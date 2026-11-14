@@ -1,0 +1,76 @@
+name: Release binaries
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['install/**', '.github/workflows/release.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-musl}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl}
+          - {os: macos-15-intel, target: x86_64-apple-darwin}
+          - {os: macos-latest, target: aarch64-apple-darwin}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --bin agent-command --target ${{ matrix.target }}
+      - name: Package Unix and smoke test installer
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          asset="agent-command-$TARGET.tar.gz"
+          tar -czf "dist/$asset" -C "target/$TARGET/release" agent-command
+          (cd dist; shasum -a 256 "$asset" > "$asset.sha256")
+          AGENT_COMMAND_RELEASE_URL="file://$PWD/dist" AGENT_COMMAND_INSTALL_DIR="$RUNNER_TEMP/ac-install" AGENT_COMMAND_NO_LAUNCH=1 sh install/install.sh
+          "$RUNNER_TEMP/ac-install/agent-command" --version
+          "$RUNNER_TEMP/ac-install/agent-command" --snapshot "$RUNNER_TEMP/ac.svg"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          $asset = "agent-command-$env:TARGET.zip"
+          Compress-Archive "target/$env:TARGET/release/agent-command.exe" "dist/$asset"
+          $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content "dist/$asset.sha256"
+          & "target/$env:TARGET/release/agent-command.exe" --version
+          & "target/$env:TARGET/release/agent-command.exe" --snapshot "$env:RUNNER_TEMP/ac.svg"
+          if ($LASTEXITCODE -ne 0) { throw 'Binary smoke test failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --title "Agent Command $TAG" --generate-notes

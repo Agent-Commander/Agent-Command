@@ -1,3 +1,6 @@
+mod cli;
+pub use cli::run_cli;
+
 use std::{collections::VecDeque, fs, io, path::Path, time::SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
