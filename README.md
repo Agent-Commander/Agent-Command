@@ -40,7 +40,7 @@ agent-command
 
 The command is `agent-command`, so tools already named `agent` are unaffected. Installers support x64 and ARM64 Windows, Intel/Apple Silicon macOS, and x64/ARM64 Linux. Linux packages use musl to avoid a distribution-specific glibc requirement. A Unicode terminal is required.
 
-The release installers require a published release with matching platform assets. First-release publication is pending. Re-running the installer updates the app. Close an existing instance before updating on Windows.
+The installers download the latest published release. Re-running the installer updates the app. Close an existing instance before updating on Windows.
 
 Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
 
