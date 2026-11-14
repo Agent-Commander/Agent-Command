@@ -18,19 +18,39 @@ The header and palette in detail:
 
 ## Install and open
 
-With Rust/Cargo 1.99 or newer installed, run this one command on Windows, Linux, or macOS:
+No Rust, Cargo, Python, or administrator access needed. Paste the command for your system; it downloads the prebuilt Rust app, verifies its checksum, installs it for your user, and opens the terminal UI.
+
+**macOS / Linux**
 
 ```sh
-cargo install --locked --git https://github.com/Agent-Commander/Agent-Command --branch main --bin agent-command
+curl -fsSL https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install.sh | sh
 ```
 
-Then open the terminal UI from any directory:
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install.ps1 | iex
+```
+
+After installation, open a new terminal and run:
 
 ```sh
 agent-command
 ```
 
-Cargo installs into its `bin` directory (normally `~/.cargo/bin`), which must be on your PATH. The executable is named `agent-command` so it can coexist with tools named `agent`. The installed UI includes its default palette and does not need a source checkout. Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
+The command is `agent-command`, so tools already named `agent` are unaffected. Installers support x64 and ARM64 Windows, Intel/Apple Silicon macOS, and x64/ARM64 Linux. Linux packages use musl to avoid a distribution-specific glibc requirement. A Unicode terminal is required.
+
+The release installers require a published release with matching platform assets. First-release publication is pending. Re-running the installer updates the app. Close an existing instance before updating on Windows.
+
+Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
+
+### Build from source
+
+With Rust/Cargo 1.99 or newer:
+
+```sh
+cargo install --locked --git https://github.com/Agent-Commander/Agent-Command --branch main --bin agent-command
+```
 
 From a source checkout, `cargo run --locked` also opens the UI.
 
