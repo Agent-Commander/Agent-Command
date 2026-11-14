@@ -1,0 +1,38 @@
+Screen { background: #111419; color: #c0c6cd; min-width: 76; }
+#topbar { height: 1; color: #272c32; background: #c9c7ba; padding: 0 2; text-style: bold; }
+#hero { height: 4; margin: 1 3 0 3; align-vertical: middle; }
+#wordmark { width: 1fr; height: 3; text-style: bold; color: #dad8ca; content-align: left middle; }
+#workspace { width: 35; height: 3; text-align: right; color: #929eaa; }
+#tagline { margin: 0 3 1 3; height: 1; color: #818d99; }
+#metrics { height: 3; margin: 0 3 1 3; background: #191e25; }
+.metric { width: 1fr; content-align: center middle; height: 3; }
+#main { height: 1fr; min-height: 14; margin: 0 3; }
+.panel { border: solid #414d5b; background: #14191f; padding: 0 1; }
+.panel-title { height: 2; color: #cbc9bc; padding-top: 0; text-style: bold; }
+#roster { width: 25; margin-right: 1; }
+#detail { width: 1fr; margin-right: 1; }
+#activity { width: 35%; }
+#agents { height: 1fr; background: transparent; }
+ListItem { height: 4; padding: 1 1 0 1; }
+ListView > ListItem.-highlight { background: #293744; }
+ListView:focus > ListItem.-highlight { background: #293744; color: #d1dce4; }
+ListItem Label { width: 1fr; }
+#roster-hint { height: 3; padding-left: 1; }
+#agent-heading { height: 3; padding-top: 1; text-style: bold; }
+#mission { height: 4; color: #d4d9df; }
+#mission-body { height: 1fr; min-height: 9; color: #929eaa; }
+#actions { height: 3; margin-bottom: 1; }
+Button { min-width: 12; height: 3; border: none; background: #28323d; color: #c0c6cd; }
+Button.-primary { background: #c9c7ba; color: #242b32; }
+Button:hover { background: #42576a; }
+Button:focus { text-style: bold; }
+#new { margin-right: 1; }
+RichLog { background: transparent; padding: 1 0; scrollbar-size: 1 1; }
+#command-row { height: 3; margin: 1 3 0 3; }
+#prompt { width: 3; height: 3; content-align: center middle; color: #b8ccd9; }
+Input { width: 1fr; background: #191f27; border: tall #455566; }
+Input:focus { border: tall #b8ccd9; }
+#send { margin-left: 1; }
+#status { height: 2; padding: 0 3; color: #a1adb8; }
+Footer { background: #1b2027; color: #a5b1bd; }
+Footer > .footer--key { background: #303f4e; color: #d1dce4; }
