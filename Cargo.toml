@@ -1,0 +1,18 @@
+[package]
+name = "agent-command"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+default-run = "agent-command"
+
+[dependencies]
+ratatui = "=0.30.2"
+crossterm = "=0.29.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+serde_json = "1"
+chrono = "0.4"
+
+[[bin]]
+name = "dev"
+path = "src/bin/dev.rs"
