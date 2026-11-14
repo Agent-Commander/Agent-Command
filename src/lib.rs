@@ -323,7 +323,7 @@ impl App {
                 );
             }
             let style = if i == self.selected {
-                Style::default().bold()
+                Style::default().fg(color("d1dce4")).bold()
             } else {
                 Style::default()
             };
@@ -336,7 +336,11 @@ impl App {
                     Span::styled(format!(" {name}  "), style),
                     Span::styled(
                         format!("/{:02}", i + 1),
-                        Style::default().fg(color(&t.muted)),
+                        Style::default().fg(color(if i == self.selected {
+                            "97a3ad"
+                        } else {
+                            "5f646b"
+                        })),
                     ),
                 ]),
                 Line::styled(format!("   {}", STATUSES[i].to_lowercase()), style),
@@ -345,7 +349,7 @@ impl App {
         }
         f.render_widget(
             Paragraph::new("↑ ↓ select an agent\nEnter to inspect")
-                .style(Style::default().fg(color(&t.muted))),
+                .style(Style::default().fg(color("666f78"))),
             r(
                 cols[0].x + 3,
                 cols[0].bottom().saturating_sub(4),
@@ -470,7 +474,7 @@ impl App {
                 let (source, message) = entry.split_once("  ").unwrap_or(("SYSTEM", entry));
                 [
                     Line::from(vec![
-                        Span::styled(format!("{stamp}  "), Style::default().fg(color(&t.muted))),
+                        Span::styled(format!("{stamp}  "), Style::default().fg(color("666f78"))),
                         Span::styled(source.to_owned(), Style::default().fg(color(&t.accent))),
                     ]),
                     Line::raw(message.trim().to_owned()),
@@ -502,7 +506,15 @@ impl App {
                     "455566"
                 }))),
             )
-            .style(Style::default().fg(color(&t.muted)).bg(color("191f27"))),
+            .style(
+                Style::default()
+                    .fg(color(if self.input.is_empty() {
+                        "666f78"
+                    } else {
+                        "c0c6cd"
+                    }))
+                    .bg(color("191f27")),
+            ),
             self.input_area,
         );
         f.render_widget(button("Send ↗", true, &t), self.send_area);
