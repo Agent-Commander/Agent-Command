@@ -16,13 +16,23 @@ The header and palette in detail:
 
 ![Agent Command header with ivory lettering and muted blue accents](docs/images/starter-terminal-header.png)
 
-## Run
+## Install and open
 
-Install a current stable Rust toolchain (Rust 1.99 or newer). On Windows, Linux, and macOS:
+With Rust/Cargo 1.99 or newer installed, run this one command on Windows, Linux, or macOS:
 
 ```sh
-cargo run --locked
+cargo install --locked --git https://github.com/Agent-Commander/Agent-Command --branch main --bin agent-command
 ```
+
+Then open the terminal UI from any directory:
+
+```sh
+agent-command
+```
+
+Cargo installs into its `bin` directory (normally `~/.cargo/bin`), which must be on your PATH. The executable is named `agent-command` so it can coexist with tools named `agent`. The installed UI includes its default palette and does not need a source checkout. Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
+
+From a source checkout, `cargo run --locked` also opens the UI.
 
 Use a Unicode terminal at least 120 columns by 40 rows for the complete layout. Smaller terminals have a compact title.
 

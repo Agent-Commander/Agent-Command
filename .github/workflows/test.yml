@@ -17,3 +17,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - name: Install and check command outside checkout
+        shell: bash
+        run: |
+          cargo install --locked --path . --bin agent-command --root "$RUNNER_TEMP/agent-command-install"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/agent-command-install/bin/agent-command" --version
+          "$RUNNER_TEMP/agent-command-install/bin/agent-command" --help
+          "$RUNNER_TEMP/agent-command-install/bin/agent-command" --snapshot "$RUNNER_TEMP/agent-command.svg"
