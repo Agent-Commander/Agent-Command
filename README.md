@@ -6,6 +6,16 @@ A Rust terminal interface for managing agents: a selectable crew roster, mission
 
 The interface retains its existing layout, block-letter backdrop, muted blue palette, ivory menu bar, and small color accent.
 
+## Starter terminal
+
+The current starter screen with sample agents and local mission controls:
+
+![Agent Command starter terminal with crew, chart room, and ship's log](docs/images/starter-terminal.png)
+
+The header and palette in detail:
+
+![Agent Command header with ivory lettering and muted blue accents](docs/images/starter-terminal-header.png)
+
 ## Run
 
 Install a current stable Rust toolchain (Rust 1.99 or newer). On Windows, Linux, and macOS:
