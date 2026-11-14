@@ -1,5 +1,6 @@
+/target/
+/.runtime/
+*.svg
 .venv/
 .venv-posix/
 __pycache__/
-*.svg
-.runtime/

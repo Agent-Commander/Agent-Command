@@ -1,33 +1,47 @@
 # Agent Command
 
-A native terminal UI prototype with an Agent Command backdrop, selectable agent roster, mission details, activity feed, and command input. All agents and actions are local sample data; no agent services are connected.
+## What we're working on
 
-## Run with live refresh
+A Rust terminal interface for managing agents: a selectable crew roster, mission controls, command input, and an activity feed. The current prototype uses sample agents; commands stay local.
 
-Requires Python 3.10+ and a Unicode terminal, at least 120 columns by 40 rows for the complete layout. A modern terminal with true color gives the intended palette. The same Python/Textual UI runs on Windows, Linux, and macOS (Intel or Apple Silicon with a compatible Python installation).
+The interface retains its existing layout, block-letter backdrop, muted blue palette, ivory menu bar, and small color accent.
 
-macOS and Linux:
+## Starter terminal
+
+The current starter screen with sample agents and local mission controls:
+
+![Agent Command starter terminal with crew, chart room, and ship's log](docs/images/starter-terminal.png)
+
+The header and palette in detail:
+
+![Agent Command header with ivory lettering and muted blue accents](docs/images/starter-terminal-header.png)
+
+## Run
+
+Install a current stable Rust toolchain (Rust 1.99 or newer). On Windows, Linux, and macOS:
 
 ```sh
-sh start.sh
-# or, from any directory:
-python3 /path/to/Agent-Command/run.py
+cargo run --locked
 ```
 
-Windows PowerShell:
+Use a Unicode terminal at least 120 columns by 40 rows for the complete layout. Smaller terminals have a compact title.
 
-```powershell
-.\start.ps1
-# or:
-python run.py
+## UI development
+
+```sh
+cargo run --locked --bin dev
 ```
 
-The launcher creates an isolated environment and installs pinned dependencies on first run. Windows uses `.venv`; Linux/macOS use `.venv-posix`, so a shared checkout also works with WSL. Internet access is needed for the first installation. On Debian/Ubuntu, install `python3-venv` if Python reports that ensurepip is missing. If using uv, `uv venv --seed .venv-posix` is another option. No system Python packages are modified.
+Save `theme.toml` to refresh colors in place. Invalid theme edits keep the last working palette. Save Rust source to rebuild and restart automatically; demo state resets after a rebuild. The development supervisor and application are both Rust.
 
-Run without reload using `python3 run.py --no-reload`. Run the headless checks using `python3 run.py --check` (use `python` on Windows). CI runs these checks on Ubuntu, macOS, and Windows with Python 3.10 and 3.13. CI verifies the app and controls; it does not guarantee identical font rendering in every terminal emulator.
+Controls: arrows select an agent, Tab changes focus, Ctrl+N focuses command input, Enter sends a local demo command, Ctrl+P pauses/resumes, Ctrl+L clears the feed, and Ctrl+Q exits. The roster and action buttons also accept mouse clicks. Menu-bar labels remain decorative.
 
-Save `theme.tcss` to refresh styles in place. Save `app.py` to automatically reload the interface (demo state resets). Ctrl+Q exits. Ctrl+N focuses the command bar; Ctrl+P pauses or resumes the selected demo agent.
+## Validation
 
-The Privateer theme uses muted slate backgrounds with a slight blue tint, an ivory menu bar and primary buttons, square terminal borders, a small six-color stripe, and privateer radio details. The development launcher enables true color for this process, overriding inherited `NO_COLOR` without changing system settings.
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+```
 
-Ctrl+P has priority over list navigation so pause/resume works while the crew list has focus. The menu-bar labels are decorative in this prototype; use the buttons or footer shortcuts.
+CI checks Windows, Linux, and macOS. No Python runtime is required.
