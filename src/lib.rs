@@ -379,8 +379,12 @@ impl App {
             );
         }
         f.render_widget(
-            Paragraph::new("↑ ↓ select an agent\nEnter to inspect")
-                .style(Style::default().fg(color("666f78"))),
+            Paragraph::new(if compact {
+                "↑ ↓ select\nEnter: edit"
+            } else {
+                "↑ ↓ select an agent\nEnter to inspect"
+            })
+            .style(Style::default().fg(color("666f78"))),
             r(
                 cols[0].x + 3,
                 cols[0].bottom().saturating_sub(4),

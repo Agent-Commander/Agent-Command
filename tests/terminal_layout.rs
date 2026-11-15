@@ -172,3 +172,30 @@ fn resize_retains_unicode_and_selected_state() {
         );
     }
 }
+
+#[test]
+fn crew_helper_is_complete_inside_its_region() {
+    for (w, h, expected) in [
+        (80, 24, "↑ ↓ select\nEnter: edit"),
+        (120, 40, "↑ ↓ select an agent\nEnter to inspect"),
+    ] {
+        let mut app = App::default();
+        let buffer = render(&mut app, w, h);
+        let helper = Rect::new(
+            app.crew_area.x + 1,
+            app.input_area.y - 5,
+            app.crew_area.width - 1,
+            2,
+        );
+        let visible = text(&buffer, helper);
+        let lines = visible
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            lines, expected,
+            "crew helper must fit fully inside its region at {w}x{h}"
+        );
+    }
+}

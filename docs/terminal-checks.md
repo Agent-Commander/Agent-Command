@@ -8,6 +8,7 @@
 | Selected mission/status in chart independently of feed | Same test clears feed, inserts a unique log marker, then checks separate rectangles |
 | Pause/Resume and Send visible, clickable and in bounds | Same test clicks centers and compares selected state, missions and log against keyboard actions |
 | Input and recent log visible in their own regions | Same test |
+| Complete crew helper within its region at both sizes | `crew_helper_is_complete_inside_its_region` |
 | Header labels separated | Same test asserts explicit separator in header row |
 | Selection, Unicode mission/draft, pause, feed and edit mode survive resize | `resize_retains_unicode_and_selected_state`, 120×40 → 80×24 → 120×40 |
 
