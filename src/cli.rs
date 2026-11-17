@@ -59,11 +59,12 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
 
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_stamp = crate::source_stamp(&source_root);
+    let updates = crate::update::watch();
     let mut reload = false;
+    let mut app = App::default();
     let mut terminal = ratatui::init();
-    let result = (|| {
+    let result: io::Result<()> = (|| {
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut app = App::default();
         while !app.quit {
             if std::env::var_os("AGENT_COMMAND_DEV").is_some()
                 && crate::source_stamp(&source_root) != source_stamp
@@ -73,6 +74,9 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             }
             if let Some(path) = &path {
                 app.poll_theme(path);
+            }
+            if let Some(latest) = updates.as_ref().and_then(|found| found.try_recv().ok()) {
+                app.offer_update(latest);
             }
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
@@ -92,5 +96,14 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     if reload {
         std::process::exit(75);
     }
-    result
+    result?;
+    // The terminal is back to normal here, so the command can be read and copied.
+    if let Some(latest) = &app.update {
+        if !(app.update_accepted && app.self_update) {
+            println!("{}", crate::update::notice(latest));
+        } else if !crate::update::install(latest) {
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }

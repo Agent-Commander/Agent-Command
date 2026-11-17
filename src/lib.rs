@@ -1,4 +1,5 @@
 mod cli;
+mod update;
 pub use cli::run_cli;
 
 use std::{collections::VecDeque, fs, io, path::Path, time::SystemTime};
@@ -8,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
     Frame,
 };
 use serde::Deserialize;
@@ -89,11 +90,22 @@ pub struct App {
     pub theme: Theme,
     pub notice: String,
     theme_stamp: Option<SystemTime>,
+    /// A newer release, once the background check has found one.
+    pub update: Option<String>,
+    /// Whether the update dialog is open.
+    pub update_prompt: bool,
+    /// Set when the user says yes; the app then quits so the update can run.
+    pub update_accepted: bool,
+    /// Whether saying yes installs the update, or only quits to show the command for it.
+    pub self_update: bool,
+    touched: bool,
     pub crew_area: Rect,
     pub input_area: Rect,
     pub new_area: Rect,
     pub pause_area: Rect,
     pub send_area: Rect,
+    pub update_area: Rect,
+    pub later_area: Rect,
 }
 impl Default for App {
     fn default() -> Self {
@@ -114,11 +126,19 @@ impl Default for App {
             theme: Theme::default(),
             notice: String::new(),
             theme_stamp: None,
+            update: None,
+            update_prompt: false,
+            update_accepted: false,
+            // Windows cannot replace an app while it is running.
+            self_update: cfg!(unix),
+            touched: false,
             crew_area: Rect::default(),
             input_area: Rect::default(),
             new_area: Rect::default(),
             pause_area: Rect::default(),
             send_area: Rect::default(),
+            update_area: Rect::default(),
+            later_area: Rect::default(),
         }
     }
 }
@@ -166,8 +186,29 @@ impl App {
             self.notice = "Preview mission only; no external dispatch.".into();
         }
     }
+    /// Records a newer release. The dialog opens by itself only while the user has not
+    /// started working, so it never takes a keystroke meant for something else.
+    pub fn offer_update(&mut self, latest: String) {
+        self.update_prompt = !self.touched;
+        self.update = Some(latest);
+    }
+    fn accept_update(&mut self) {
+        self.update_accepted = true;
+        self.quit = true;
+    }
     pub fn key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        self.touched = true;
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.update_prompt {
+            match key.code {
+                KeyCode::Enter => self.accept_update(),
+                KeyCode::Esc => self.update_prompt = false,
+                KeyCode::Char('q' | 'c') if control => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+        if control {
             match key.code {
                 KeyCode::Char('q' | 'c') => self.quit = true,
                 KeyCode::Char('n') => self.editing = true,
@@ -176,6 +217,7 @@ impl App {
                     self.log.clear();
                     self.log_times.clear();
                 }
+                KeyCode::Char('u') => self.update_prompt = self.update.is_some(),
                 _ => {}
             }
             return;
@@ -195,8 +237,15 @@ impl App {
         }
     }
     pub fn click(&mut self, x: u16, y: u16) {
+        self.touched = true;
         let point = ratatui::layout::Position::new(x, y);
-        if self.new_area.contains(point) || self.input_area.contains(point) {
+        if self.update_prompt {
+            if self.update_area.contains(point) {
+                self.accept_update();
+            } else if self.later_area.contains(point) {
+                self.update_prompt = false;
+            }
+        } else if self.new_area.contains(point) || self.input_area.contains(point) {
             self.editing = true;
         } else if self.pause_area.contains(point) {
             self.toggle_pause();
@@ -530,11 +579,68 @@ impl App {
             .style(Style::default().fg(color("a1adb8"))),
             r(0, a.height.saturating_sub(2), a.width, 1),
         );
+        let mut keys = vec![Span::raw(
+            " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed",
+        )];
+        if self.update.is_some() {
+            keys.push(Span::styled(
+                "    ^U Update",
+                Style::default().fg(color(&t.amber)),
+            ));
+        }
         f.render_widget(
-            Paragraph::new(" ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed")
+            Paragraph::new(Line::from(keys))
                 .style(Style::default().bg(color("1b2027")).fg(color("a5b1bd"))),
             r(0, a.height.saturating_sub(1), a.width, 1),
         );
+        if let (true, Some(latest)) = (self.update_prompt, &self.update) {
+            let (w, h) = (58.min(a.width), 12.min(a.height));
+            let (x, y) = ((a.width - w) / 2, (a.height - h) / 2);
+            let (yes, how, hint) = if self.self_update {
+                (
+                    "Update now",
+                    "Updating closes the app to install it.",
+                    "Enter to update · Esc for later",
+                )
+            } else {
+                (
+                    "Quit now",
+                    "Quit to see the command that installs it.",
+                    "Enter to quit · Esc for later",
+                )
+            };
+            f.render_widget(Clear, r(x, y, w, h));
+            f.render_widget(
+                Block::bordered()
+                    .style(base.bg(color(&t.panel)))
+                    .border_style(Style::default().fg(color(&t.accent))),
+                r(x, y, w, h),
+            );
+            f.render_widget(
+                Paragraph::new("UPDATE AVAILABLE")
+                    .style(Style::default().fg(color("cbc9bc")).bold()),
+                r(x + 2, y + 1, w.saturating_sub(4), 1),
+            );
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::raw(format!(
+                        "Agent Command {latest} is available. You have {}.",
+                        update::CURRENT
+                    )),
+                    Line::styled(how, Style::default().fg(color(&t.muted))),
+                ])
+                .wrap(Wrap { trim: false }),
+                r(x + 2, y + 3, w.saturating_sub(4), 3),
+            );
+            self.update_area = r(x + 2, y + 6, 12, 3);
+            self.later_area = r(x + 15, y + 6, 7, 3);
+            f.render_widget(button(yes, true, &t), self.update_area);
+            f.render_widget(button("Later", false, &t), self.later_area);
+            f.render_widget(
+                Paragraph::new(hint).style(Style::default().fg(color("666f78"))),
+                r(x + 2, y + 10, w.saturating_sub(4), 1),
+            );
+        }
     }
 }
 
@@ -681,5 +787,73 @@ mod tests {
         assert_eq!(a.theme.accent, "123456");
         assert!(!a.notice.is_empty());
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn update_prompt_asks_before_anything_else() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = App::default();
+        a.offer_update("9.9.9".into());
+        assert!(a.update_prompt);
+        // The dialog takes the keys: nothing behind it moves.
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.selected, 0);
+        a.key(key(KeyCode::Esc));
+        assert!(!a.update_prompt && !a.quit);
+        a.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(a.update_prompt);
+        a.key(key(KeyCode::Enter));
+        assert!(a.update_accepted && a.quit);
+
+        // A result that arrives once the user is working does not interrupt them.
+        let mut a = App::default();
+        a.key(key(KeyCode::Down));
+        a.offer_update("9.9.9".into());
+        assert!(!a.update_prompt);
+        a.key(key(KeyCode::Enter));
+        assert!(a.editing && !a.update_accepted);
+
+        // Without an update there is nothing for the shortcut to open.
+        let mut a = App::default();
+        a.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(!a.update_prompt);
+    }
+    #[test]
+    fn update_prompt_layouts_and_clicks() {
+        let screen = |a: &mut App, w, h| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            t.draw(|f| a.draw(f)).unwrap();
+            let cells = t.backend().buffer().content.iter();
+            cells.map(|c| c.symbol()).collect::<String>()
+        };
+        for (self_update, yes) in [(true, "Update now"), (false, "Quit now")] {
+            for (w, h) in [(1, 1), (30, 8), (80, 24), (120, 40), (210, 54)] {
+                let mut a = App {
+                    self_update,
+                    ..App::default()
+                };
+                a.offer_update("9.9.9".into());
+                let text = screen(&mut a, w, h);
+                if w >= 80 {
+                    assert!(text.contains("UPDATE AVAILABLE") && text.contains(yes));
+                    assert!(
+                        text.contains(&format!("9.9.9 is available. You have {}", update::CURRENT))
+                    );
+                    assert!(a.update_area.bottom() <= h && a.later_area.right() <= w);
+                }
+            }
+        }
+        let mut a = App::default();
+        a.offer_update("9.9.9".into());
+        screen(&mut a, 120, 40);
+        // Clicks outside the dialog do nothing while it is open.
+        a.click(a.crew_area.x, a.crew_area.y + 4);
+        assert!(a.update_prompt && a.selected == 0);
+        a.click(a.later_area.x, a.later_area.y);
+        assert!(!a.update_prompt && !a.quit);
+        // Dismissed, the update stays one shortcut away.
+        assert!(screen(&mut a, 120, 40).contains("^U Update"));
+        a.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        a.click(a.update_area.x + 1, a.update_area.y + 1);
+        assert!(a.update_accepted && a.quit);
     }
 }

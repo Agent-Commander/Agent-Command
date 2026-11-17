@@ -56,6 +56,19 @@ From a source checkout, `cargo run --locked` also opens the UI.
 
 Use a Unicode terminal at least 120 columns by 40 rows for the complete layout. Smaller terminals have a compact title.
 
+## Updates
+
+Each time it opens, Agent Command checks GitHub for a newer release and, when there is one, asks whether to update.
+
+- **macOS / Linux:** Enter closes the app and runs the installer for you. Run `agent-command` again to open the new version.
+- **Windows:** a running app cannot be replaced, so Enter closes it and shows the command to run in PowerShell.
+
+Esc carries on with the current version. Ctrl+U brings the question back, and the update command is shown when you quit.
+
+The check runs in the background and needs `curl`; without a connection it is skipped. Set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to turn it off. Development builds (`cargo run`) do not check.
+
+Releases are compared by version number, so `version` in `Cargo.toml` has to match the release tag: `0.2.0` for `v0.2.0`.
+
 ## UI development
 
 ```sh

@@ -1,0 +1,191 @@
+//! Update check: finds the latest release on GitHub and the command that installs it.
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+};
+
+pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+const LATEST: &str = "https://github.com/Agent-Commander/Agent-Command/releases/latest";
+const INSTALLER: &str =
+    "https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install";
+
+/// Numeric `major.minor.patch`. A leading `v` and any pre-release suffix are ignored.
+fn parse(version: &str) -> Option<[u64; 3]> {
+    let core = version.trim().trim_start_matches('v');
+    let mut parts = core.split(['-', '+']).next()?.split('.');
+    let mut numbers = [0; 3];
+    for number in &mut numbers {
+        match parts.next() {
+            Some(part) => *number = part.parse().ok()?,
+            None => break,
+        }
+    }
+    parts.next().is_none().then_some(numbers)
+}
+
+/// `latest` as plain `major.minor.patch`, when it is newer than `current`.
+pub fn newer(latest: &str, current: &str) -> Option<String> {
+    let (latest, current) = (parse(latest)?, parse(current)?);
+    (latest > current).then(|| latest.map(|number| number.to_string()).join("."))
+}
+
+/// The release tag in the redirect that `releases/latest` answers with.
+fn tag(headers: &str) -> Option<&str> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let (_, tag) = value.trim().rsplit_once("/releases/tag/")?;
+        name.eq_ignore_ascii_case("location").then_some(tag)
+    })
+}
+
+/// Looks for a newer release in the background, so a slow network never delays the UI.
+/// Nothing arrives when the app is current, offline, or `curl` is missing.
+pub fn watch() -> Option<Receiver<String>> {
+    // Debug builds are development copies, not installs to keep current.
+    if cfg!(debug_assertions)
+        || env::var_os("AGENT_COMMAND_NO_UPDATE_CHECK").is_some_and(|value| value == "1")
+    {
+        return None;
+    }
+    let (found, results) = mpsc::channel();
+    thread::spawn(move || {
+        let headers = Command::new("curl")
+            .args(["--silent", "--head", "--max-time", "5", LATEST])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let latest = newer(tag(&String::from_utf8_lossy(&headers.stdout))?, CURRENT)?;
+        found.send(latest).ok()
+    });
+    Some(results)
+}
+
+/// The folder holding the running app, when it is not the installer's default and so has to
+/// be named for an update to replace this copy rather than add a second one.
+fn custom_dir() -> Option<PathBuf> {
+    // Windows paths stay as given: the canonical `\\?\` form is not one to paste into PowerShell.
+    let real = |path: PathBuf| {
+        if cfg!(windows) {
+            Some(path)
+        } else {
+            fs::canonicalize(path).ok()
+        }
+    };
+    let dir = real(env::current_exe().ok()?)?.parent()?.to_owned();
+    let default = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(|root| Path::new(&root).join(r"AgentCommand\bin"))
+    } else {
+        env::var_os("HOME").map(|home| Path::new(&home).join(".local/bin"))
+    };
+    (default.and_then(real).as_ref() != Some(&dir)).then_some(dir)
+}
+
+/// The command that installs the latest release, into `dir` when one is given.
+fn command(windows: bool, dir: Option<&Path>) -> String {
+    match (windows, dir.map(|dir| dir.display().to_string())) {
+        (false, None) => format!("curl -fsSL {INSTALLER}.sh | sh"),
+        (false, Some(dir)) => format!(
+            "curl -fsSL {INSTALLER}.sh | AGENT_COMMAND_INSTALL_DIR='{}' sh",
+            dir.replace('\'', r"'\''")
+        ),
+        (true, None) => format!("irm {INSTALLER}.ps1 | iex"),
+        (true, Some(dir)) => format!(
+            "$env:AGENT_COMMAND_INSTALL_DIR = '{}'; irm {INSTALLER}.ps1 | iex",
+            dir.replace('\'', "''")
+        ),
+    }
+}
+
+/// How to update, for printing once the terminal is back to normal.
+pub fn notice(latest: &str) -> String {
+    let run = if cfg!(windows) {
+        "run this in PowerShell"
+    } else {
+        "run"
+    };
+    format!(
+        "Agent Command {latest} is available (you have {CURRENT}). To update, {run}:\n\n  {}\n",
+        command(cfg!(windows), custom_dir().as_deref())
+    )
+}
+
+/// Installs the latest release over this copy with the project's installer, which reports its
+/// own progress. Returns whether it finished. Unix only: Windows cannot replace a running app.
+pub fn install(latest: &str) -> bool {
+    println!("Updating Agent Command {CURRENT} to {latest}...");
+    let dir = custom_dir();
+    // Fetched before it runs, not piped, so a failed download is not taken for a finished install.
+    let script = Command::new("curl")
+        .args(["-fsSL", &format!("{INSTALLER}.sh")])
+        .stderr(Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|fetched| fetched.status.success());
+    let finished = script.is_some_and(|script| {
+        let mut installer = Command::new("sh");
+        installer
+            .args(["-c", &String::from_utf8_lossy(&script.stdout)])
+            .env("AGENT_COMMAND_NO_LAUNCH", "1");
+        if let Some(dir) = &dir {
+            installer.env("AGENT_COMMAND_INSTALL_DIR", dir);
+        }
+        installer.status().is_ok_and(|status| status.success())
+    });
+    if !finished {
+        eprintln!(
+            "\nThe update did not finish. To try again, run:\n\n  {}\n",
+            command(false, dir.as_deref())
+        );
+    }
+    finished
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_newer_versions_count() {
+        assert_eq!(newer("v0.2.0", "0.1.0").as_deref(), Some("0.2.0"));
+        assert_eq!(newer("v0.10.0", "0.9.9").as_deref(), Some("0.10.0"));
+        assert_eq!(newer("v1.0", "0.9.9").as_deref(), Some("1.0.0"));
+        for (latest, current) in [
+            ("v0.1.0", "0.1.0"),
+            ("v0.1.0", "0.2.0"),
+            ("v0.2.0-rc1", "0.2.0"),
+            ("v1.2.3.4", "0.1.0"),
+            ("nightly", "0.1.0"),
+            ("", "0.1.0"),
+        ] {
+            assert_eq!(newer(latest, current), None, "{latest} over {current}");
+        }
+    }
+
+    #[test]
+    fn tag_comes_from_the_redirect() {
+        let headers = "HTTP/2 302 \r\nserver: github.com\r\nlocation: https://github.com/Agent-Commander/Agent-Command/releases/tag/v0.2.0\r\n\r\n";
+        assert_eq!(tag(headers), Some("v0.2.0"));
+        assert_eq!(
+            tag(&headers.replace("location", "Location")),
+            Some("v0.2.0")
+        );
+        // A repository with no releases redirects to the plain releases page.
+        assert_eq!(tag(&headers.replace("/tag/v0.2.0", "")), None);
+        assert_eq!(tag(""), None);
+    }
+
+    #[test]
+    fn command_matches_the_readme_and_names_other_folders() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains(&command(false, None)));
+        assert!(readme.contains(&command(true, None)));
+        assert!(command(false, Some(Path::new("/opt/it's here")))
+            .ends_with(r"| AGENT_COMMAND_INSTALL_DIR='/opt/it'\''s here' sh"));
+        assert!(command(true, Some(Path::new(r"C:\it's here")))
+            .starts_with(r"$env:AGENT_COMMAND_INSTALL_DIR = 'C:\it''s here'; irm "));
+    }
+}
