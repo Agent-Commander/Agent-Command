@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Manage subscription logins for Codex CLI (codex) and Claude Code (claude)."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+PROVIDERS = ("claude", "codex")
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+CODEX_OPTIONS = ["-c", 'cli_auth_credentials_store="file"',
+                 "-c", 'forced_login_method="chatgpt"']
+
+
+def profile_name(value):
+    if not PROFILE_NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("use 1-64 lowercase letters, digits, _ or -, starting with a letter or digit")
+    return value
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list", help="list local profile names")
+    for command, description in [
+        ("login", "sign in to a subscription in your browser"),
+        ("status", "check the selected subscription login"),
+        ("logout", "sign out the selected profile"),
+        ("run", "launch the provider CLI using the selected login"),
+    ]:
+        sub = commands.add_parser(command, help=description)
+        sub.add_argument("provider", choices=PROVIDERS, help="claude for Claude Code, codex for Codex CLI")
+        sub.add_argument("profile", type=profile_name)
+        if command == "run":
+            sub.add_argument("arguments", nargs=argparse.REMAINDER, help="arguments for the provider CLI")
+    return parser.parse_args()
+
+
+def private_directory(path, create):
+    if create:
+        path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f"Expected a private directory owned by you (mode 0700) at {path}")
+
+
+def profile_environment(provider, directory):
+    # The worker may itself have been launched from an authenticated agent.
+    env = os.environ.copy()
+    overrides = {
+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN", "CODEX_REFRESH_TOKEN", "CHATGPT_BASE_URL",
+        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDECODE",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_AWS", "CLAUDE_CODE_USE_GATEWAY",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_REMOTE_SESSION_ID",
+        "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    }
+    for key in list(env):
+        if key in overrides or key.startswith(("ANTHROPIC_", "CLAUDE_CODE_OAUTH_", "CLAUDE_CODE_SESSION_ACCESS_TOKEN")):
+            del env[key]
+    env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = str(directory)
+    return env
+
+
+def subscription_active(provider, cli, env):
+    args = ["auth", "status", "--json"] if provider == "claude" else ["login", "status"]
+    result = subprocess.run(cli + args, env=env, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True)
+    if result.returncode:
+        return False
+    if provider == "codex":
+        # Codex writes its human-readable status to stderr.
+        return "logged in using chatgpt" in (result.stderr + result.stdout).lower()
+    status = json.loads(result.stdout)
+    return status.get("loggedIn") is True and status.get("authMethod") == "claude.ai"
+
+
+def main():
+    args = parse_args()
+    root = Path(os.environ.get("SUB_AUTH_DIR", "~/.local/share/sub-auth")).expanduser()
+    if not root.is_absolute():
+        raise ValueError("SUB_AUTH_DIR must be an absolute path")
+    if args.command == "list":
+        if root.exists():
+            private_directory(root, False)
+            for provider in PROVIDERS:
+                parent = root / provider
+                if parent.exists():
+                    private_directory(parent, False)
+                    for path in sorted(parent.iterdir()):
+                        if PROFILE_NAME.fullmatch(path.name) and path.is_dir() and not path.is_symlink():
+                            print(provider, path.name)
+        return 0
+
+    create = args.command == "login"
+    directory = root / args.provider / args.profile
+    if create:
+        root.parent.mkdir(parents=True, exist_ok=True)
+    elif not directory.exists():
+        raise ValueError(f"Unknown profile. Sign in with sub-auth login {args.provider} {args.profile}")
+    for path in (root, directory.parent, directory):
+        private_directory(path, create)
+
+    env = profile_environment(args.provider, directory)
+    cli = [args.provider]
+    if args.provider == "codex":
+        cli += CODEX_OPTIONS
+    if args.command in ("login", "logout"):
+        action = [args.command]
+        if args.provider == "claude":
+            action = ["auth", args.command]
+            if create:
+                action.append("--claudeai")
+        os.execvpe(cli[0], cli + action, env)
+
+    if not subscription_active(args.provider, cli, env):
+        print(f"No active subscription login detected. Run sub-auth login {args.provider} {args.profile}", file=sys.stderr)
+        return 1
+    if args.command == "status":
+        print(f"{args.provider}/{args.profile} is signed in")
+        return 0
+    os.execvpe(cli[0], cli + args.arguments, env)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as exc:
+        sys.exit(f"sub-auth: {exc}")
