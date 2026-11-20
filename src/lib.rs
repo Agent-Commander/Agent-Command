@@ -203,7 +203,9 @@ impl App {
         } else if self.send_area.contains(point) {
             self.submit();
         } else if self.crew_area.contains(point) {
-            self.selected = ((y.saturating_sub(self.crew_area.y)) / 4).min(3) as usize;
+            self.selected = ((y.saturating_sub(self.crew_area.y))
+                / (self.crew_area.height / 4).max(1))
+            .min(3) as usize;
             self.editing = false;
         }
     }
@@ -222,17 +224,30 @@ impl App {
                 h.min(a.height.saturating_sub(y)),
             )
         };
-        f.render_widget(Paragraph::new("  ▣  AGENT COMMAND     File   Crew   Missions   Radio                         PRIVATEER / 01").style(Style::default().fg(color("272c32")).bg(color(&t.ivory)).bold()),r(0,0,a.width,1));
-        let banner = if a.width >= 105 {
-            banner()
-        } else {
-            "AGENT COMMAND".into()
-        };
         f.render_widget(
-            Paragraph::new(banner).style(Style::default().fg(color("dad8ca")).bold()),
-            r(3, 2, a.width.saturating_sub(41), 3),
+            Paragraph::new(
+                "  ▣  AGENT COMMAND     File   Crew   Missions   Radio    |    PRIVATEER / 01",
+            )
+            .style(
+                Style::default()
+                    .fg(color("272c32"))
+                    .bg(color(&t.ivory))
+                    .bold(),
+            ),
+            r(0, 0, a.width, 1),
         );
-        f.render_widget(
+        let compact = a.height < 36 || a.width < 105;
+        if !compact {
+            let banner = if a.width >= 105 {
+                banner()
+            } else {
+                "AGENT COMMAND".into()
+            };
+            f.render_widget(
+                Paragraph::new(banner).style(Style::default().fg(color("dad8ca")).bold()),
+                r(3, 2, a.width.saturating_sub(41), 3),
+            );
+            f.render_widget(
             Paragraph::new(
                 "PRIVATEER RADIO  /  LOCAL\n───┤ ◆ ├───  SIGNAL CLEAR\n1200 BAUD  ·  UI PREVIEW",
             )
@@ -240,50 +255,55 @@ impl App {
             .style(Style::default().fg(color(&t.muted))),
             r(a.width.saturating_sub(38), 2, 35, 3),
         );
-        let mut stripe = ["89a76f", "dbc77b", "cc955d", "b86d67", "9c829f", "7d9fb6"]
-            .map(|c| Span::styled("━━", Style::default().fg(color(c))))
-            .to_vec();
-        stripe.push(Span::raw("  INDEPENDENT OPERATORS. UNCHARTED WATERS."));
-        f.render_widget(
-            Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
-            r(3, 6, a.width.saturating_sub(6), 1),
-        );
-        let ma = r(3, 8, a.width.saturating_sub(6), 3);
-        f.render_widget(
-            Block::default().style(Style::default().bg(color("191e25"))),
-            ma,
-        );
-        let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
-        for (i, label) in [
-            "04  AGENTS ONLINE",
-            "02  ACTIVE MISSIONS",
-            "00  NEED ATTENTION",
-            "UI PROTOTYPE  /  SAMPLE DATA",
-        ]
-        .iter()
-        .enumerate()
-        {
+            let mut stripe = ["89a76f", "dbc77b", "cc955d", "b86d67", "9c829f", "7d9fb6"]
+                .map(|c| Span::styled("━━", Style::default().fg(color(c))))
+                .to_vec();
+            stripe.push(Span::raw("  INDEPENDENT OPERATORS. UNCHARTED WATERS."));
             f.render_widget(
-                Paragraph::new(*label)
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .style(Style::default().fg(color(if i == 3 {
-                        &t.amber
-                    } else {
-                        &t.foreground
-                    }))),
-                Rect::new(metrics[i].x, metrics[i].y + 1, metrics[i].width, 1),
+                Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
+                r(3, 6, a.width.saturating_sub(6), 1),
             );
+            let ma = r(3, 8, a.width.saturating_sub(6), 3);
+            f.render_widget(
+                Block::default().style(Style::default().bg(color("191e25"))),
+                ma,
+            );
+            let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
+            for (i, label) in [
+                "04  AGENTS ONLINE",
+                "02  ACTIVE MISSIONS",
+                "00  NEED ATTENTION",
+                "UI PROTOTYPE  /  SAMPLE DATA",
+            ]
+            .iter()
+            .enumerate()
+            {
+                f.render_widget(
+                    Paragraph::new(*label)
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .style(Style::default().fg(color(if i == 3 {
+                            &t.amber
+                        } else {
+                            &t.foreground
+                        }))),
+                    Rect::new(metrics[i].x, metrics[i].y + 1, metrics[i].width, 1),
+                );
+            }
         }
-        let main = r(
-            3,
-            12,
-            a.width.saturating_sub(6),
-            a.height.saturating_sub(18),
-        );
+        let main = if compact {
+            r(1, 2, a.width.saturating_sub(2), a.height.saturating_sub(8))
+        } else {
+            r(
+                3,
+                12,
+                a.width.saturating_sub(6),
+                a.height.saturating_sub(18),
+            )
+        };
         let cols = Layout::horizontal([
-            Constraint::Length(25),
-            Constraint::Min(15),
-            Constraint::Percentage(35),
+            Constraint::Length(if compact { 18 } else { 25 }),
+            Constraint::Min(32),
+            Constraint::Fill(1),
         ])
         .spacing(1)
         .split(main);
@@ -311,14 +331,19 @@ impl App {
             cols[0].x + 2,
             cols[0].y + 3,
             cols[0].width.saturating_sub(4),
-            cols[0].height.saturating_sub(7),
+            if compact {
+                8.min(cols[0].height.saturating_sub(4))
+            } else {
+                16.min(cols[0].height.saturating_sub(7))
+            },
         );
+        let stride = (self.crew_area.height / 4).max(1);
         for (i, name) in NAMES.iter().enumerate() {
-            let y = self.crew_area.y + i as u16 * 4;
-            if y + 3 > self.crew_area.bottom() {
+            let y = self.crew_area.y + i as u16 * stride;
+            if y + stride > self.crew_area.bottom() {
                 break;
             }
-            let row = r(self.crew_area.x, y, self.crew_area.width, 3);
+            let row = r(self.crew_area.x, y, self.crew_area.width, stride);
             if i == self.selected {
                 f.render_widget(
                     Block::default().style(Style::default().bg(color(&t.selection))),
@@ -348,11 +373,18 @@ impl App {
                 ]),
                 Line::styled(format!("   {}", STATUSES[i].to_lowercase()), style),
             ];
-            f.render_widget(Paragraph::new(lines), r(row.x, row.y + 1, row.width, 2));
+            f.render_widget(
+                Paragraph::new(lines),
+                r(row.x, row.y + u16::from(!compact), row.width, 2),
+            );
         }
         f.render_widget(
-            Paragraph::new("↑ ↓ select an agent\nEnter to inspect")
-                .style(Style::default().fg(color("666f78"))),
+            Paragraph::new(if compact {
+                "↑ ↓ select\nEnter: edit"
+            } else {
+                "↑ ↓ select an agent\nEnter to inspect"
+            })
+            .style(Style::default().fg(color("666f78"))),
             r(
                 cols[0].x + 3,
                 cols[0].bottom().saturating_sub(4),
@@ -361,7 +393,7 @@ impl App {
             ),
         );
         let x = cols[1].x + 2;
-        let y = cols[1].y + 4;
+        let y = cols[1].y + 3;
         let w = cols[1].width.saturating_sub(4);
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -463,7 +495,7 @@ impl App {
         );
         let feed = r(
             cols[2].x + 2,
-            cols[2].y + 4,
+            cols[2].y + 3,
             cols[2].width.saturating_sub(5),
             cols[2].height.saturating_sub(6),
         );
