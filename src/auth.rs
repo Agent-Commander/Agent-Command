@@ -184,6 +184,13 @@ impl Profile {
         Ok(profile)
     }
 
+    pub(crate) fn checkpoint_directory(&self) -> io::Result<PathBuf> {
+        self.directory(false)?;
+        let directory = self.root.join("agent-command-checkpoints-v1");
+        privacy::create(&directory)?;
+        Ok(directory)
+    }
+
     pub(crate) fn isolated_command(&self) -> io::Result<(Command, PathBuf)> {
         let directory = self.directory(false)?;
         Ok((self.command(&directory), directory))

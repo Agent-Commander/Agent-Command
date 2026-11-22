@@ -1,5 +1,6 @@
 use crate::{
     auth::{Profile, Provider},
+    checkpoint::{Checkpoint, Progress},
     usage::{self, Usage},
 };
 use serde_json::Value;
@@ -19,6 +20,7 @@ use std::{
 pub(crate) enum Event {
     Running { profile: usize, rotated: bool },
     Output(String),
+    Continuing { from: usize, to: usize },
     Finished(io::Result<()>),
 }
 
@@ -40,23 +42,107 @@ impl Mission {
         workspace: PathBuf,
         prompt: String,
     ) -> Self {
+        Self::launch_with_clock(profiles, preferred, workspace, prompt, usage::now)
+    }
+
+    fn launch_with_clock(
+        profiles: Vec<Profile>,
+        preferred: usize,
+        workspace: PathBuf,
+        prompt: String,
+        clock: fn() -> i64,
+    ) -> Self {
         let (sender, events) = mpsc::sync_channel(64);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         thread::spawn(move || {
-            let result = (|| {
-                let (index, command) = select_command(&profiles, preferred, usage::now())?;
-                run(
-                    (command, profiles[index].clone(), index, index != preferred),
-                    workspace,
-                    prompt,
-                    &sender,
-                    &worker_cancel,
-                )
-            })();
+            let execution = Execution {
+                profiles,
+                workspace,
+                prompt,
+                clock,
+            };
+            let result = execution.run(preferred, &sender, &worker_cancel);
             let _ = sender.send(Event::Finished(result));
         });
         Self { events, cancel }
+    }
+}
+
+struct Execution {
+    profiles: Vec<Profile>,
+    workspace: PathBuf,
+    prompt: String,
+    clock: fn() -> i64,
+}
+
+impl Execution {
+    fn run(
+        &self,
+        preferred: usize,
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let (index, command) = select_command(&self.profiles, preferred, (self.clock)())?;
+        let profile = &self.profiles[index];
+        let limit = run(
+            (command, profile.clone(), index, index != preferred),
+            &self.workspace,
+            self.prompt.clone(),
+            sender,
+            cancel,
+            self.clock,
+        )?;
+        let Some(progress) = limit else { return Ok(()) };
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let checkpoint = Checkpoint::save(profile, uuid::Uuid::new_v4(), &self.workspace, progress)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "Usage limit reached; mission stopped without replay. {error}"
+                ))
+            })?;
+        let (to, next) = self.alternate(index).ok_or_else(|| {
+            io::Error::other(
+            "Usage limit reached; mission stopped without replay. No eligible signed-in alternate."
+        )
+        })?;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
+        if sender.send(Event::Continuing { from: index, to }).is_err() {
+            return Ok(());
+        }
+        if run(
+            (next, self.profiles[to].clone(), to, false),
+            &self.workspace,
+            checkpoint.prompt(&self.prompt),
+            sender,
+            cancel,
+            self.clock,
+        )?
+        .is_some()
+        {
+            return Err(io::Error::other(
+                "Continuation hit a usage limit; mission stopped without replay",
+            ));
+        }
+        Ok(())
+    }
+
+    fn alternate(&self, index: usize) -> Option<(usize, std::process::Command)> {
+        usage::alternates(&self.profiles, index, (self.clock)())
+            .into_iter()
+            .find_map(|candidate| {
+                let profile = &self.profiles[candidate];
+                let command = profile.authenticated_command().ok()?;
+                Usage::read(profile)
+                    .ok()?
+                    .eligible_alternate((self.clock)())
+                    .then_some((candidate, command))
+            })
     }
 }
 
@@ -82,14 +168,15 @@ fn select_command(
 
 fn run(
     selection: (std::process::Command, Profile, usize, bool),
-    workspace: PathBuf,
+    workspace: &std::path::Path,
     prompt: String,
     sender: &SyncSender<Event>,
     cancel: &AtomicBool,
-) -> io::Result<()> {
+    clock: fn() -> i64,
+) -> io::Result<Option<Progress>> {
     let (mut command, profile, index, rotated) = selection;
     if cancel.load(Ordering::Relaxed) {
-        return Ok(());
+        return Ok(None);
     }
     match profile.provider {
         Provider::Claude => command.args([
@@ -127,14 +214,14 @@ fn run(
     let limited = Arc::new(AtomicBool::new(false));
     let output_limit = Arc::clone(&limited);
     let reader =
-        thread::spawn(move || read_output(&profile, stdout, &stdout_sender, &output_limit));
+        thread::spawn(move || read_output(&profile, stdout, &stdout_sender, &output_limit, clock));
     let mut stdin = child.stdin.take().expect("mission stdin is piped");
     let writer = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             child.wait()?;
-            return Ok(());
+            return Ok(None);
         }
         if limited.load(Ordering::Acquire) {
             let _ = child.kill();
@@ -145,20 +232,19 @@ fn run(
         }
         thread::sleep(Duration::from_millis(50));
     };
-    reader
+    let (progress, completed) = reader
         .join()
         .map_err(|_| io::Error::other("Mission output reader stopped"))??;
     if limited.load(Ordering::Acquire) {
-        return Err(io::Error::other(
-            "Provider usage limit reached; mission stopped without replay",
-        ));
+        return Ok((!completed).then_some(progress));
     }
     if !status.success() {
         return Err(io::Error::other(format!("Provider exited with {status}")));
     }
     writer
         .join()
-        .map_err(|_| io::Error::other("Mission input writer stopped"))?
+        .map_err(|_| io::Error::other("Mission input writer stopped"))??;
+    Ok(None)
 }
 
 fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
@@ -182,13 +268,25 @@ fn read_output(
     stdout: impl io::Read,
     sender: &SyncSender<Event>,
     limited: &AtomicBool,
-) -> io::Result<()> {
+    clock: fn() -> i64,
+) -> io::Result<(Progress, bool)> {
+    let mut progress = Progress::default();
+    let mut completed = false;
     for line in BufReader::new(stdout).lines() {
         let line = line?;
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let observed = usage::now();
+        let observed = clock();
+        record_progress(profile.provider, &event, &mut progress);
+        completed |= match profile.provider {
+            Provider::Claude => {
+                event["type"] == "result"
+                    && event["subtype"] == "success"
+                    && event["is_error"] == false
+            }
+            Provider::Codex => event["type"] == "turn.completed",
+        };
         let limit = match profile.provider {
             Provider::Claude => Usage::observe_claude(profile, &event, observed)?,
             Provider::Codex if codex_limit(&event) => {
@@ -208,12 +306,36 @@ fn read_output(
                     .take(500)
                     .collect();
                 if sender.send(Event::Output(safe)).is_err() {
-                    return Ok(());
+                    return Ok((progress, completed));
                 }
             }
         }
     }
-    Ok(())
+    Ok((progress, completed))
+}
+
+fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
+    match (provider, event["type"].as_str()) {
+        (Provider::Claude, Some("assistant")) => progress.assistant_messages += 1,
+        (Provider::Claude, Some("user")) => {
+            let tools = event["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "tool_result" && item["is_error"] != true);
+            progress.completed_tool_events += tools.count() as u64;
+        }
+        (Provider::Codex, Some("item.completed")) => match event["item"]["type"].as_str() {
+            Some("agent_message") => progress.assistant_messages += 1,
+            Some("command_execution" | "file_change" | "mcp_tool_call")
+                if event["item"]["status"] == "completed" =>
+            {
+                progress.completed_tool_events += 1
+            }
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 fn codex_limit(event: &Value) -> bool {
@@ -233,10 +355,210 @@ fn codex_limit(event: &Value) -> bool {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::usage::tests::Fixture;
     use serde_json::json;
+
+    const FAKE_NOW: i64 = 1_000;
+
+    fn git_workspace(fixture: &Fixture) -> PathBuf {
+        let workspace = fixture.root.join("work");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("completed"), "").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "completed"],
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-qm",
+                "Fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&workspace)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        workspace
+    }
+
+    pub(crate) fn limit_fixture(name: &str, now: i64) -> (Fixture, PathBuf, Vec<Profile>) {
+        let fixture = Fixture::new(
+            name,
+            r#"
+profile=${CLAUDE_CONFIG_DIR##*/}
+work="${CLAUDE_CONFIG_DIR%/profiles/claude/*}/work"
+if test "$1" = auth; then
+    if test "$profile" = standby && test -f "$work/.git/change-after-checkpoint"; then
+        printf 'changed\n' >> "$work/completed"
+    fi
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+prompt=$(cat)
+if test "$profile" = first; then
+    test "$prompt" = "Keep the finished step" || exit 7
+    printf 'done\n' >> completed
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Finished the first step"}]}}'
+    printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","content":"fixture-credential-never-persist"}]}}'
+    if test -f .git/completed-before-limit; then
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+    fi
+    printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}'
+    exit 1
+fi
+test "$(cat completed)" = done || exit 8
+case "$prompt" in
+  *"1 assistant messages and 1 completed tool events"*"do not redo completed work"*"Keep the finished step"*) ;;
+  *) exit 9 ;;
+esac
+printf 'continued\n' >> completed
+"#,
+        );
+        let workspace = git_workspace(&fixture);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "first"),
+            fixture.profile(Provider::Claude, "standby"),
+        ];
+        Usage::observe_claude(
+            &profiles[1],
+            &json!({
+                "type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{
+                    "five_hour":{"utilization":0.25,"resetsAt":now + 3000},
+                    "seven_day":{"utilization":0.25,"resetsAt":now + 8000}
+                }}
+            }),
+            now,
+        )
+        .unwrap();
+        (fixture, workspace, profiles)
+    }
+
+    fn drain(mission: &Mission) -> (Vec<(usize, usize)>, io::Result<()>) {
+        let mut links = Vec::new();
+        loop {
+            match mission.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Continuing { from, to } => links.push((from, to)),
+                Event::Finished(result) => return (links, result),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_mission_checkpoints_once_and_continues_on_the_next_profile() {
+        let (_fixture, workspace, profiles) = limit_fixture("continue", FAKE_NOW);
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            0,
+            workspace.clone(),
+            "Keep the finished step".into(),
+            || FAKE_NOW,
+        );
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert_eq!(links, [(0, 1)]);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("completed")).unwrap(),
+            "done\ncontinued\n"
+        );
+        assert!(Usage::read(&profiles[0]).unwrap().blocked(FAKE_NOW));
+        let directory = profiles[0].checkpoint_directory().unwrap();
+        let paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 2);
+        let checkpoint_path = paths
+            .iter()
+            .find(|path| path.extension().unwrap() == "json")
+            .unwrap();
+        let bytes = std::fs::read_to_string(checkpoint_path).unwrap();
+        for excluded in [
+            "fixture-credential-never-persist",
+            "Finished the first step",
+            "Keep the finished step",
+        ] {
+            assert!(!bytes.contains(excluded));
+        }
+        let checkpoint: Checkpoint = serde_json::from_str(&bytes).unwrap();
+        for _ in 0..2 {
+            let error = checkpoint
+                .reserve(&profiles[0], &workspace, &profiles[1])
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("already claimed for this checkpoint by claude/standby"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("completed")).unwrap(),
+            "done\ncontinued\n"
+        );
+    }
+
+    #[test]
+    fn a_completed_mission_never_creates_a_continuation() {
+        let (_fixture, workspace, profiles) = limit_fixture("completed", FAKE_NOW);
+        std::fs::write(workspace.join(".git/completed-before-limit"), "").unwrap();
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            0,
+            workspace.clone(),
+            "Keep the finished step".into(),
+            || FAKE_NOW,
+        );
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert!(links.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("completed")).unwrap(),
+            "done\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(profiles[0].checkpoint_directory().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn changed_workspace_refuses_the_cross_profile_continuation() {
+        let (_fixture, workspace, profiles) = limit_fixture("changed-workspace", FAKE_NOW);
+        std::fs::write(workspace.join(".git/change-after-checkpoint"), "").unwrap();
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            0,
+            workspace.clone(),
+            "Keep the finished step".into(),
+            || FAKE_NOW,
+        );
+        let (links, result) = drain(&mission);
+        assert!(links.is_empty());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Workspace changed since the interruption"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("completed")).unwrap(),
+            "done\nchanged\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(profiles[0].checkpoint_directory().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn a_new_mission_rotates_once_to_the_first_authorized_alternate() {
@@ -312,21 +634,14 @@ fi
 exit 1
 "#,
         );
+        let workspace = git_workspace(&fixture);
         for provider in [Provider::Claude, Provider::Codex] {
             let selected = fixture.profile(provider, "original");
             let standby = fixture.profile(provider, "standby");
-            if provider == Provider::Claude {
-                Usage::observe_claude(&standby, &json!({
-                    "type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{
-                        "five_hour":{"utilization":0.25,"resetsAt":4102444800_i64},
-                        "seven_day":{"utilization":0.25,"resetsAt":4102444800_i64}
-                    }}
-                }), usage::now()).unwrap();
-            }
             let mission = Mission::launch(
                 vec![selected.clone(), standby],
                 0,
-                fixture.root.clone(),
+                workspace.clone(),
                 "Do work".into(),
             );
             assert!(matches!(
@@ -341,11 +656,14 @@ exit 1
             else {
                 panic!("expected interrupted outcome")
             };
-            assert!(result.unwrap_err().to_string().contains("without replay"));
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("No eligible signed-in alternate"));
             assert!(Usage::read(&selected).unwrap().blocked(usage::now()));
         }
         assert_eq!(
-            std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
+            std::fs::read_to_string(workspace.join("starts")).unwrap(),
             "claude\ncodex\n"
         );
     }

@@ -118,15 +118,34 @@ unavailable. Agent Command sends no synthetic Claude prompts to collect usage.
 
 A reported subscription limit latches the profile until the provider's reset
 time. When no reliable reset is available, the profile stays latched and shows
-“reset unknown.” The app keeps only usage metadata in its private
-`agent-command-usage-v1` directory under the isolated profile root.
+“reset unknown.” Usage metadata lives in the private `agent-command-usage-v1`
+directory under the isolated profile root.
 
-When submitting a new mission with a latched preferred profile, Agent Command
-can select the first signed-in same-provider profile by name that has fresh
-headroom in both windows. The feed explains the selection. An interrupted
-mission stops. The provider interfaces used here do not establish that a
-session can be transferred across isolated accounts or that arbitrary side
-effects can resume exactly once.
+For new missions, a latched preferred profile can be replaced by the first
+signed-in same-provider profile by name with fresh headroom in both windows.
+If the provider interrupts a mission with a usage limit, Agent Command creates
+a checkpoint for the root of a Git workspace. It checks the workspace again
+before launching one continuation on an eligible alternate. The terminal shows
+the source and destination profiles together with the reason. It stops if there
+is no eligible account, the workspace changed, or a continuation also hits a limit.
 
-Reverting the Stage 2 commit restores Stage 1 behavior. The usage metadata
-directory is independent of provider configuration and Stage 1 ignores it.
+A checkpoint stores a mission UUID, the interrupted profile, counts of observed
+assistant and completed tool events, and a SHA-256 digest covering HEAD, index,
+and tracked and non-ignored working files. It contains no task text, transcript,
+file content, or credentials. The live process supplies the original task and
+progress counts to the alternate, instructs it to inspect existing work and
+skip anything already completed, and tells it to stop if prior external effects
+are uncertain. The app cannot verify arbitrary effects outside the workspace.
+Symlinks, repository submodules, and non-Git workspaces prevent automatic
+continuation. Profile state must be stored outside the Git worktree.
+
+The private `agent-command-checkpoints-v1` directory also stores a claim before
+the alternate starts, so a restart or repeat claim cannot schedule the same
+continuation again. If the app exits after claiming but before it launches the
+CLI, it leaves the claim in place and does not start another process. A fresh
+app cannot reconstruct an unclaimed mission because the task text was held only
+in memory.
+
+Reverting the follow-up commit removes checkpoint continuation. Reverting both
+Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the Stage 2 state
+directories.

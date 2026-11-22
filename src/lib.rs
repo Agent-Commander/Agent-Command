@@ -1,4 +1,5 @@
 mod auth;
+mod checkpoint;
 mod cli;
 mod mission;
 mod usage;
@@ -94,6 +95,7 @@ struct Live {
     usage_checked_at: Option<i64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
+    continuation: Option<String>,
     mission: Option<(usize, mission::Mission)>,
     outcomes: [&'static str; 4],
 }
@@ -202,6 +204,7 @@ impl App {
             usage_checked_at: None,
             usage_worker: None,
             running_profile: None,
+            continuation: None,
             mission: None,
             outcomes: ["READY"; 4],
         });
@@ -251,6 +254,12 @@ impl App {
                         self.push_log(format!("SYSTEM  {reason}"));
                     }
                 }
+                Ok(mission::Event::Continuing { from, to }) => {
+                    let link = format!("Limit: {} → {}", live.profiles[from], live.profiles[to]);
+                    live.continuation = Some(link.clone());
+                    self.notice = link.clone();
+                    self.push_log(format!("SYSTEM  {link}"));
+                }
                 Ok(mission::Event::Output(text)) => {
                     self.push_log(format!("{}  {text}", NAMES[agent]))
                 }
@@ -271,7 +280,10 @@ impl App {
         live.refresh_usage();
         live.outcomes[agent] = if result.is_ok() { "DONE" } else { "FAILED" };
         self.notice = match result {
-            Ok(()) => format!("{} completed the mission.", NAMES[agent]),
+            Ok(()) => live.continuation.as_ref().map_or_else(
+                || format!("{} completed the mission.", NAMES[agent]),
+                |link| format!("Done · {link}"),
+            ),
             Err(error) => format!("{}: {error}", NAMES[agent]),
         };
     }
@@ -345,6 +357,7 @@ impl App {
             };
             self.notice = format!("Starting {profile} in {}", live.workspace.display());
             live.outcomes[self.selected] = "STARTING";
+            live.continuation = None;
             live.mission = Some((
                 self.selected,
                 mission::Mission::launch(
@@ -928,10 +941,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_mission_uses_selected_profile_and_renders_output_and_outcome() {
-        use std::{
-            os::unix::fs::PermissionsExt,
-            time::{Duration, Instant},
-        };
+        use std::os::unix::fs::PermissionsExt;
         let workspace =
             std::env::temp_dir().join(format!("agent-command-mission-{}", std::process::id()));
         fs::create_dir(&workspace).unwrap();
@@ -991,6 +1001,7 @@ while test ! -f release-mission; do sleep 0.01; done
                     usage_checked_at: None,
                     usage_worker: None,
                     running_profile: None,
+                    continuation: None,
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),
@@ -1051,14 +1062,70 @@ while test ! -f release-mission; do sleep 0.01; done
             fs::remove_file(workspace.join("release-mission")).unwrap();
         }
         fs::remove_dir_all(workspace).unwrap();
+    }
 
-        fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !ready(app) {
-                assert!(Instant::now() < deadline, "{}", app.notice);
-                app.poll_mission();
-                std::thread::sleep(Duration::from_millis(10));
+    #[cfg(unix)]
+    fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready(app) {
+            assert!(Instant::now() < deadline, "{}", app.notice);
+            app.poll_mission();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuation_receipt_is_visible_after_keyboard_and_mouse_submission() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (width, height, keyboard) in [(80, 24, true), (120, 40, false)] {
+            let (_fixture, workspace, profiles) =
+                mission::tests::limit_fixture(&format!("continuation-panel-{width}"), usage::now());
+            let mut app = App {
+                live: Some(Live {
+                    workspace: workspace.clone(),
+                    profiles,
+                    selected_profile: 0,
+                    profile_area: Rect::default(),
+                    usage: None,
+                    usage_checked_at: None,
+                    usage_worker: None,
+                    running_profile: None,
+                    continuation: None,
+                    mission: None,
+                    outcomes: ["READY"; 4],
+                }),
+                input: "Keep the finished step".into(),
+                editing: keyboard,
+                ..App::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                app.click(app.send_area.x, app.send_area.y);
+                app.click(app.send_area.x, app.send_area.y);
             }
+            wait_for(&mut app, |app| !app.mission_running());
+            assert_eq!(app.status(0), "DONE", "{}", app.notice);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let notice: String = (0..width)
+                .map(|x| buffer[(x, height - 2)].symbol())
+                .collect();
+            assert!(
+                notice.contains("Done · Limit: claude/first → claude/standby"),
+                "{notice}"
+            );
+            assert_eq!(
+                fs::read_to_string(workspace.join("completed")).unwrap(),
+                "done\ncontinued\n"
+            );
         }
     }
 
@@ -1101,6 +1168,7 @@ while test ! -f release-mission; do sleep 0.01; done
                     usage_checked_at: None,
                     usage_worker: None,
                     running_profile: None,
+                    continuation: None,
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),

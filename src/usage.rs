@@ -189,17 +189,23 @@ pub(crate) fn choices(profiles: &[Profile], preferred: usize, now: i64) -> io::R
     if !Usage::read(selected)?.blocked(now) {
         return Ok(vec![preferred]);
     }
+    Ok(alternates(profiles, preferred, now))
+}
+
+pub(crate) fn alternates(profiles: &[Profile], preferred: usize, now: i64) -> Vec<usize> {
     let mut alternates: Vec<_> = profiles
         .iter()
         .enumerate()
-        .filter(|(_, profile)| profile.provider == selected.provider)
+        .filter(|(index, profile)| {
+            *index != preferred && profile.provider == profiles[preferred].provider
+        })
         .filter(|(_, profile)| {
             Usage::read(profile).is_ok_and(|usage| usage.eligible_alternate(now))
         })
         .map(|(index, profile)| (profile.to_string(), index))
         .collect();
     alternates.sort_unstable();
-    Ok(alternates.into_iter().map(|(_, index)| index).collect())
+    alternates.into_iter().map(|(_, index)| index).collect()
 }
 
 fn codex_windows(

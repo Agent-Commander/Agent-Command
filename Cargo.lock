@@ -12,7 +12,9 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
+ "uuid",
  "windows-sys",
 ]
 
@@ -1676,6 +1678,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
