@@ -1,6 +1,7 @@
 mod auth;
 mod cli;
 mod mission;
+mod usage;
 pub use cli::run_cli;
 
 use std::{
@@ -89,8 +90,51 @@ struct Live {
     profiles: Vec<auth::Profile>,
     selected_profile: usize,
     profile_area: Rect,
+    usage: Option<usage::Usage>,
+    usage_checked_at: Option<i64>,
+    usage_worker: Option<std::thread::JoinHandle<()>>,
+    running_profile: Option<usize>,
     mission: Option<(usize, mission::Mission)>,
     outcomes: [&'static str; 4],
+}
+
+impl Live {
+    fn refresh_usage(&mut self) {
+        let now = usage::now();
+        if self.usage_checked_at == Some(now) {
+            return;
+        }
+        self.usage_checked_at = Some(now);
+        let displayed = self.running_profile.unwrap_or(self.selected_profile);
+        self.usage = self
+            .profiles
+            .get(displayed)
+            .and_then(|profile| usage::Usage::read(profile).ok());
+        if self.mission.is_some()
+            || self
+                .usage_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            return;
+        }
+        let due: Vec<_> = self
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.provider == auth::Provider::Codex
+                    && usage::Usage::read(profile).is_ok_and(|usage| usage.codex_due(now))
+            })
+            .cloned()
+            .collect();
+        if !due.is_empty() {
+            self.usage_worker = Some(std::thread::spawn(move || {
+                for profile in due {
+                    let _ = usage::refresh_codex(&profile, usage::now());
+                }
+            }));
+        }
+    }
 }
 
 pub struct App {
@@ -154,6 +198,10 @@ impl App {
             profiles,
             selected_profile: 0,
             profile_area: Rect::default(),
+            usage: None,
+            usage_checked_at: None,
+            usage_worker: None,
+            running_profile: None,
             mission: None,
             outcomes: ["READY"; 4],
         });
@@ -165,8 +213,10 @@ impl App {
 
     fn select_profile(&mut self) {
         let Some(live) = &mut self.live else { return };
-        if !live.profiles.is_empty() {
+        if live.mission.is_none() && !live.profiles.is_empty() {
             live.selected_profile = (live.selected_profile + 1) % live.profiles.len();
+            live.usage_checked_at = None;
+            live.refresh_usage();
         }
     }
 
@@ -177,6 +227,9 @@ impl App {
     }
 
     fn poll_mission(&mut self) {
+        if let Some(live) = &mut self.live {
+            live.refresh_usage();
+        }
         for _ in 0..64 {
             let Some(live) = &mut self.live else { return };
             let Some((agent, running)) = &live.mission else {
@@ -184,7 +237,20 @@ impl App {
             };
             let agent = *agent;
             match running.events.try_recv() {
-                Ok(mission::Event::Running) => live.outcomes[agent] = "RUNNING",
+                Ok(mission::Event::Running { profile, rotated }) => {
+                    live.outcomes[agent] = "RUNNING";
+                    live.running_profile = Some(profile);
+                    live.usage_checked_at = None;
+                    live.refresh_usage();
+                    if rotated {
+                        let reason = format!(
+                            "{} selected because the preferred profile is latched.",
+                            live.profiles[profile]
+                        );
+                        self.notice = reason.clone();
+                        self.push_log(format!("SYSTEM  {reason}"));
+                    }
+                }
                 Ok(mission::Event::Output(text)) => {
                     self.push_log(format!("{}  {text}", NAMES[agent]))
                 }
@@ -200,6 +266,9 @@ impl App {
     fn finish_mission(&mut self, agent: usize, result: io::Result<()>) {
         let live = self.live.as_mut().expect("live mission");
         live.mission = None;
+        live.running_profile = None;
+        live.usage_checked_at = None;
+        live.refresh_usage();
         live.outcomes[agent] = if result.is_ok() { "DONE" } else { "FAILED" };
         self.notice = match result {
             Ok(()) => format!("{} completed the mission.", NAMES[agent]),
@@ -278,7 +347,12 @@ impl App {
             live.outcomes[self.selected] = "STARTING";
             live.mission = Some((
                 self.selected,
-                mission::Mission::launch(profile, live.workspace.clone(), command.clone()),
+                mission::Mission::launch(
+                    live.profiles.clone(),
+                    live.selected_profile,
+                    live.workspace.clone(),
+                    command.clone(),
+                ),
             ));
             self.missions[self.selected] = command;
             self.input.clear();
@@ -427,14 +501,20 @@ impl App {
                 );
             }
         }
+        let usage_rows = if self.live.is_some() { 2 } else { 0 };
         let main = if compact {
-            r(1, 2, a.width.saturating_sub(2), a.height.saturating_sub(8))
+            r(
+                1,
+                2,
+                a.width.saturating_sub(2),
+                a.height.saturating_sub(8 + usage_rows),
+            )
         } else {
             r(
                 3,
                 12,
                 a.width.saturating_sub(6),
-                a.height.saturating_sub(18),
+                a.height.saturating_sub(18 + usage_rows),
             )
         };
         let cols = Layout::horizontal([
@@ -665,14 +745,33 @@ impl App {
         f.render_widget(paragraph.scroll((scroll, 0)), feed);
         let iy = a.height.saturating_sub(5);
         if let Some(live) = &mut self.live {
-            live.profile_area = r(7, iy.saturating_sub(1), a.width.saturating_sub(14), 1);
-            let label = live.profiles.get(live.selected_profile).map_or_else(
+            live.profile_area = r(7, iy.saturating_sub(3), a.width.saturating_sub(14), 1);
+            let now = usage::now();
+            let selected = live.running_profile.unwrap_or(live.selected_profile);
+            let label = live.profiles.get(selected).map_or_else(
                 || "No profiles · agent-command auth login PROVIDER PROFILE".into(),
-                |profile| format!("Profile {profile}  ·  F2 or click to switch"),
+                |profile| {
+                    let latch = live.usage.map_or_else(
+                        || "State unavailable".into(),
+                        |usage| usage.latch_label(now),
+                    );
+                    let control = if live.running_profile.is_some() {
+                        "Running"
+                    } else {
+                        "F2 / click"
+                    };
+                    format!("{control} · {latch} · {profile}")
+                },
             );
+            let [five, week] = live.usage.unwrap_or_default().rows(now);
             f.render_widget(
                 Paragraph::new(label).style(Style::default().fg(color(&t.accent))),
                 live.profile_area,
+            );
+            f.render_widget(
+                Paragraph::new(vec![Line::raw(five), Line::raw(week)])
+                    .style(Style::default().fg(color(&t.muted))),
+                r(7, iy.saturating_sub(2), a.width.saturating_sub(14), 2),
             );
         }
         f.render_widget(
@@ -764,7 +863,6 @@ pub fn snapshot(path: &Path) -> io::Result<()> {
         Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         _ => "#c0c6cd".into(),
     };
-    // Paint backgrounds before text to avoid adjacent cells clipping glyphs.
     for y in 0..46 {
         for x in 0..150 {
             let cell = &buffer[(x, y)];
@@ -889,6 +987,10 @@ while test ! -f release-mission; do sleep 0.01; done
                     profiles: vec![codex.clone(), claude.clone()],
                     selected_profile: usize::from(!key),
                     profile_area: Rect::default(),
+                    usage: None,
+                    usage_checked_at: None,
+                    usage_worker: None,
+                    running_profile: None,
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),
@@ -957,6 +1059,81 @@ while test ! -f release-mission; do sleep 0.01; done
                 app.poll_mission();
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_panel_shows_selected_allowances_and_latch_with_keyboard_and_mouse() {
+        use auth::Provider;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use serde_json::json;
+        use usage::{tests::Fixture, Usage};
+
+        let fixture = Fixture::new("usage-panel", "");
+        let ready = fixture.profile(Provider::Claude, "ready");
+        let latched = fixture.profile(Provider::Claude, "latched");
+        let now = usage::now();
+        Usage::observe_claude(
+            &latched,
+            &json!({
+                "type":"rate_limit_event",
+                "rate_limit_info":{
+                    "status":"rejected","resetsAt":now + 7200,
+                    "unifiedWindows":{
+                        "five_hour":{"utilization":0.25,"resetsAt":now + 7200},
+                        "seven_day":{"utilization":0.60,"resetsAt":now + 86400}
+                    }
+                }
+            }),
+            now,
+        )
+        .unwrap();
+
+        for (width, height, key) in [(80, 24, true), (120, 40, false)] {
+            let mut app = App {
+                live: Some(Live {
+                    workspace: fixture.root.clone(),
+                    profiles: vec![ready.clone(), latched.clone()],
+                    selected_profile: 0,
+                    profile_area: Rect::default(),
+                    usage: None,
+                    usage_checked_at: None,
+                    usage_worker: None,
+                    running_profile: None,
+                    mission: None,
+                    outcomes: ["READY"; 4],
+                }),
+                ..App::default()
+            };
+            app.poll_mission();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let area = app.live.as_ref().unwrap().profile_area;
+            let panel = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+                let buffer = terminal.backend().buffer();
+                (area.y..area.y + 3)
+                    .map(|y| {
+                        (area.x..area.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let initial = panel(&terminal);
+            assert!(initial[0].contains("No latch · claude/ready"));
+            assert!(initial[1].contains("5h unavailable"));
+            if key {
+                app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+            } else {
+                app.click(area.x, area.y);
+            }
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let changed = panel(&terminal);
+            assert!(changed[0].contains("Latched") && changed[0].contains("claude/latched"));
+            assert!(changed[1].contains("5h 25% used / 75% left, reset"));
+            assert!(changed[2].contains("Week 60% used / 40% left, reset"));
         }
     }
 

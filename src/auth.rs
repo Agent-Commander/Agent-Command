@@ -153,14 +153,40 @@ fn inherited_provider_variable(key: &str) -> bool {
 impl Profile {
     #[cfg(all(test, unix))]
     pub(crate) fn fixture(root: &Path, provider: Provider, executable: PathBuf) -> Self {
+        Self::named_fixture(root, provider, "fixture", executable)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn named_fixture(
+        root: &Path,
+        provider: Provider,
+        name: &str,
+        executable: PathBuf,
+    ) -> Self {
         let profile = Self {
             provider,
-            name: "fixture".into(),
+            name: name.into(),
             root: root.into(),
             executable: Some(executable),
         };
         profile.directory(true).unwrap();
         profile
+    }
+
+    pub(crate) fn usage_directory(&self) -> io::Result<PathBuf> {
+        self.directory(false)?;
+        let usage = self.root.join("agent-command-usage-v1");
+        let provider = usage.join(self.provider.binary());
+        let profile = provider.join(&self.name);
+        for path in [&usage, &provider, &profile] {
+            privacy::create(path)?;
+        }
+        Ok(profile)
+    }
+
+    pub(crate) fn isolated_command(&self) -> io::Result<(Command, PathBuf)> {
+        let directory = self.directory(false)?;
+        Ok((self.command(&directory), directory))
     }
 
     fn directory(&self, create: bool) -> io::Result<PathBuf> {

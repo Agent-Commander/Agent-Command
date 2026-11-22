@@ -102,3 +102,31 @@ F2 or click the profile row to choose the provider and profile. Enter a
 mission and press Enter or click Send. The status and assistant output appear
 in the mission panel and ship's log. One mission runs at a time. Reopen the
 TUI after adding a profile in another terminal.
+
+### Subscription usage in the terminal
+
+Use F2 or click the profile row to inspect each profile. The usage rows show
+used and remaining percentages, time until reset, and observation age. Readings
+become stale after 15 minutes, at the window reset, or when a refreshed reading
+is unavailable.
+
+Agent Command reads Codex usage through its local app server. Readbacks for a
+profile start at least five minutes apart, including across app restarts, and
+are skipped during a known latch. Claude readings come from the native CLI's
+structured mission stream when it reports a window. An unreported window is
+unavailable. Agent Command sends no synthetic Claude prompts to collect usage.
+
+A reported subscription limit latches the profile until the provider's reset
+time. When no reliable reset is available, the profile stays latched and shows
+“reset unknown.” The app keeps only usage metadata in its private
+`agent-command-usage-v1` directory under the isolated profile root.
+
+When submitting a new mission with a latched preferred profile, Agent Command
+can select the first signed-in same-provider profile by name that has fresh
+headroom in both windows. The feed explains the selection. An interrupted
+mission stops. The provider interfaces used here do not establish that a
+session can be transferred across isolated accounts or that arbitrary side
+effects can resume exactly once.
+
+Reverting the Stage 2 commit restores Stage 1 behavior. The usage metadata
+directory is independent of provider configuration and Stage 1 ignores it.
