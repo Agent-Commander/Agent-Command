@@ -45,3 +45,10 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | Intent to add carries a working-copy hash and no staged blob | `intent_to_add_records_worktree_without_an_index_blob` |
 | Working-copy edit carries the base blob and edited file hashes | `worktree_only_edit_reports_head_blob_and_worktree_hash` |
 | Non-UTF-8 path bytes and a staged object-type change are preserved | `non_utf8_paths_round_trip_as_hex` and `staged_type_change_hashes_link_blob_without_following_it` |
+
+| Unsupported workspace entry | Executable check |
+|---|---|
+| Nested Git repository and mutation after checkpointing on the prior behavior | `nested_repository_mutation_cannot_authorize_a_reopened_claim` |
+| Nested repository added after a valid claim | `reopened_claim_refuses_a_new_nested_repository` |
+| Terminal directory, FIFO, Unix socket, or device | `terminal_directory_is_not_a_missing_worktree_file`, `fifo_omitted_by_git_is_refused_by_path`, `unix_socket_omitted_by_git_is_refused_by_path`, `character_device_is_refused_by_path_before_open` |
+| Unreadable file, staged gitlink, or working symlink | `unreadable_regular_file_is_refused_by_path`, `staged_gitlink_is_refused_by_path`, `working_symlink_is_refused_by_path` |

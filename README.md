@@ -138,7 +138,9 @@ untracked paths, and separate SHA-256 hashes of the staged blob and working copy
 the task, transcript, file contents, or credentials in checkpoint state.
 The alternate receives instructions to inspect retained work and skip
 completed actions. The app cannot control the provider's decisions or verify
-effects outside the workspace. Symlinks, submodules, and non-Git workspaces
+effects outside the workspace. A nested Git repository, submodule, symlink, or unsupported or unreadable
+worktree entry stops continuation and identifies the path. This includes
+special files Git leaves out of its file listing. Non-Git workspaces also
 prevent continuation. Keep isolated profile state outside the worktree.
 
 If the app closes with a pending claim, reopen the same workspace. Re-enter the

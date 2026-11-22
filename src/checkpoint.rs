@@ -2,8 +2,8 @@ use crate::auth::Profile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -235,7 +235,7 @@ fn write_new(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(path.parent().expect("state path has a parent"))?.sync_all()?;
+    fs::File::open(path.parent().expect("state path has a parent"))?.sync_all()?;
     #[cfg(windows)]
     let _ = path;
     Ok(())
@@ -285,6 +285,7 @@ fn snapshot(workspace: &Path) -> io::Result<Snapshot> {
     let head = git(workspace, &["rev-parse", "--verify", "HEAD"])?;
     add_field(&mut hash, &head);
     let revision = std::str::from_utf8(&head).map_err(io::Error::other)?.trim();
+    verify_workspace_entry_types(workspace)?;
     let mut manifest = Vec::new();
     for (name, entry) in workspace_entries(workspace, revision)? {
         add_field(&mut hash, &name);
@@ -294,7 +295,7 @@ fn snapshot(workspace: &Path) -> io::Result<Snapshot> {
         } else {
             add_field(&mut hash, &[]);
         }
-        let worktree_hash = hash_worktree_file(workspace, &name, &mut hash)?;
+        let worktree_hash = hash_worktree_file(workspace, &name, entry.untracked, &mut hash)?;
         let kind = if entry.intent_to_add {
             "intent-to-add"
         } else if entry.changed {
@@ -308,7 +309,11 @@ fn snapshot(workspace: &Path) -> io::Result<Snapshot> {
         let index_hash = entry
             .index
             .filter(|_| !entry.intent_to_add)
-            .map(|index| hash_index_blob(workspace, &index.object))
+            .map(|index| {
+                hash_index_blob(workspace, &index.object).map_err(|error| {
+                    unsupported_entry(Path::new(String::from_utf8_lossy(&name).as_ref()), error)
+                })
+            })
             .transpose()?;
         if let Some(index_hash) = &index_hash {
             add_field(&mut hash, index_hash.as_bytes());
@@ -368,8 +373,9 @@ fn workspace_entries(
             ));
         };
         if !matches!(*mode, "100644" | "100755" | "120000") {
-            return Err(io::Error::other(
-                "Continuation cannot verify this staged entry type",
+            return Err(unsupported_entry(
+                &relative_path(&name[1..])?,
+                "unsupported staged entry type",
             ));
         }
         entries.entry(name[1..].to_vec()).or_default().index = Some(IndexEntry {
@@ -422,50 +428,143 @@ fn changed_paths(workspace: &Path, revision: &str, options: &[&str]) -> io::Resu
     git(workspace, &args)
 }
 
+fn unsupported_entry(path: &Path, reason: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("Unsupported workspace entry {path:?}: {reason}"))
+}
+
+fn inspect_optional(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_workspace_entry_types(workspace: &Path) -> io::Result<()> {
+    let ignored: BTreeSet<_> = nul_records(&git(
+        workspace,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+    )?)
+    .map(relative_path)
+    .collect::<io::Result<_>>()?;
+    let mut pending = vec![PathBuf::new()];
+    while let Some(directory) = pending.pop() {
+        let contents = fs::read_dir(workspace.join(&directory))
+            .map_err(|error| unsupported_entry(&directory, error))?;
+        for item in contents {
+            let item = item.map_err(|error| unsupported_entry(&directory, error))?;
+            let path = directory.join(item.file_name());
+            if path == Path::new(".git") || ignored.contains(&path) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(item.path())
+                .map_err(|error| unsupported_entry(&path, error))?;
+            if redirects(&metadata) {
+                return Err(unsupported_entry(&path, "symbolic links are not supported"));
+            }
+            if metadata.is_dir() {
+                if nested_repository(&item.path())
+                    .map_err(|error| unsupported_entry(&path, error))?
+                {
+                    return Err(unsupported_entry(&path, "nested Git repository"));
+                }
+                pending.push(path);
+            } else if !metadata.is_file() {
+                return Err(unsupported_entry(&path, "not a regular file"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nested_repository(path: &Path) -> io::Result<bool> {
+    if inspect_optional(&path.join(".git"))?.is_some() {
+        return Ok(true);
+    }
+    Ok(
+        inspect_optional(&path.join("HEAD"))?.is_some_and(|metadata| metadata.is_file())
+            && inspect_optional(&path.join("objects"))?.is_some_and(|metadata| metadata.is_dir())
+            && inspect_optional(&path.join("refs"))?.is_some_and(|metadata| metadata.is_dir()),
+    )
+}
+
 fn hash_worktree_file(
     workspace: &Path,
     name: &[u8],
+    untracked: bool,
     hash: &mut Sha256,
 ) -> io::Result<Option<String>> {
-    let path = relative_path(name)?;
+    let path = relative_path(name).map_err(|error| {
+        unsupported_entry(Path::new(String::from_utf8_lossy(name).as_ref()), error)
+    })?;
     let mut file_path = workspace.to_path_buf();
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         file_path.push(component);
-        match fs::symlink_metadata(&file_path) {
-            Ok(metadata) if redirects(&metadata) => {
-                return Err(io::Error::other(
-                    "Continuation cannot verify symbolic links",
+        let Some(metadata) =
+            inspect_optional(&file_path).map_err(|error| unsupported_entry(&path, error))?
+        else {
+            if untracked {
+                return Err(unsupported_entry(
+                    &path,
+                    "untracked entry disappeared during verification",
                 ));
             }
-            Ok(metadata) if components.peek().is_none() && metadata.is_file() => {
-                hash.update([1]);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    hash.update((metadata.permissions().mode() & 0o111).to_le_bytes());
-                }
-                let file_hash = hash_reader(File::open(&file_path)?)?;
-                hash.update(file_hash);
-                return Ok(Some(hex(&file_hash)));
-            }
-            Ok(metadata) if components.peek().is_some() && metadata.is_dir() => {}
-            Ok(metadata)
-                if metadata.is_dir() || (components.peek().is_some() && metadata.is_file()) =>
-            {
-                break
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "Continuation cannot verify this workspace entry",
-                ))
-            }
+            hash.update([0]);
+            return Ok(None);
+        };
+        if redirects(&metadata) {
+            return Err(unsupported_entry(&path, "symbolic links are not supported"));
         }
+        if components.peek().is_some() && metadata.is_dir() {
+            continue;
+        }
+        if components.peek().is_some() || !metadata.is_file() {
+            return Err(unsupported_entry(&path, "not a regular file"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            if metadata.permissions().mode() & 0o444 == 0 {
+                return Err(unsupported_entry(&path, "file has no read permissions"));
+            }
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
+            .open(&file_path)
+            .map_err(|error| unsupported_entry(&path, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| unsupported_entry(&path, error))?;
+        if !metadata.is_file() || redirects(&metadata) {
+            return Err(unsupported_entry(&path, "not a regular file"));
+        }
+        hash.update([1]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            hash.update((metadata.permissions().mode() & 0o111).to_le_bytes());
+        }
+        let file_hash = hash_reader(file).map_err(|error| unsupported_entry(&path, error))?;
+        hash.update(file_hash);
+        return Ok(Some(hex(&file_hash)));
     }
-    hash.update([0]);
-    Ok(None)
+    Err(unsupported_entry(&path, "empty path"))
 }
 
 fn hash_index_blob(workspace: &Path, object: &str) -> io::Result<String> {
@@ -708,5 +807,158 @@ mod tests {
         let row = entry(&manifest, "file with spaces");
         assert_eq!(row["index_sha256"], content_hash("unused-link-target"));
         assert_eq!(row["worktree_sha256"], content_hash("base\n"));
+    }
+    fn nested_repo(workspace: &Path) -> PathBuf {
+        let nested = workspace.join("nested repo");
+        fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-q"]).unwrap();
+        fs::write(nested.join("inner"), "before\n").unwrap();
+        git(&nested, &["add", "--", "inner"]).unwrap();
+        git(
+            &nested,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                "Nested",
+            ],
+        )
+        .unwrap();
+        nested
+    }
+
+    #[test]
+    fn nested_repository_mutation_cannot_authorize_a_reopened_claim() {
+        let (_fixture, workspace, profiles) =
+            crate::mission::tests::limit_fixture("nested-checkpoint", crate::usage::now());
+        let nested = nested_repo(&workspace);
+        let result = (|| {
+            let checkpoint = Checkpoint::save(
+                &profiles[0],
+                Uuid::new_v4(),
+                &workspace,
+                Progress::default(),
+            )?;
+            checkpoint.reserve(&profiles[0], &workspace, &profiles[1])?;
+            fs::write(nested.join("inner"), "changed after checkpoint\n")?;
+            let (_, claim) =
+                Claim::pending(&profiles, &workspace)?.expect("reopened pending claim");
+            claim
+                .start(&profiles[0], &workspace, "Fixture continuation")
+                .map(|_| ())
+        })();
+        assert_unsupported(result, "nested repo");
+    }
+
+    #[test]
+    fn reopened_claim_refuses_a_new_nested_repository() {
+        let (_fixture, workspace, profiles) =
+            crate::mission::tests::limit_fixture("new-nested-repo", crate::usage::now());
+        let checkpoint = Checkpoint::save(
+            &profiles[0],
+            Uuid::new_v4(),
+            &workspace,
+            Progress::default(),
+        )
+        .unwrap();
+        checkpoint
+            .reserve(&profiles[0], &workspace, &profiles[1])
+            .unwrap();
+        nested_repo(&workspace);
+        let (_, claim) = Claim::pending(&profiles, &workspace).unwrap().unwrap();
+        assert_unsupported(
+            claim.start(&profiles[0], &workspace, "Fixture continuation"),
+            "nested repo",
+        );
+        assert!(Claim::pending(&profiles, &workspace).unwrap().is_some());
+    }
+
+    #[test]
+    fn terminal_directory_is_not_a_missing_worktree_file() {
+        let fixture = repository("terminal-directory");
+        fs::create_dir(fixture.root.join("directory")).unwrap();
+        assert_unsupported(
+            hash_worktree_file(&fixture.root, b"directory", true, &mut Sha256::new()),
+            "directory",
+        );
+    }
+
+    #[test]
+    fn fifo_omitted_by_git_is_refused_by_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = repository("fifo");
+        let path = fixture.root.join("test fifo");
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_unsupported(snapshot(&fixture.root), "test fifo");
+    }
+
+    #[test]
+    fn unix_socket_omitted_by_git_is_refused_by_path() {
+        let fixture = repository("socket");
+        let _socket =
+            std::os::unix::net::UnixListener::bind(fixture.root.join("test socket")).unwrap();
+        assert_unsupported(snapshot(&fixture.root), "test socket");
+    }
+
+    #[test]
+    fn character_device_is_refused_by_path_before_open() {
+        assert_unsupported(
+            hash_worktree_file(Path::new("/dev"), b"null", true, &mut Sha256::new()),
+            "null",
+        );
+    }
+
+    #[test]
+    fn unreadable_regular_file_is_refused_by_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = repository("unreadable-file");
+        let path = fixture.root.join("unreadable file");
+        fs::write(&path, "fixture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_unsupported(snapshot(&fixture.root), "unreadable file");
+    }
+
+    #[test]
+    fn staged_gitlink_is_refused_by_path() {
+        let fixture = repository("gitlink");
+        let head = git(&fixture.root, &["rev-parse", "HEAD"]).unwrap();
+        let head = std::str::from_utf8(&head).unwrap().trim();
+        git(
+            &fixture.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},gitlink path"),
+            ],
+        )
+        .unwrap();
+        assert_unsupported(snapshot(&fixture.root), "gitlink path");
+    }
+
+    #[test]
+    fn working_symlink_is_refused_by_path() {
+        let fixture = repository("live-symlink");
+        std::os::unix::fs::symlink("target", fixture.root.join("link path")).unwrap();
+        assert_unsupported(snapshot(&fixture.root), "link path");
+    }
+
+    fn assert_unsupported<T>(result: io::Result<T>, name: &str) {
+        let Err(error) = result else {
+            panic!("expected unsupported workspace entry refusal for {name}");
+        };
+        let reason = error.to_string();
+        assert!(
+            reason.contains("Unsupported workspace entry") && reason.contains(name),
+            "{reason}"
+        );
     }
 }
