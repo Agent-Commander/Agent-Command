@@ -6,7 +6,7 @@ rust-version = "1.99"
 default-run = "agent-command"
 
 [dependencies]
-ratatui = "=0.30.2"
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "=0.29.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

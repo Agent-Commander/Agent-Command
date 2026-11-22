@@ -638,8 +638,8 @@ impl App {
             cols[2].width.saturating_sub(5),
             cols[2].height.saturating_sub(6),
         );
-        let keep = usize::from(feed.height / 3).max(1);
-        let lines: Vec<_> = self
+        let keep = (usize::from(feed.height) + 1).div_ceil(3);
+        let mut lines: Vec<_> = self
             .log
             .iter()
             .zip(self.log_times.iter())
@@ -656,7 +656,13 @@ impl App {
                 ]
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), feed);
+        lines.pop();
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let hidden_rows = paragraph
+            .line_count(feed.width)
+            .saturating_sub(usize::from(feed.height));
+        let scroll = u16::try_from(hidden_rows).unwrap_or(u16::MAX);
+        f.render_widget(paragraph.scroll((scroll, 0)), feed);
         let iy = a.height.saturating_sub(5);
         if let Some(live) = &mut self.live {
             live.profile_area = r(7, iy.saturating_sub(1), a.width.saturating_sub(14), 1);
@@ -850,10 +856,18 @@ case "${1}" in
         ;;
 esac
 test -f workspace-marker && test "$(cat)" = "Mission input" || exit 9
+long=
+remaining=58
+while test "$remaining" -gt 0; do
+    long="${long}wide "
+    remaining=$((remaining - 1))
+done
 if test "$1" = --print; then
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$long"
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude output"},{"type":"tool_use","input":"internal event"}]}}'
 else
     test "$1" = -a && test "$3" = exec || exit 10
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$long"
     printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Codex output"}}'
 fi
 while test ! -f release-mission; do sleep 0.01; done
@@ -863,8 +877,12 @@ while test ! -f release-mission; do sleep 0.01; done
         let claude = auth::Profile::fixture(&root, auth::Provider::Claude, helper.clone());
         let codex = auth::Profile::fixture(&root, auth::Provider::Codex, helper);
 
-        for (width, height, key, provider) in [(80, 24, true, "Claude"), (120, 40, false, "Codex")]
-        {
+        for (width, height, key, provider) in [
+            (80, 24, true, "Claude"),
+            (80, 24, false, "Codex"),
+            (120, 40, true, "Claude"),
+            (120, 40, false, "Codex"),
+        ] {
             let mut app = App {
                 live: Some(Live {
                     workspace: workspace.clone(),
@@ -906,21 +924,28 @@ while test ! -f release-mission; do sleep 0.01; done
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(screen.contains(&format!("{provider} output")));
+            assert!(
+                screen.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden during streaming"
+            );
             assert!(screen.contains("RUNNING"));
             assert!(!screen.contains("internal event"));
             fs::write(workspace.join("release-mission"), "").unwrap();
             wait_for(&mut app, |app| !app.mission_running());
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
             terminal.draw(|f| app.draw(f)).unwrap();
-            assert!(terminal
+            let screen = terminal
                 .backend()
                 .buffer()
                 .content
                 .iter()
                 .map(|cell| cell.symbol())
-                .collect::<String>()
-                .contains("DONE"));
+                .collect::<String>();
+            assert!(screen.contains("DONE"));
+            assert!(
+                screen.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden after completion"
+            );
             fs::remove_file(workspace.join("release-mission")).unwrap();
         }
         fs::remove_dir_all(workspace).unwrap();
