@@ -33,7 +33,7 @@ pub(crate) fn now() -> Tick {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn tick(wall: i64, elapsed: u64) -> Tick {
     Tick {
         wall,
