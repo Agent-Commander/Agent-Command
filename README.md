@@ -134,7 +134,7 @@ is no eligible account, the workspace changed, or a continuation also hits a lim
 A checkpoint stores a mission UUID, interrupted profile, progress counters,
 and a SHA-256 digest covering HEAD, index, and tracked and non-ignored working
 files. The continuation prompt adds a manifest of changed tracked paths,
-untracked paths, and hashes for files that still exist. The app does not store
+untracked paths, and separate SHA-256 hashes of the staged blob and working copy when present. The app does not store
 the task, transcript, file contents, or credentials in checkpoint state.
 The alternate receives instructions to inspect retained work and skip
 completed actions. The app cannot control the provider's decisions or verify
@@ -151,7 +151,7 @@ The private `agent-command-checkpoints-v1` directory tracks claimed, launched,
 and abandoned continuations. A launched or abandoned claim cannot be resumed.
 The launch is fenced durably immediately before dispatch. If the app exits
 at that boundary, it rejects a repeat rather than risk starting two processes.
-Older pre-recovery claims lack the metadata needed to resume.
+Pending claims from the previous Stage 2 revision can be abandoned. Their old digest cannot authorize a launch under the current snapshot format.
 
 Reverting the Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the
 Stage 2 state directories.

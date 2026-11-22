@@ -508,14 +508,14 @@ fi
 test "$(cat completed)" = done || exit 8
 if test -f untracked; then
     case "$prompt" in
-      *'"kind":"untracked","path":"untracked","sha256":"373ca25fde04545677f483dcec193a407a9e61ba46dec587ba51f7275332b19d"'*)
+      *'"kind":"untracked","path":"untracked","index_sha256":null,"worktree_sha256":"373ca25fde04545677f483dcec193a407a9e61ba46dec587ba51f7275332b19d"'*)
         case "$prompt" in *"synthetic file contents"*|*"fixture-credential-never-persist"*) exit 11;; esac
         ;;
       *) exit 10 ;;
     esac
 fi
 case "$prompt" in
-  *"do not redo completed work"*"Retained workspace manifest:"*'"kind":"tracked","path":"completed","sha256":"d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"'*"Keep the finished step"*) ;;
+  *"do not redo completed work"*"Retained workspace manifest:"*'"kind":"tracked","path":"completed","index_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","worktree_sha256":"d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"'*"Keep the finished step"*) ;;
   *) exit 9 ;;
 esac
 printf 'continued\n' >> completed

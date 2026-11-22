@@ -36,3 +36,12 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | A 64-character profile and both usage rows remain visible in a real terminal | `sh tests/terminal_full_profile.sh` after building, with tmux installed |
 | A separate process displays a pending claim and can resume once or abandon it | `separate_process_shows_and_resumes_pending_claim_once_or_abandons_it` |
 | Malformed usage state prevents selection and polling | `corrupt_usage_fails_closed_before_poll_or_selection` |
+
+| Continuation manifest case | Executable check |
+|---|---|
+| Index edit survives restoring the working copy to HEAD | `staged_edit_survives_worktree_restore_in_manifest_and_digest` |
+| Staged deletion carries the path and two absent hashes | `staged_deletion_shows_both_states_absent` |
+| Staged rename carries the old and new paths | `staged_rename_records_removed_and_added_paths` |
+| Intent to add carries a working-copy hash and no staged blob | `intent_to_add_records_worktree_without_an_index_blob` |
+| Working-copy edit carries the base blob and edited file hashes | `worktree_only_edit_reports_head_blob_and_worktree_hash` |
+| Non-UTF-8 path bytes and a staged object-type change are preserved | `non_utf8_paths_round_trip_as_hex` and `staged_type_change_hashes_link_blob_without_following_it` |
