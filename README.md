@@ -75,3 +75,30 @@ cargo test --locked --all-targets
 ```
 
 CI checks Windows, Linux, and macOS. No Python runtime is required.
+
+## Subscription profiles
+
+Install Claude Code and/or Codex CLI and put the provider executable on PATH.
+Keep the provider's regular login for its standalone CLI. Agent Command uses
+separate subscription profiles.
+
+```sh
+agent-command auth login claude work
+agent-command auth login codex work
+agent-command auth list
+agent-command auth status codex work
+agent-command auth run claude work -- --help
+agent-command auth logout claude work
+```
+
+Profile directories use the existing sub-auth layout under
+`~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`. On Windows, use
+an NTFS directory so Agent Command can enforce user-only access. The
+provider handles browser sign-in and manages its own session in that profile.
+Logout keeps the named profile directory and its settings.
+
+Open `agent-command` from the workspace where the mission should run. Press
+F2 or click the profile row to choose the provider and profile. Enter a
+mission and press Enter or click Send. The status and assistant output appear
+in the mission panel and ship's log. One mission runs at a time. Reopen the
+TUI after adding a profile in another terminal.
