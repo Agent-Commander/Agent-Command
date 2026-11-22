@@ -107,18 +107,20 @@ TUI after adding a profile in another terminal.
 
 Use F2 or click the profile row to inspect each profile. The usage rows show
 used and remaining percentages, time until reset, and observation age. Readings
-become stale after 15 minutes, at the window reset, or when a refreshed reading
-is unavailable.
+become stale after 15 monotonic minutes, at the window reset, after an app
+restart, or when a refreshed reading is unavailable. A wall-clock rollback
+cannot make a future-dated observation fresh.
 
 Agent Command reads Codex usage through its local app server. Readbacks for a
-profile start at least five minutes apart, including across app restarts, and
-are skipped during a known latch. Claude readings come from the native CLI's
+profile start at least five monotonic minutes apart, even after a failure.
+A reopened app waits a full floor on discovering a previous probe. Probes
+are skipped during a known active latch. Claude readings come from the native CLI's
 structured mission stream when it reports a window. An unreported window is
 unavailable. Agent Command sends no synthetic Claude prompts to collect usage.
 
 A reported subscription limit latches the profile until the provider's reset
 time. When no reliable reset is available, the profile stays latched and shows
-“reset unknown.” Usage metadata lives in the private `agent-command-usage-v1`
+“reset unknown.” A reported past reset requires a new reading. Usage metadata lives in the private `agent-command-usage-v1`
 directory under the isolated profile root.
 
 For new missions, a latched preferred profile can be replaced by the first
@@ -129,23 +131,27 @@ before launching one continuation on an eligible alternate. The terminal shows
 the source and destination profiles together with the reason. It stops if there
 is no eligible account, the workspace changed, or a continuation also hits a limit.
 
-A checkpoint stores a mission UUID, the interrupted profile, counts of observed
-assistant and completed tool events, and a SHA-256 digest covering HEAD, index,
-and tracked and non-ignored working files. It contains no task text, transcript,
-file content, or credentials. The live process supplies the original task and
-progress counts to the alternate, instructs it to inspect existing work and
-skip anything already completed, and tells it to stop if prior external effects
-are uncertain. The app cannot verify arbitrary effects outside the workspace.
-Symlinks, repository submodules, and non-Git workspaces prevent automatic
-continuation. Profile state must be stored outside the Git worktree.
+A checkpoint stores a mission UUID, interrupted profile, progress counters,
+and a SHA-256 digest covering HEAD, index, and tracked and non-ignored working
+files. The continuation prompt adds a manifest of changed tracked paths,
+untracked paths, and hashes for files that still exist. The app does not store
+the task, transcript, file contents, or credentials in checkpoint state.
+The alternate receives instructions to inspect retained work and skip
+completed actions. The app cannot control the provider's decisions or verify
+effects outside the workspace. Symlinks, submodules, and non-Git workspaces
+prevent continuation. Keep isolated profile state outside the worktree.
 
-The private `agent-command-checkpoints-v1` directory also stores a claim before
-the alternate starts, so a restart or repeat claim cannot schedule the same
-continuation again. If the app exits after claiming but before it launches the
-CLI, it leaves the claim in place and does not start another process. A fresh
-app cannot reconstruct an unclaimed mission because the task text was held only
-in memory.
+If the app closes with a pending claim, reopen the same workspace. Re-enter the
+original task and select Send to resume on the claimed alternate, or use
+F4 or click Abandon. The app checks the retained workspace and the alternate's
+known limit windows before a user-driven resume. It does not automatically
+launch a continuation on startup.
 
-Reverting the follow-up commit removes checkpoint continuation. Reverting both
-Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the Stage 2 state
-directories.
+The private `agent-command-checkpoints-v1` directory tracks claimed, launched,
+and abandoned continuations. A launched or abandoned claim cannot be resumed.
+The launch is fenced durably immediately before dispatch. If the app exits
+at that boundary, it rejects a repeat rather than risk starting two processes.
+Older pre-recovery claims lack the metadata needed to resume.
+
+Reverting the Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the
+Stage 2 state directories.

@@ -1,6 +1,6 @@
 use crate::{
     auth::{Profile, Provider},
-    checkpoint::{Checkpoint, Progress},
+    checkpoint::{Checkpoint, Claim, Progress},
     usage::{self, Usage},
 };
 use serde_json::Value;
@@ -50,19 +50,48 @@ impl Mission {
         preferred: usize,
         workspace: PathBuf,
         prompt: String,
-        clock: fn() -> i64,
+        clock: fn() -> usage::Tick,
     ) -> Self {
-        let (sender, events) = mpsc::sync_channel(64);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        thread::spawn(move || {
-            let execution = Execution {
+        Self::start(
+            Execution {
                 profiles,
                 workspace,
                 prompt,
                 clock,
+            },
+            preferred,
+            None,
+        )
+    }
+
+    pub(crate) fn resume(
+        profiles: Vec<Profile>,
+        interrupted: usize,
+        workspace: PathBuf,
+        prompt: String,
+        claim: Claim,
+    ) -> Self {
+        Self::start(
+            Execution {
+                profiles,
+                workspace,
+                prompt,
+                clock: usage::now,
+            },
+            interrupted,
+            Some(claim),
+        )
+    }
+
+    fn start(execution: Execution, preferred: usize, claim: Option<Claim>) -> Self {
+        let (sender, events) = mpsc::sync_channel(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            let result = match claim {
+                Some(claim) => execution.resume(preferred, claim, &sender, &worker_cancel),
+                None => execution.run(preferred, &sender, &worker_cancel),
             };
-            let result = execution.run(preferred, &sender, &worker_cancel);
             let _ = sender.send(Event::Finished(result));
         });
         Self { events, cancel }
@@ -73,7 +102,7 @@ struct Execution {
     profiles: Vec<Profile>,
     workspace: PathBuf,
     prompt: String,
-    clock: fn() -> i64,
+    clock: fn() -> usage::Tick,
 }
 
 impl Execution {
@@ -92,6 +121,7 @@ impl Execution {
             sender,
             cancel,
             self.clock,
+            None,
         )?;
         let Some(progress) = limit else { return Ok(()) };
         if cancel.load(Ordering::Relaxed) {
@@ -111,17 +141,59 @@ impl Execution {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
-        if sender.send(Event::Continuing { from: index, to }).is_err() {
+        let claim = checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
+        self.continue_with((index, to, next), &claim, sender, cancel)
+    }
+
+    fn resume(
+        &self,
+        index: usize,
+        claim: Claim,
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let (to, profile) = self
+            .profiles
+            .iter()
+            .enumerate()
+            .find(|(to, profile)| {
+                *to != index
+                    && profile.provider == self.profiles[index].provider
+                    && profile.to_string() == claim.alternate
+            })
+            .ok_or_else(|| io::Error::other("Claimed alternate profile is unavailable"))?;
+        let next = profile.authenticated_command()?;
+        if !Usage::read(profile)?.can_resume_claim((self.clock)()) {
+            return Err(io::Error::other(
+                "Claimed alternate needs a fresh reading or is latched",
+            ));
+        }
+        self.continue_with((index, to, next), &claim, sender, cancel)
+    }
+
+    fn continue_with(
+        &self,
+        selection: (usize, usize, std::process::Command),
+        claim: &Claim,
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let (index, to, next) = selection;
+        if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
         if run(
             (next, self.profiles[to].clone(), to, false),
             &self.workspace,
-            checkpoint.prompt(&self.prompt),
+            self.prompt.clone(),
             sender,
             cancel,
             self.clock,
+            Some(Continuation {
+                claim,
+                from: index,
+                profile: &self.profiles[index],
+            }),
         )?
         .is_some()
         {
@@ -149,7 +221,7 @@ impl Execution {
 fn select_command(
     profiles: &[Profile],
     preferred: usize,
-    now: i64,
+    now: usage::Tick,
 ) -> io::Result<(usize, std::process::Command)> {
     for index in usage::choices(profiles, preferred, now)? {
         match profiles[index].authenticated_command() {
@@ -166,13 +238,20 @@ fn select_command(
     ))
 }
 
+struct Continuation<'a> {
+    claim: &'a Claim,
+    from: usize,
+    profile: &'a Profile,
+}
+
 fn run(
     selection: (std::process::Command, Profile, usize, bool),
     workspace: &std::path::Path,
     prompt: String,
     sender: &SyncSender<Event>,
     cancel: &AtomicBool,
-    clock: fn() -> i64,
+    clock: fn() -> usage::Tick,
+    continuation: Option<Continuation<'_>>,
 ) -> io::Result<Option<Progress>> {
     let (mut command, profile, index, rotated) = selection;
     if cancel.load(Ordering::Relaxed) {
@@ -199,12 +278,22 @@ fn run(
             "-",
         ]),
     };
-    let mut child = command
+    command
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    let prompt = match &continuation {
+        Some(next) => next.claim.start(next.profile, workspace, &prompt)?,
+        None => prompt,
+    };
+    let mut child = command.spawn()?;
+    if let Some(next) = continuation {
+        let _ = sender.send(Event::Continuing {
+            from: next.from,
+            to: index,
+        });
+    }
     let stdout = child.stdout.take().expect("mission stdout is piped");
     let stdout_sender = sender.clone();
     let _ = sender.send(Event::Running {
@@ -268,7 +357,7 @@ fn read_output(
     stdout: impl io::Read,
     sender: &SyncSender<Event>,
     limited: &AtomicBool,
-    clock: fn() -> i64,
+    clock: fn() -> usage::Tick,
 ) -> io::Result<(Progress, bool)> {
     let mut progress = Progress::default();
     let mut completed = false;
@@ -391,7 +480,7 @@ pub(crate) mod tests {
         workspace
     }
 
-    pub(crate) fn limit_fixture(name: &str, now: i64) -> (Fixture, PathBuf, Vec<Profile>) {
+    pub(crate) fn limit_fixture(name: &str, now: usage::Tick) -> (Fixture, PathBuf, Vec<Profile>) {
         let fixture = Fixture::new(
             name,
             r#"
@@ -417,8 +506,16 @@ if test "$profile" = first; then
     exit 1
 fi
 test "$(cat completed)" = done || exit 8
+if test -f untracked; then
+    case "$prompt" in
+      *'"kind":"untracked","path":"untracked","sha256":"373ca25fde04545677f483dcec193a407a9e61ba46dec587ba51f7275332b19d"'*)
+        case "$prompt" in *"synthetic file contents"*|*"fixture-credential-never-persist"*) exit 11;; esac
+        ;;
+      *) exit 10 ;;
+    esac
+fi
 case "$prompt" in
-  *"1 assistant messages and 1 completed tool events"*"do not redo completed work"*"Keep the finished step"*) ;;
+  *"do not redo completed work"*"Retained workspace manifest:"*'"kind":"tracked","path":"completed","sha256":"d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"'*"Keep the finished step"*) ;;
   *) exit 9 ;;
 esac
 printf 'continued\n' >> completed
@@ -433,8 +530,8 @@ printf 'continued\n' >> completed
             &profiles[1],
             &json!({
                 "type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{
-                    "five_hour":{"utilization":0.25,"resetsAt":now + 3000},
-                    "seven_day":{"utilization":0.25,"resetsAt":now + 8000}
+                    "five_hour":{"utilization":0.25,"resetsAt":now.wall + 3000},
+                    "seven_day":{"utilization":0.25,"resetsAt":now.wall + 8000}
                 }}
             }),
             now,
@@ -456,13 +553,13 @@ printf 'continued\n' >> completed
 
     #[test]
     fn interrupted_mission_checkpoints_once_and_continues_on_the_next_profile() {
-        let (_fixture, workspace, profiles) = limit_fixture("continue", FAKE_NOW);
+        let (_fixture, workspace, profiles) = limit_fixture("continue", usage::tick(FAKE_NOW, 0));
         let mission = Mission::launch_with_clock(
             profiles.clone(),
             0,
             workspace.clone(),
             "Keep the finished step".into(),
-            || FAKE_NOW,
+            || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
         result.unwrap();
@@ -471,13 +568,15 @@ printf 'continued\n' >> completed
             std::fs::read_to_string(workspace.join("completed")).unwrap(),
             "done\ncontinued\n"
         );
-        assert!(Usage::read(&profiles[0]).unwrap().blocked(FAKE_NOW));
+        assert!(Usage::read(&profiles[0])
+            .unwrap()
+            .blocked(usage::tick(FAKE_NOW, 0)));
         let directory = profiles[0].checkpoint_directory().unwrap();
         let paths: Vec<_> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 3);
         let checkpoint_path = paths
             .iter()
             .find(|path| path.extension().unwrap() == "json")
@@ -506,15 +605,114 @@ printf 'continued\n' >> completed
     }
 
     #[test]
+    fn separate_process_shows_and_resumes_pending_claim_once_or_abandons_it() {
+        for abandon in [false, true] {
+            let tag = if abandon {
+                "restart-abandon"
+            } else {
+                "restart-resume"
+            };
+            let (fixture, workspace, profiles) = limit_fixture(tag, usage::now());
+            std::fs::write(workspace.join("completed"), "done\n").unwrap();
+            std::fs::write(workspace.join("untracked"), "synthetic file contents").unwrap();
+            let checkpoint = Checkpoint::save(
+                &profiles[0],
+                uuid::Uuid::new_v4(),
+                &workspace,
+                Progress::default(),
+            )
+            .unwrap();
+            let claim = checkpoint
+                .reserve(&profiles[0], &workspace, &profiles[1])
+                .unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mission::tests::recovery_child", "--nocapture"])
+                .current_dir(&workspace)
+                .env("SUB_AUTH_DIR", fixture.root.join("profiles"))
+                .env("AC_RECOVERY_TEST_PROVIDER", &fixture.executable)
+                .env(
+                    "AC_RECOVERY_TEST_ACTION",
+                    if abandon { "abandon" } else { "resume" },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            assert!(Claim::pending(&profiles, &workspace).unwrap().is_none());
+            assert!(claim
+                .start(&profiles[0], &workspace, "Keep the finished step")
+                .is_err());
+            let expected = if abandon {
+                "done\n"
+            } else {
+                "done\ncontinued\n"
+            };
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("completed")).unwrap(),
+                expected
+            );
+            for entry in std::fs::read_dir(profiles[0].checkpoint_directory().unwrap()).unwrap() {
+                let path = entry.unwrap().path();
+                let content = std::fs::read_to_string(path).unwrap();
+                for excluded in [
+                    "Keep the finished step",
+                    "fixture-credential-never-persist",
+                    "synthetic file contents",
+                ] {
+                    assert!(!content.contains(excluded));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_child() {
+        let Some(executable) = std::env::var_os("AC_RECOVERY_TEST_PROVIDER") else {
+            return;
+        };
+        let root = crate::auth::root().unwrap();
+        let workspace = std::env::current_dir().unwrap();
+        let profiles = ["first", "standby"].map(|name| {
+            Profile::named_fixture(&root, Provider::Claude, name, PathBuf::from(&executable))
+        });
+        let mut app = crate::App::live(workspace);
+        app.live.as_mut().unwrap().profiles = profiles.into();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let notice: String = (0..80).map(|x| buffer[(x, 22)].symbol()).collect();
+        assert!(notice.contains("Interrupted continuation pending"));
+        if std::env::var("AC_RECOVERY_TEST_ACTION").unwrap() == "abandon" {
+            let button = app.live.as_ref().unwrap().abandon_area;
+            app.click(button.x, button.y);
+            assert!(app.notice.contains("abandoned"));
+            return;
+        }
+        app.input = "Keep the finished step".into();
+        app.click(app.send_area.x, app.send_area.y);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.mission_running() {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_mission();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.status(0), "DONE", "{}", app.notice);
+    }
+
+    #[test]
     fn a_completed_mission_never_creates_a_continuation() {
-        let (_fixture, workspace, profiles) = limit_fixture("completed", FAKE_NOW);
+        let (_fixture, workspace, profiles) = limit_fixture("completed", usage::tick(FAKE_NOW, 0));
         std::fs::write(workspace.join(".git/completed-before-limit"), "").unwrap();
         let mission = Mission::launch_with_clock(
             profiles.clone(),
             0,
             workspace.clone(),
             "Keep the finished step".into(),
-            || FAKE_NOW,
+            || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
         result.unwrap();
@@ -533,14 +731,15 @@ printf 'continued\n' >> completed
 
     #[test]
     fn changed_workspace_refuses_the_cross_profile_continuation() {
-        let (_fixture, workspace, profiles) = limit_fixture("changed-workspace", FAKE_NOW);
+        let (_fixture, workspace, profiles) =
+            limit_fixture("changed-workspace", usage::tick(FAKE_NOW, 0));
         std::fs::write(workspace.join(".git/change-after-checkpoint"), "").unwrap();
         let mission = Mission::launch_with_clock(
             profiles.clone(),
             0,
             workspace.clone(),
             "Keep the finished step".into(),
-            || FAKE_NOW,
+            || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
         assert!(links.is_empty());
@@ -581,10 +780,10 @@ printf '%s\n' "$profile" >> starts
         let mut event = json!({
             "type": "rate_limit_event",
             "rate_limit_info": {
-                "status": "rejected", "resetsAt": now + 3600,
+                "status": "rejected", "resetsAt": now.wall + 3600,
                 "unifiedWindows": {
-                    "five_hour": {"utilization": 0.5, "resetsAt": now + 3600},
-                    "seven_day": {"utilization": 0.5, "resetsAt": now + 3600}
+                    "five_hour": {"utilization": 0.5, "resetsAt": now.wall + 3600},
+                    "seven_day": {"utilization": 0.5, "resetsAt": now.wall + 3600}
                 }
             }
         });

@@ -92,10 +92,12 @@ struct Live {
     selected_profile: usize,
     profile_area: Rect,
     usage: Option<usage::Usage>,
-    usage_checked_at: Option<i64>,
+    usage_checked_at: Option<u64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
     continuation: Option<String>,
+    pending: Option<(usize, checkpoint::Claim)>,
+    abandon_area: Rect,
     mission: Option<(usize, mission::Mission)>,
     outcomes: [&'static str; 4],
 }
@@ -103,10 +105,10 @@ struct Live {
 impl Live {
     fn refresh_usage(&mut self) {
         let now = usage::now();
-        if self.usage_checked_at == Some(now) {
+        if self.usage_checked_at == Some(now.elapsed / 1_000_000_000) {
             return;
         }
-        self.usage_checked_at = Some(now);
+        self.usage_checked_at = Some(now.elapsed / 1_000_000_000);
         let displayed = self.running_profile.unwrap_or(self.selected_profile);
         self.usage = self
             .profiles
@@ -195,6 +197,10 @@ impl App {
                 app.notice = format!("Cannot load profiles: {error}");
                 Vec::new()
             });
+        let pending = checkpoint::Claim::pending(&profiles, &workspace).unwrap_or_else(|error| {
+            app.notice = format!("Cannot read continuation state: {error}");
+            None
+        });
         app.live = Some(Live {
             workspace,
             profiles,
@@ -205,6 +211,8 @@ impl App {
             usage_worker: None,
             running_profile: None,
             continuation: None,
+            pending,
+            abandon_area: Rect::default(),
             mission: None,
             outcomes: ["READY"; 4],
         });
@@ -257,6 +265,7 @@ impl App {
                 Ok(mission::Event::Continuing { from, to }) => {
                     let link = format!("Limit: {} → {}", live.profiles[from], live.profiles[to]);
                     live.continuation = Some(link.clone());
+                    live.pending = None;
                     self.notice = link.clone();
                     self.push_log(format!("SYSTEM  {link}"));
                 }
@@ -275,6 +284,11 @@ impl App {
     fn finish_mission(&mut self, agent: usize, result: io::Result<()>) {
         let live = self.live.as_mut().expect("live mission");
         live.mission = None;
+        if live.pending.is_some() {
+            if let Ok(pending) = checkpoint::Claim::pending(&live.profiles, &live.workspace) {
+                live.pending = pending;
+            }
+        }
         live.running_profile = None;
         live.usage_checked_at = None;
         live.refresh_usage();
@@ -351,6 +365,22 @@ impl App {
                 self.notice = "Resume this agent before sending a mission.".into();
                 return;
             }
+            if let Some((index, claim)) = live.pending.clone() {
+                live.outcomes[self.selected] = "STARTING";
+                live.mission = Some((
+                    self.selected,
+                    mission::Mission::resume(
+                        live.profiles.clone(),
+                        index,
+                        live.workspace.clone(),
+                        command.clone(),
+                        claim,
+                    ),
+                ));
+                self.missions[self.selected] = command;
+                self.input.clear();
+                return;
+            }
             let Some(profile) = live.profiles.get(live.selected_profile).cloned() else {
                 self.notice = "Sign in with agent-command auth login PROVIDER PROFILE.".into();
                 return;
@@ -376,6 +406,24 @@ impl App {
             self.notice = "Preview mission only; no external dispatch.".into();
         }
     }
+    fn abandon_continuation(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        if live.mission.is_some() {
+            return;
+        }
+        let Some((index, claim)) = &live.pending else {
+            return;
+        };
+        self.notice = match claim.abandon(&live.profiles[*index]) {
+            Ok(()) => {
+                live.pending = None;
+                self.input.clear();
+                "Interrupted continuation abandoned.".into()
+            }
+            Err(error) => error.to_string(),
+        };
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -395,6 +443,7 @@ impl App {
         }
         match key.code {
             KeyCode::F(2) => self.select_profile(),
+            KeyCode::F(4) => self.abandon_continuation(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
             KeyCode::Enter if self.editing => self.submit(),
@@ -411,6 +460,12 @@ impl App {
     pub fn click(&mut self, x: u16, y: u16) {
         let point = ratatui::layout::Position::new(x, y);
         if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.abandon_area.contains(point))
+        {
+            self.abandon_continuation();
+        } else if self
             .live
             .as_ref()
             .is_some_and(|live| live.profile_area.contains(point))
@@ -514,7 +569,7 @@ impl App {
                 );
             }
         }
-        let usage_rows = if self.live.is_some() { 2 } else { 0 };
+        let usage_rows = if self.live.is_some() { 3 } else { 0 };
         let main = if compact {
             r(
                 1,
@@ -559,7 +614,7 @@ impl App {
         }
         self.crew_area = r(
             cols[0].x + 2,
-            cols[0].y + 3,
+            cols[0].y + if compact && self.live.is_some() { 2 } else { 3 },
             cols[0].width.saturating_sub(4),
             if compact {
                 8.min(cols[0].height.saturating_sub(4))
@@ -617,7 +672,10 @@ impl App {
             .style(Style::default().fg(color("666f78"))),
             r(
                 cols[0].x + 3,
-                cols[0].bottom().saturating_sub(4),
+                cols[0]
+                    .bottom()
+                    .saturating_sub(4)
+                    .max(self.crew_area.bottom()),
                 cols[0].width.saturating_sub(5),
                 2,
             ),
@@ -758,11 +816,15 @@ impl App {
         f.render_widget(paragraph.scroll((scroll, 0)), feed);
         let iy = a.height.saturating_sub(5);
         if let Some(live) = &mut self.live {
-            live.profile_area = r(7, iy.saturating_sub(3), a.width.saturating_sub(14), 1);
+            live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
             let now = usage::now();
             let selected = live.running_profile.unwrap_or(live.selected_profile);
             let label = live.profiles.get(selected).map_or_else(
-                || "No profiles · agent-command auth login PROVIDER PROFILE".into(),
+                || {
+                    vec![Line::raw(
+                        "No profiles · agent-command auth login PROVIDER PROFILE",
+                    )]
+                },
                 |profile| {
                     let latch = live.usage.map_or_else(
                         || "State unavailable".into(),
@@ -773,7 +835,10 @@ impl App {
                     } else {
                         "F2 / click"
                     };
-                    format!("{control} · {latch} · {profile}")
+                    vec![
+                        Line::raw(format!("{control} · {latch}")),
+                        Line::raw(profile.to_string()),
+                    ]
                 },
             );
             let [five, week] = live.usage.unwrap_or_default().rows(now);
@@ -797,7 +862,15 @@ impl App {
             Paragraph::new(format!(
                 " {}",
                 if self.input.is_empty() {
-                    "Give your selected agent a mission…"
+                    if self
+                        .live
+                        .as_ref()
+                        .is_some_and(|live| live.pending.is_some())
+                    {
+                        "Re-enter the original task to resume…"
+                    } else {
+                        "Give your selected agent a mission…"
+                    }
                 } else {
                     &self.input
                 }
@@ -821,8 +894,14 @@ impl App {
             self.input_area,
         );
         f.render_widget(button("Send ↗", true, &t), self.send_area);
+        let pending = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.pending.is_some() && live.mission.is_none());
         f.render_widget(
-            Paragraph::new(if self.notice.is_empty() {
+            Paragraph::new(if pending && self.notice.is_empty() {
+                "Interrupted continuation pending · re-enter task, then Send"
+            } else if self.notice.is_empty() {
                 if self.live.is_some() {
                     "   Ready"
                 } else {
@@ -834,11 +913,26 @@ impl App {
             .style(Style::default().fg(color("a1adb8"))),
             r(0, a.height.saturating_sub(2), a.width, 1),
         );
+        let shortcuts = r(0, a.height.saturating_sub(1), a.width, 1);
+        let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
         f.render_widget(
             Paragraph::new(" ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed")
-                .style(Style::default().bg(color("1b2027")).fg(color("a5b1bd"))),
-            r(0, a.height.saturating_sub(1), a.width, 1),
+                .style(style),
+            shortcuts,
         );
+        if let Some(live) = &mut self.live {
+            live.abandon_area = if pending {
+                r(a.width.saturating_sub(14), shortcuts.y, 14, 1)
+            } else {
+                Rect::default()
+            };
+            if pending {
+                f.render_widget(
+                    Paragraph::new("  F4 Abandon  ").style(style),
+                    live.abandon_area,
+                );
+            }
+        }
     }
 }
 
@@ -1002,6 +1096,8 @@ while test ! -f release-mission; do sleep 0.01; done
                     usage_worker: None,
                     running_profile: None,
                     continuation: None,
+                    pending: None,
+                    abandon_area: Rect::default(),
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),
@@ -1095,6 +1191,8 @@ while test ! -f release-mission; do sleep 0.01; done
                     usage_worker: None,
                     running_profile: None,
                     continuation: None,
+                    pending: None,
+                    abandon_area: Rect::default(),
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),
@@ -1139,17 +1237,18 @@ while test ! -f release-mission; do sleep 0.01; done
 
         let fixture = Fixture::new("usage-panel", "");
         let ready = fixture.profile(Provider::Claude, "ready");
-        let latched = fixture.profile(Provider::Claude, "latched");
+        let long = "a".repeat(64);
+        let latched = fixture.profile(Provider::Claude, &long);
         let now = usage::now();
         Usage::observe_claude(
             &latched,
             &json!({
                 "type":"rate_limit_event",
                 "rate_limit_info":{
-                    "status":"rejected","resetsAt":now + 7200,
+                    "status":"rejected","resetsAt":now.wall + 7200,
                     "unifiedWindows":{
-                        "five_hour":{"utilization":0.25,"resetsAt":now + 7200},
-                        "seven_day":{"utilization":0.60,"resetsAt":now + 86400}
+                        "five_hour":{"utilization":0.25,"resetsAt":now.wall + 7200},
+                        "seven_day":{"utilization":0.60,"resetsAt":now.wall + 86400}
                     }
                 }
             }),
@@ -1169,6 +1268,8 @@ while test ! -f release-mission; do sleep 0.01; done
                     usage_worker: None,
                     running_profile: None,
                     continuation: None,
+                    pending: None,
+                    abandon_area: Rect::default(),
                     mission: None,
                     outcomes: ["READY"; 4],
                 }),
@@ -1181,7 +1282,7 @@ while test ! -f release-mission; do sleep 0.01; done
             let area = app.live.as_ref().unwrap().profile_area;
             let panel = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
                 let buffer = terminal.backend().buffer();
-                (area.y..area.y + 3)
+                (area.y..area.y + 4)
                     .map(|y| {
                         (area.x..area.right())
                             .map(|x| buffer[(x, y)].symbol())
@@ -1190,8 +1291,8 @@ while test ! -f release-mission; do sleep 0.01; done
                     .collect::<Vec<_>>()
             };
             let initial = panel(&terminal);
-            assert!(initial[0].contains("No latch · claude/ready"));
-            assert!(initial[1].contains("5h unavailable"));
+            assert!(initial[0].contains("No latch") && initial[1].contains("claude/ready"));
+            assert!(initial[2].contains("5h unavailable"));
             if key {
                 app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
             } else {
@@ -1199,9 +1300,11 @@ while test ! -f release-mission; do sleep 0.01; done
             }
             terminal.draw(|f| app.draw(f)).unwrap();
             let changed = panel(&terminal);
-            assert!(changed[0].contains("Latched") && changed[0].contains("claude/latched"));
-            assert!(changed[1].contains("5h 25% used / 75% left, reset"));
-            assert!(changed[2].contains("Week 60% used / 40% left, reset"));
+            assert!(
+                changed[0].contains("Latched") && changed[1].contains(&format!("claude/{long}"))
+            );
+            assert!(changed[2].contains("5h 25% used / 75% left, reset"));
+            assert!(changed[3].contains("Week 60% used / 40% left, reset"));
         }
     }
 

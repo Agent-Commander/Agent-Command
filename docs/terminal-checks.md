@@ -27,3 +27,12 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | A workspace change after checkpoint creation prevents the next CLI from starting | `changed_workspace_refuses_the_cross_profile_continuation` |
 | The continuation receipt identifies both profiles at 80×24 and 120×40, including a repeat mouse click | `continuation_receipt_is_visible_after_keyboard_and_mouse_submission` |
 | An observed success result prevents a continuation even if the stream also contains a limit | `a_completed_mission_never_creates_a_continuation` |
+
+| Stage 2 rework | Executable check |
+|---|---|
+| A backward wall-clock jump makes a future observation stale and ineligible | `backward_wall_clock_never_makes_a_future_observation_fresh` |
+| A past limit expires and a valid future limit replaces an unknown limit | `expired_limit_needs_fresh_usage_and_future_limits_repair_unknown` |
+| A failed Codex readback cannot be retried early after a forward wall-clock jump or reopening | `failed_codex_probe_respects_monotonic_backoff_after_clock_jump_and_reopen` |
+| A 64-character profile and both usage rows remain visible in a real terminal | `sh tests/terminal_full_profile.sh` after building, with tmux installed |
+| A separate process displays a pending claim and can resume once or abandon it | `separate_process_shows_and_resumes_pending_claim_once_or_abandons_it` |
+| Malformed usage state prevents selection and polling | `corrupt_usage_fails_closed_before_poll_or_selection` |
