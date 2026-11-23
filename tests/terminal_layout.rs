@@ -1,4 +1,4 @@
-use agent_command::{App, NAMES};
+use agent_command::App;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
 
@@ -26,6 +26,13 @@ fn click(app: &mut App, area: Rect, w: u16, h: u16) {
     );
     app.click(area.x + area.width / 2, area.y + area.height / 2);
 }
+fn crewed() -> App {
+    let mut app = App::default();
+    app.input = "/spawn Nova reviewer".into();
+    app.submit();
+    app.selected = 0;
+    app
+}
 fn render(app: &mut App, w: u16, h: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| app.draw(f)).unwrap();
@@ -34,19 +41,22 @@ fn render(app: &mut App, w: u16, h: u16) -> Buffer {
 #[test]
 fn regions_and_equivalent_controls_at_supported_sizes() {
     for (w, h) in [(80, 24), (120, 40)] {
-        let mut keyboard = App::default();
-        let mut mouse = App::default();
+        let mut keyboard = crewed();
+        let mut mouse = crewed();
         let header = render(&mut mouse, w, h);
         assert!(text(&header, Rect::new(0, 0, w, 1)).contains("Radio    |    PRIVATEER"));
-        for (selected, name) in NAMES.iter().enumerate() {
+        let names: Vec<String> = mouse
+            .crew
+            .iter()
+            .map(|member| member.name.clone())
+            .collect();
+        assert_eq!(names, ["Commander", "Nova"]);
+        for (selected, name) in names.iter().enumerate() {
             if selected > 0 {
                 key(&mut keyboard, KeyCode::Down, KeyModifiers::NONE);
             }
             let row_height = mouse.crew_area.height / 4;
-            assert!(
-                row_height > 0,
-                "all four crew rows must be visible at {w}x{h}"
-            );
+            assert!(row_height > 0, "every crew row must be visible at {w}x{h}");
             mouse.click(
                 mouse.crew_area.x,
                 mouse.crew_area.y + selected as u16 * row_height + 1,
@@ -75,8 +85,7 @@ fn regions_and_equivalent_controls_at_supported_sizes() {
             key(&mut keyboard, KeyCode::Char('p'), KeyModifiers::CONTROL);
             let pause = mouse.pause_area;
             click(&mut mouse, pause, w, h);
-            assert_eq!(mouse.paused, keyboard.paused);
-            assert_eq!(mouse.missions, keyboard.missions);
+            assert_eq!(mouse.crew, keyboard.crew);
             assert_eq!(mouse.log, keyboard.log);
             mouse.log.clear();
             mouse.log_times.clear();
@@ -98,7 +107,7 @@ fn regions_and_equivalent_controls_at_supported_sizes() {
                 "mission must appear in chart, independently of log"
             );
             assert!(
-                text(&buffer, chart).contains(if paused { "PAUSED" } else { "READY" }),
+                text(&buffer, chart).contains(if paused { "PAUSED" } else { "IDLE" }),
                 "selected status in chart"
             );
             assert!(text(&buffer, mouse.pause_area).contains(if paused {
@@ -114,15 +123,23 @@ fn regions_and_equivalent_controls_at_supported_sizes() {
                 mouse.pause_area.bottom() - mouse.crew_area.y,
             );
             assert!(
-                text(&buffer, log).contains("Recent-marker"),
-                "recent log in log region"
+                text(&buffer, log).contains("Mission café λ"),
+                "selected specialist history in log region"
             );
+            let specialist = mouse.selected;
+            mouse.click(mouse.crew_area.x, mouse.crew_area.y + 1);
+            let buffer = render(&mut mouse, w, h);
+            assert!(
+                text(&buffer, log).contains("Recent-marker"),
+                "Commander feed in log region after returning to Commander"
+            );
+            mouse.selected = specialist;
         }
     }
 }
 #[test]
 fn resize_retains_unicode_and_selected_state() {
-    let mut app = App::default();
+    let mut app = crewed();
     key(&mut app, KeyCode::Down, KeyModifiers::NONE);
     key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
     for c in "Café 航海 🚀".chars() {
@@ -133,8 +150,7 @@ fn resize_retains_unicode_and_selected_state() {
     app.input = "Draft λ".into();
     let state = (
         app.selected,
-        app.paused,
-        app.missions.clone(),
+        app.crew.clone(),
         app.input.clone(),
         app.log.clone(),
         app.log_times.clone(),
@@ -161,8 +177,7 @@ fn resize_retains_unicode_and_selected_state() {
         assert_eq!(
             (
                 app.selected,
-                app.paused,
-                app.missions.clone(),
+                app.crew.clone(),
                 app.input.clone(),
                 app.log.clone(),
                 app.log_times.clone(),

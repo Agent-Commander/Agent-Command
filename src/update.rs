@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -37,24 +37,69 @@ fn tag(headers: &str) -> Option<&str> {
     })
 }
 
-pub fn watch() -> Option<Receiver<String>> {
-    if cfg!(debug_assertions)
-        || env::var_os("AGENT_COMMAND_NO_UPDATE_CHECK").is_some_and(|value| value == "1")
-    {
+pub fn watch(enabled: bool) -> Option<Receiver<String>> {
+    if cfg!(debug_assertions) || !enabled {
         return None;
     }
     let (found, results) = mpsc::channel();
-    thread::spawn(move || {
-        let headers = Command::new("curl")
-            .args(["--silent", "--head", "--max-time", "5", LATEST])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        let latest = newer(tag(&String::from_utf8_lossy(&headers.stdout))?, CURRENT)?;
-        found.send(latest).ok()
-    });
+    thread::spawn(move || found.send(newer(&latest_tag()?, CURRENT)?).ok());
     Some(results)
+}
+
+fn latest_tag() -> Option<String> {
+    let headers = Command::new("curl")
+        .args(["--silent", "--head", "--max-time", "5", LATEST])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    tag(&String::from_utf8_lossy(&headers.stdout)).map(str::to_owned)
+}
+
+pub const DEVELOPMENT_REFUSAL: &str =
+    "agent-command update is unavailable in development builds. Rebuild from source instead.";
+
+pub fn run(args: &[String]) -> io::Result<()> {
+    if !args.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Usage: agent-command update",
+        ));
+    }
+    if cfg!(debug_assertions) {
+        return Err(io::Error::other(DEVELOPMENT_REFUSAL));
+    }
+    apply(latest_tag().as_deref())
+}
+
+fn apply(latest: Option<&str>) -> io::Result<()> {
+    let Some(latest) = latest else {
+        return Err(io::Error::other(
+            "Cannot read the latest release. Try again later.",
+        ));
+    };
+    let Some(latest) = newer(latest, CURRENT) else {
+        println!("Agent Command {CURRENT} is up to date.");
+        return Ok(());
+    };
+    if cfg!(windows) {
+        print!("{}", notice(&latest));
+        return Ok(());
+    }
+    if install(&latest) {
+        Ok(())
+    } else {
+        Err(io::Error::other("The update did not finish."))
+    }
+}
+
+pub fn one_line_notice(latest: &str) -> String {
+    notice(latest)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn custom_dir() -> Option<PathBuf> {
@@ -160,6 +205,30 @@ mod tests {
         );
         assert_eq!(tag(&headers.replace("/tag/v0.2.0", "")), None);
         assert_eq!(tag(""), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn update_command_refuses_or_no_ops_without_a_newer_version() {
+        let refused = run(&[]).unwrap_err();
+        assert_eq!(refused.to_string(), DEVELOPMENT_REFUSAL);
+        assert_eq!(
+            run(&["now".into()]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(apply(Some(&format!("v{CURRENT}"))).is_ok());
+        assert!(apply(Some("v0.0.1")).is_ok());
+        assert!(apply(Some("nightly")).is_ok());
+        assert!(apply(None).is_err());
+        assert!(watch(true).is_none());
+    }
+
+    #[test]
+    fn one_line_notice_keeps_the_command_on_a_single_line() {
+        let line = one_line_notice("9.9.9");
+        assert!(!line.contains('\n'));
+        assert!(line.starts_with("Agent Command 9.9.9 is available"));
+        assert!(line.contains(INSTALLER));
     }
 
     #[test]

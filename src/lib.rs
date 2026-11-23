@@ -4,16 +4,21 @@ mod checkpoint;
 mod cli;
 mod mission;
 mod native;
+mod panel;
 mod routing;
+mod settings;
+mod specialists;
 pub mod token_burn;
 pub mod update;
 mod usage;
 pub use cli::run_cli;
+pub use specialists::{Entry, Member, Status, COMMANDER};
 
 use std::{
     collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
+    sync::mpsc::{Receiver, TryRecvError},
     time::SystemTime,
 };
 
@@ -27,14 +32,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
-pub const NAMES: [&str; 4] = ["Atlas", "Nova", "Echo", "Orion"];
-const STATUSES: [&str; 4] = ["BUILDING", "REVIEWING", "READY", "READY"];
-const MISSIONS: [&str; 4] = [
-    "Implementing the command center",
-    "Reviewing interface components",
-    "Standing by for a new mission",
-    "Standing by for a new mission",
-];
+const PREVIEW_NOTICE: &str = "Preview only; no external dispatch.";
 
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -91,6 +89,78 @@ pub fn color(hex: &str) -> Color {
     Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
+fn profile_route(
+    label: &str,
+    ranked: &[routing::Candidate],
+    exclusions: &[routing::Exclusion],
+) -> ProfileRoute {
+    if let Some(candidate) = ranked.iter().find(|candidate| candidate.label == label) {
+        return ProfileRoute::Routed {
+            model: candidate.configuration.label(),
+            metric: routing::score_label(candidate),
+        };
+    }
+    let reason = exclusions
+        .iter()
+        .find(|exclusion| exclusion.label == label)
+        .map_or("below routing floor", |exclusion| exclusion.reason);
+    ProfileRoute::Excluded(reason.into())
+}
+
+fn deck_card(
+    label: &str,
+    allowance: usage::Allowance,
+    route: Option<&ProfileRoute>,
+) -> token_burn::AccountCard {
+    let (provider, profile) = label.split_once('/').unwrap_or((label, ""));
+    let (route_model, route_metric) = match route {
+        _ if allowance.latched => (None, Some("latched".to_owned())),
+        Some(ProfileRoute::Routed { model, metric }) => (Some(model.clone()), Some(metric.clone())),
+        Some(ProfileRoute::Excluded(reason)) => (None, Some(reason.clone())),
+        None => (None, None),
+    };
+    token_burn::AccountCard {
+        provider: provider.into(),
+        profile: profile.into(),
+        tier: String::new(),
+        primary_remaining: allowance.five,
+        secondary_remaining: allowance.week,
+        seconds_until_reset: allowance.reset_in,
+        route_model,
+        route_metric,
+    }
+}
+
+fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| token_burn::TokenBurnPalette::from_theme_toml(&text).ok())
+        .unwrap_or_default()
+}
+
+fn deck_mode(area: Rect, compact_layout: bool) -> token_burn::DeckMode {
+    if compact_layout {
+        token_burn::DeckMode::Compact
+    } else {
+        token_burn::DeckMode::for_area(area)
+    }
+}
+
+const COMPACT_DECK_MAX_ROWS: usize = 3;
+const FULL_DECK_MAX_CARDS: usize = 3;
+const UPDATE_DISMISS_HINT: &str = " ✕ F6 ";
+
+fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
+    request.units = request.units.iter().map(|unit| frame(unit)).collect();
+    request
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ProfileRoute {
+    Routed { model: String, metric: String },
+    Excluded(String),
+}
+
 struct Live {
     workspace: PathBuf,
     profiles: Vec<auth::Profile>,
@@ -106,8 +176,14 @@ struct Live {
     continuation: Option<String>,
     pending: Option<(usize, checkpoint::Claim)>,
     abandon_area: Rect,
-    mission: Option<(usize, mission::Mission)>,
-    outcomes: [&'static str; 4],
+    mission: Option<(String, mission::Mission)>,
+    store: Option<specialists::Store>,
+    queue: VecDeque<(String, String)>,
+    reply: String,
+    entry: Option<(String, &'static str)>,
+    routes: Vec<ProfileRoute>,
+    allowances: Vec<usage::Allowance>,
+    signed_in: Vec<bool>,
 }
 
 impl Live {
@@ -119,6 +195,7 @@ impl Live {
         Self {
             workspace,
             profiles,
+            store: profile_root.clone().map(specialists::Store::new),
             profile_root,
             preferred: None,
             pins: native::Pins::default(),
@@ -132,7 +209,99 @@ impl Live {
             pending: None,
             abandon_area: Rect::default(),
             mission: None,
-            outcomes: ["READY"; 4],
+            queue: VecDeque::new(),
+            reply: String::new(),
+            entry: None,
+            routes: Vec::new(),
+            allowances: Vec::new(),
+            signed_in: Vec::new(),
+        }
+    }
+
+    fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
+        self.profiles = profiles;
+        self.preferred = None;
+        self.last_routed = None;
+        self.running_profile = None;
+        self.usage = None;
+        self.usage_checked_at = None;
+        self.load_override();
+        self.pending = checkpoint::Claim::pending(&self.profiles, &self.workspace)
+            .ok()
+            .flatten();
+        self.refresh_routes();
+        self.read_allowances(usage::now());
+    }
+
+    fn refresh_routes(&mut self) {
+        let (candidates, exclusions) =
+            routing::candidates(&self.profiles, &self.catalog(), &self.pins, usage::now());
+        let request = routing::Request::default();
+        let ranked = routing::rank(candidates, request.policy, request.difficulty);
+        let ranked = ranked.as_deref().unwrap_or_default();
+        self.routes = self
+            .profiles
+            .iter()
+            .map(|profile| profile_route(&profile.to_string(), ranked, &exclusions))
+            .collect();
+        self.entry = self.choose_entry(ranked);
+    }
+
+    fn choose_entry(&self, ranked: &[routing::Candidate]) -> Option<(String, &'static str)> {
+        if let Some(index) = self.preferred {
+            return Some((self.profiles[index].to_string(), "override"));
+        }
+        match ranked.first() {
+            Some(best) => Some((
+                format!("{} {}", best.label, best.configuration.label()),
+                "auto",
+            )),
+            None => self
+                .profiles
+                .first()
+                .map(|profile| (profile.to_string(), "first signed-in")),
+        }
+    }
+
+    fn read_allowances(&mut self, now: usage::Tick) {
+        self.allowances = self
+            .profiles
+            .iter()
+            .map(|profile| {
+                usage::Usage::read(profile)
+                    .map(|usage| usage.allowance(now))
+                    .unwrap_or_default()
+            })
+            .collect();
+    }
+
+    fn deck_cards(&self) -> Vec<token_burn::AccountCard> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| {
+                deck_card(
+                    &profile.to_string(),
+                    self.allowances.get(index).copied().unwrap_or_default(),
+                    self.routes.get(index),
+                )
+            })
+            .collect()
+    }
+
+    fn entry_label(&self) -> String {
+        self.entry.as_ref().map_or_else(
+            || "no signed-in profile".into(),
+            |(label, source)| format!("{label} ({source})"),
+        )
+    }
+
+    fn route(&self, request: routing::Request) -> mission::Route {
+        mission::Route {
+            request,
+            preferred: self.preferred.map(|index| self.profiles[index].to_string()),
+            catalog: self.catalog(),
+            pins: self.pins.clone(),
         }
     }
 
@@ -218,6 +387,7 @@ impl Live {
             return;
         }
         self.usage_checked_at = Some(now.elapsed / 1_000_000_000);
+        self.read_allowances(now);
         let displayed = self.displayed_profile();
         self.usage = self
             .profiles
@@ -253,8 +423,7 @@ impl Live {
 pub struct App {
     live: Option<Live>,
     pub selected: usize,
-    pub paused: [bool; 4],
-    pub missions: [String; 4],
+    pub crew: Vec<Member>,
     pub input: String,
     pub editing: bool,
     pub quit: bool,
@@ -268,24 +437,34 @@ pub struct App {
     pub new_area: Rect,
     pub pause_area: Rect,
     pub send_area: Rect,
+    crew_row_height: u16,
+    crew_offset: usize,
+    pub deck_palette: token_burn::TokenBurnPalette,
+    update_receiver: Option<Receiver<String>>,
+    pub update_banner: Option<String>,
+    pub update_area: Rect,
+    pub settings_area: Rect,
+    pub full_redraw: bool,
+    panel: Option<panel::Panel>,
+    panel_hits: Vec<(panel::Action, Rect)>,
+    host: Option<Box<dyn panel::Host>>,
+    settings: settings::Settings,
+    launch: settings::LaunchConfig,
 }
 impl Default for App {
     fn default() -> Self {
         Self {
             live: None,
             selected: 0,
-            paused: [false; 4],
-            missions: MISSIONS.map(str::to_owned),
+            crew: vec![Member::commander()],
             input: String::new(),
             editing: false,
             quit: false,
             log: VecDeque::from([
-                "SYSTEM  Command center initialized.".into(),
-                "ATLAS   Building the operations console.".into(),
-                "NOVA    Interface review in progress.".into(),
-                "SYSTEM  Ready for your next command.".into(),
+                "SYSTEM  Commander online. Message Commander, or /spawn NAME ROLE [TASK]."
+                    .to_owned(),
             ]),
-            log_times: VecDeque::from(vec![chrono::Local::now().format("%H:%M:%S").to_string(); 4]),
+            log_times: VecDeque::from([chrono::Local::now().format("%H:%M:%S").to_string()]),
             theme: Theme::default(),
             notice: String::new(),
             theme_stamp: None,
@@ -294,37 +473,100 @@ impl Default for App {
             new_area: Rect::default(),
             pause_area: Rect::default(),
             send_area: Rect::default(),
+            crew_row_height: 1,
+            crew_offset: 0,
+            deck_palette: token_burn::TokenBurnPalette::default(),
+            update_receiver: None,
+            update_banner: None,
+            update_area: Rect::default(),
+            settings_area: Rect::default(),
+            full_redraw: false,
+            panel: None,
+            panel_hits: Vec::new(),
+            host: None,
+            settings: settings::Settings::default(),
+            launch: settings::LaunchConfig::default(),
         }
     }
 }
 impl App {
     fn live(workspace: PathBuf) -> Self {
-        let mut app = Self::default();
+        let mut notice = String::new();
         let root = auth::root();
         let profiles = root
             .as_ref()
             .map_err(|error| io::Error::new(error.kind(), error.to_string()))
             .and_then(|root| auth::profiles(root))
             .unwrap_or_else(|error| {
-                app.notice = format!("Cannot load profiles: {error}");
+                notice = format!("Cannot load profiles: {error}");
                 Vec::new()
             });
         let pending = checkpoint::Claim::pending(&profiles, &workspace).unwrap_or_else(|error| {
-            app.notice = format!("Cannot read continuation state: {error}");
+            notice = format!("Cannot read continuation state: {error}");
             None
         });
         let mut live = Live::new(workspace, profiles, root.ok());
         live.pending = pending;
-        if let Some(notice) = live.load_pins() {
+        if let Some(message) = live.load_pins() {
+            notice = message;
+        }
+        if let Some(message) = live.load_override() {
+            notice = message;
+        }
+        let mut app = Self::from_live(live);
+        if app.notice.is_empty() {
             app.notice = notice;
         }
-        if let Some(notice) = live.load_override() {
-            app.notice = notice;
+        app
+    }
+
+    fn attach(&mut self, host: Box<dyn panel::Host>, launch: settings::LaunchConfig) {
+        if let Some(path) = &launch.settings_path {
+            match settings::Settings::load(path) {
+                Ok(loaded) => self.settings = loaded,
+                Err(error) => {
+                    self.notice = format!("Settings unreadable: {error}. Using defaults.")
+                }
+            }
         }
-        app.live = Some(live);
+        self.launch = launch;
+        self.host = Some(host);
+        self.refresh_sign_in();
+        if self.no_provider_connected() {
+            self.open_connect(panel::Origin::Onboarding);
+        }
+    }
+
+    pub fn launch_update_check(&self) -> bool {
+        settings::launch_update_check(&self.settings, self.launch.no_update_check.as_ref())
+    }
+
+    pub fn panel_open(&self) -> bool {
+        self.panel.is_some()
+    }
+
+    fn from_live(mut live: Live) -> Self {
+        let mut app = Self::default();
         app.log.clear();
         app.log_times.clear();
-        app.missions = std::array::from_fn(|_| "Standing by for a new mission".into());
+        if let Some(store) = &live.store {
+            match store.load_commander() {
+                Ok(entries) => {
+                    for entry in entries {
+                        app.log.push_back(entry.text);
+                        app.log_times.push_back(entry.at);
+                    }
+                }
+                Err(error) => app.notice = format!("Cannot read Commander transcript: {error}"),
+            }
+            match store.load_roster() {
+                Ok(members) => app.crew.extend(members),
+                Err(error) => app.notice = format!("Cannot read specialist roster: {error}"),
+            }
+        }
+        live.refresh_routes();
+        live.read_allowances(usage::now());
+        app.live = Some(live);
         app
     }
 
@@ -340,6 +582,7 @@ impl App {
         };
         live.usage_checked_at = None;
         live.refresh_usage();
+        live.refresh_routes();
         self.notice = match live.save_override() {
             Ok(()) => match live.preferred {
                 Some(index) => format!("Override saved: {}", live.profiles[index]),
@@ -350,9 +593,7 @@ impl App {
     }
 
     fn status(&self, index: usize) -> &'static str {
-        self.live
-            .as_ref()
-            .map_or(STATUSES[index], |live| live.outcomes[index])
+        self.crew[index].status.label()
     }
 
     fn poll_mission(&mut self) {
@@ -360,43 +601,59 @@ impl App {
             live.refresh_usage();
         }
         for _ in 0..64 {
-            let Some(live) = &mut self.live else { return };
-            let Some((agent, running)) = &live.mission else {
+            let Some((name, event)) = self.next_event() else {
                 return;
             };
-            let agent = *agent;
-            match running.events.try_recv() {
-                Ok(mission::Event::Running { profile, reason }) => {
-                    live.outcomes[agent] = "RUNNING";
-                    live.running_profile = Some(profile);
-                    live.last_routed = Some(profile);
-                    live.usage_checked_at = None;
-                    live.refresh_usage();
-                    if let Some(reason) = reason {
-                        self.notice = reason.clone();
-                        self.push_log(format!("SYSTEM  {reason}"));
-                    }
-                }
-                Ok(mission::Event::Continuing { from, to }) => {
-                    let link = format!("Limit: {} → {}", live.profiles[from], live.profiles[to]);
-                    live.continuation = Some(link.clone());
-                    live.pending = None;
-                    self.notice = link.clone();
-                    self.push_log(format!("SYSTEM  {link}"));
-                }
-                Ok(mission::Event::Output(text)) => {
-                    self.push_log(format!("{}  {text}", NAMES[agent]))
-                }
-                Ok(mission::Event::Finished(result)) => self.finish_mission(agent, result),
-                Err(std::sync::mpsc::TryRecvError::Empty) => return,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.finish_mission(agent, Err(io::Error::other("Mission worker stopped")));
-                }
-            }
+            self.handle_event(&name, event);
         }
     }
 
-    fn finish_mission(&mut self, agent: usize, result: io::Result<()>) {
+    fn next_event(&mut self) -> Option<(String, mission::Event)> {
+        let (name, running) = self.live.as_ref()?.mission.as_ref()?;
+        let event = match running.events.try_recv() {
+            Ok(event) => event,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                mission::Event::Finished(Err(io::Error::other("Mission worker stopped")))
+            }
+        };
+        Some((name.clone(), event))
+    }
+
+    fn handle_event(&mut self, name: &str, event: mission::Event) {
+        let index = specialists::find(&self.crew, name).unwrap_or(0);
+        let live = self.live.as_mut().expect("live mission");
+        match event {
+            mission::Event::Running { profile, reason } => {
+                self.crew[index].status = Status::Running;
+                live.running_profile = Some(profile);
+                live.last_routed = Some(profile);
+                live.usage_checked_at = None;
+                live.refresh_usage();
+                if let Some(reason) = reason {
+                    self.notice = reason.clone();
+                    self.push_log(format!("SYSTEM  {reason}"));
+                }
+            }
+            mission::Event::Continuing { from, to } => {
+                let link = format!("Limit: {} → {}", live.profiles[from], live.profiles[to]);
+                live.continuation = Some(link.clone());
+                live.pending = None;
+                self.notice = link.clone();
+                self.push_log(format!("SYSTEM  {link}"));
+            }
+            mission::Event::Output(text) => {
+                live.reply.push_str(&text);
+                live.reply.push('\n');
+                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    self.record(index, format!("{name}  {line}"));
+                }
+            }
+            mission::Event::Finished(result) => self.finish_mission(index, result),
+        }
+    }
+
+    fn finish_mission(&mut self, index: usize, result: io::Result<()>) {
         let live = self.live.as_mut().expect("live mission");
         live.mission = None;
         if live.pending.is_some() {
@@ -407,20 +664,181 @@ impl App {
         live.running_profile = None;
         live.usage_checked_at = None;
         live.refresh_usage();
-        live.outcomes[agent] = if result.is_ok() { "DONE" } else { "FAILED" };
-        self.notice = match result {
-            Ok(()) => live.continuation.as_ref().map_or_else(
-                || format!("{} completed the mission.", NAMES[agent]),
-                |link| format!("Done · {link}"),
-            ),
-            Err(error) => format!("{}: {error}", NAMES[agent]),
+        let reply = std::mem::take(&mut live.reply);
+        let continuation = live.continuation.clone();
+        let member = &mut self.crew[index];
+        member.status = if result.is_ok() {
+            Status::Done
+        } else {
+            Status::Error
         };
+        let name = member.name.clone();
+        let label = member.status.label();
+        if member.is_commander() {
+            self.notice = match &result {
+                Ok(()) => continuation.map_or_else(
+                    || format!("{name} replied."),
+                    |link| format!("Done · {link}"),
+                ),
+                Err(error) => format!("{name}: {error}"),
+            };
+            if result.is_ok() {
+                self.apply_directives(&reply);
+            }
+        } else {
+            let outcome = match &result {
+                Ok(()) => specialists::summary(&reply),
+                Err(error) => error.to_string(),
+            };
+            self.push_log(format!("{name}  {label} · {outcome}"));
+            self.notice = format!("{name} {label}");
+            self.save_roster();
+        }
+        self.start_next();
+    }
+
+    fn apply_directives(&mut self, reply: &str) {
+        for directive in specialists::directives(reply) {
+            match directive {
+                specialists::Directive::Spawn { name, role, task } => {
+                    if let (Some(index), Some(task)) = (self.spawn(&name, &role), task) {
+                        self.delegate(index, task);
+                    }
+                }
+                specialists::Directive::Delegate { name, task } => self.ask(&name, task),
+            }
+        }
+    }
+
+    fn save_roster(&mut self) {
+        let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) else {
+            return;
+        };
+        if let Err(error) = store.save_roster(&self.crew) {
+            self.notice = format!("Roster not saved: {error}");
+        }
+    }
+
+    fn record(&mut self, index: usize, text: String) {
+        if self.crew[index].is_commander() {
+            return self.push_log(text);
+        }
+        let entry = Entry::now(text);
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            if let Err(error) = store.append_history(&self.crew[index].name, &entry) {
+                self.notice = format!("History not saved: {error}");
+            }
+        }
+        self.crew[index].remember(entry);
+    }
+
+    fn spawn(&mut self, name: &str, role: &str) -> Option<usize> {
+        if let Err(error) = specialists::validate_name(name, &self.crew) {
+            self.notice = error;
+            return None;
+        }
+        let workspace = match self
+            .live
+            .as_ref()
+            .and_then(|live| Some((live.store.as_ref()?, &live.workspace)))
+        {
+            Some((store, base)) => match store.isolate(base, name) {
+                Ok(workspace) => Some(workspace),
+                Err(error) => {
+                    self.notice = format!("Cannot isolate {name}: {error}");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        self.crew.push(Member::new(name, role, None, workspace));
+        let index = self.crew.len() - 1;
+        self.push_log(format!(
+            "SYSTEM  Spawned {name} ({role}) · {}",
+            specialists::workspace_label(&self.crew[index])
+        ));
+        self.save_roster();
+        Some(index)
+    }
+
+    fn ask(&mut self, name: &str, task: String) {
+        match specialists::find(&self.crew, name) {
+            Some(index) if !self.crew[index].is_commander() => self.delegate(index, task),
+            Some(_) => self.notice = "Message Commander directly.".into(),
+            None => self.notice = format!("No specialist named {name}."),
+        }
+    }
+
+    fn delegate(&mut self, index: usize, task: String) {
+        let name = self.crew[index].name.clone();
+        if self.crew[index].paused {
+            self.notice = format!("Resume {name} before delegating.");
+            return;
+        }
+        self.crew[index].mission = task.clone();
+        self.record(index, format!("TASK  {task}"));
+        let Some(live) = &mut self.live else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        live.queue.push_back((name.clone(), task.clone()));
+        self.push_log(format!("SYSTEM  Delegated to {name}: {task}"));
+        self.save_roster();
+        self.start_next();
+    }
+
+    fn start_next(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        if live.mission.is_some() {
+            return;
+        }
+        let Some((name, task)) = live.queue.pop_front() else {
+            return;
+        };
+        let Some(index) = specialists::find(&self.crew, &name) else {
+            return self.start_next();
+        };
+        match self.launch_specialist(index, &task) {
+            Ok(()) => {}
+            Err(reason) => {
+                self.crew[index].status = Status::Error;
+                self.push_log(format!("{name}  ERROR · {reason}"));
+                self.notice = reason;
+                self.save_roster();
+                self.start_next();
+            }
+        }
+    }
+
+    fn launch_specialist(&mut self, index: usize, task: &str) -> Result<(), String> {
+        let live = self.live.as_mut().expect("live delegation");
+        let member = &self.crew[index];
+        let workspace = member
+            .workspace
+            .as_ref()
+            .ok_or_else(|| format!("{} has no isolated workspace.", member.name))?;
+        if live.profiles.is_empty() {
+            return Err(format!("{}.", panel::NO_PROVIDER_HINT));
+        }
+        let request = framed(routing::parse(task)?, |unit| {
+            specialists::specialist_prompt(member, unit)
+        });
+        live.reply.clear();
+        live.continuation = None;
+        let mission = mission::Mission::launch(
+            live.profiles.clone(),
+            live.route(request),
+            workspace.path.clone(),
+        );
+        live.mission = Some((member.name.clone(), mission));
+        Ok(())
     }
 
     pub fn poll_theme(&mut self, path: &Path) {
         let stamp = fs::metadata(path).and_then(|m| m.modified()).ok();
         if stamp != self.theme_stamp {
             self.theme_stamp = stamp;
+            self.deck_palette = deck_palette(path);
             match Theme::load(path) {
                 Ok(theme) => {
                     self.theme = theme;
@@ -430,11 +848,39 @@ impl App {
             }
         }
     }
+    pub fn watch_updates(&mut self, receiver: Option<Receiver<String>>) {
+        self.update_receiver = receiver;
+    }
+
+    pub fn poll_update(&mut self) {
+        let Some(receiver) = &self.update_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(latest) => {
+                self.update_banner = Some(update::one_line_notice(&latest));
+                self.update_receiver = None;
+            }
+            Err(TryRecvError::Disconnected) => self.update_receiver = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    pub fn dismiss_update(&mut self) {
+        self.update_banner = None;
+        self.update_area = Rect::default();
+    }
+
     fn push_log(&mut self, text: String) {
-        self.log.push_back(text);
-        self.log_times
-            .push_back(chrono::Local::now().format("%H:%M:%S").to_string());
-        if self.log.len() > 200 {
+        let entry = Entry::now(text);
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            if let Err(error) = store.append_commander(&entry) {
+                self.notice = format!("Transcript not saved: {error}");
+            }
+        }
+        self.log.push_back(entry.text);
+        self.log_times.push_back(entry.at);
+        if self.log.len() > specialists::FEED_LIMIT {
             self.log.pop_front();
             self.log_times.pop_front();
         }
@@ -446,89 +892,189 @@ impl App {
     }
 
     pub fn toggle_pause(&mut self) {
+        let name = self.crew[self.selected].name.clone();
         if self
             .live
             .as_ref()
             .and_then(|live| live.mission.as_ref())
-            .is_some_and(|(agent, _)| *agent == self.selected)
+            .is_some_and(|(running, _)| *running == name)
         {
             self.notice = "This mission is running. Pause is available between missions.".into();
             return;
         }
-        self.paused[self.selected] = !self.paused[self.selected];
-        self.push_log(format!(
-            "{}  {}.",
-            NAMES[self.selected],
-            if self.paused[self.selected] {
-                "Paused"
-            } else {
-                "Resumed"
-            }
-        ));
+        let member = &mut self.crew[self.selected];
+        member.paused = !member.paused;
+        let state = if member.paused { "Paused" } else { "Resumed" };
+        self.push_log(format!("{name}  {state}."));
     }
+
     pub fn submit(&mut self) {
         let command = self.input.trim().to_owned();
         if command.is_empty() {
             return;
         }
-        if let Some(live) = &mut self.live {
-            if live.mission.is_some() {
-                self.notice = "A mission is already running.".into();
-                return;
-            }
-            if self.paused[self.selected] {
-                self.notice = "Resume this agent before sending a mission.".into();
-                return;
-            }
-            if let Some((index, claim)) = live.pending.clone() {
-                live.outcomes[self.selected] = "STARTING";
-                live.mission = Some((
-                    self.selected,
-                    mission::Mission::resume(
-                        live.profiles.clone(),
-                        index,
-                        live.workspace.clone(),
-                        command.clone(),
-                        claim,
-                    ),
-                ));
-                self.missions[self.selected] = command;
+        match specialists::parse_command(&command) {
+            Err(usage) => self.notice = usage,
+            Ok(specialists::Command::Message(text)) if self.selected > 0 => {
                 self.input.clear();
-                return;
+                self.delegate(self.selected, text);
             }
-            if live.profiles.is_empty() {
-                self.notice = "Sign in with agent-command auth login PROVIDER PROFILE.".into();
-                return;
+            Ok(specialists::Command::Message(text)) => self.message_commander(text),
+            Ok(command) => {
+                self.input.clear();
+                self.orchestrate(command);
             }
-            let request = match routing::parse(&command) {
-                Ok(request) => request,
-                Err(error) => {
-                    self.notice = error;
-                    return;
-                }
-            };
-            self.notice = format!("Routing in {}", live.workspace.display());
-            live.outcomes[self.selected] = "STARTING";
-            live.continuation = None;
-            let route = mission::Route {
-                request,
-                preferred: live.preferred.map(|index| live.profiles[index].to_string()),
-                catalog: live.catalog(),
-                pins: live.pins.clone(),
-            };
-            live.mission = Some((
-                self.selected,
-                mission::Mission::launch(live.profiles.clone(), route, live.workspace.clone()),
-            ));
-            self.missions[self.selected] = command;
-            self.input.clear();
-        } else {
-            self.missions[self.selected] = command.clone();
-            self.push_log(format!("YOU -> {}  {command}", NAMES[self.selected]));
-            self.input.clear();
-            self.notice = "Preview mission only; no external dispatch.".into();
         }
     }
+
+    fn orchestrate(&mut self, command: specialists::Command) {
+        match command {
+            specialists::Command::Spawn { name, role, task } => {
+                if let Some(index) = self.spawn(&name, &role) {
+                    self.selected = index;
+                    if let Some(task) = task {
+                        self.delegate(index, task);
+                    }
+                }
+            }
+            specialists::Command::Ask { name, task } => self.ask(&name, task),
+            specialists::Command::Roster => {
+                let entry = self
+                    .live
+                    .as_ref()
+                    .map_or_else(|| "preview".into(), Live::entry_label);
+                let roster = specialists::roster_summary(&self.crew);
+                self.push_log(format!("SYSTEM  Roster: {roster} · entry {entry}"));
+            }
+            specialists::Command::Remove { name } => self.remove(&name),
+            specialists::Command::Entry { profile } => self.set_entry(&profile),
+            specialists::Command::Settings => self.open_settings(),
+            specialists::Command::Connect => self.open_connect(panel::Origin::Direct),
+            specialists::Command::Message(text) => self.message_commander(text),
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        let Some(index) = specialists::find(&self.crew, name) else {
+            self.notice = format!("No specialist named {name}.");
+            return;
+        };
+        let member = &self.crew[index];
+        if member.is_commander() {
+            self.notice = "Commander is the persistent entry bot and cannot be removed.".into();
+            return;
+        }
+        if let Some(live) = &mut self.live {
+            if live
+                .mission
+                .as_ref()
+                .is_some_and(|(running, _)| *running == member.name)
+            {
+                self.notice = format!("{} is running; remove it after it finishes.", member.name);
+                return;
+            }
+            live.queue.retain(|(queued, _)| *queued != member.name);
+            if let Some(Err(error)) = live.store.as_ref().map(|store| store.release(member)) {
+                self.notice = format!("Cannot remove {}: {error}", member.name);
+                return;
+            }
+        }
+        let member = self.crew.remove(index);
+        self.selected = self.selected.min(self.crew.len() - 1);
+        self.push_log(format!("SYSTEM  Removed {}.", member.name));
+        self.save_roster();
+    }
+
+    fn set_entry(&mut self, profile: &str) {
+        let Some(live) = &mut self.live else {
+            self.notice = "Preview: sign in to choose an entry profile.".into();
+            return;
+        };
+        if live.mission.is_some() {
+            self.notice = "Change the entry profile between missions.".into();
+            return;
+        }
+        live.preferred = if profile == "auto" {
+            None
+        } else {
+            match live
+                .profiles
+                .iter()
+                .position(|candidate| candidate.to_string() == profile)
+            {
+                Some(index) => Some(index),
+                None => {
+                    self.notice = format!("{profile} is not a signed-in profile.");
+                    return;
+                }
+            }
+        };
+        live.refresh_routes();
+        live.usage_checked_at = None;
+        self.notice = match live.save_override() {
+            Ok(()) => format!("Entry model: {}", live.entry_label()),
+            Err(error) => format!("Entry override not saved: {error}"),
+        };
+    }
+
+    fn message_commander(&mut self, command: String) {
+        let Some(live) = &mut self.live else {
+            self.crew[0].mission = command.clone();
+            self.push_log(format!("YOU  {command}"));
+            self.input.clear();
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        if live.mission.is_some() {
+            self.notice = "A mission is already running.".into();
+            return;
+        }
+        if self.crew[0].paused {
+            self.notice = "Resume Commander before sending a message.".into();
+            return;
+        }
+        if let Some((index, claim)) = live.pending.clone() {
+            live.mission = Some((
+                COMMANDER.into(),
+                mission::Mission::resume(
+                    live.profiles.clone(),
+                    index,
+                    live.workspace.clone(),
+                    command.clone(),
+                    claim,
+                ),
+            ));
+            self.crew[0].mission = command;
+            self.input.clear();
+            return;
+        }
+        if live.profiles.is_empty() {
+            self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
+            return;
+        }
+        let request = match routing::parse(&command) {
+            Ok(request) => framed(request, |unit| {
+                specialists::commander_prompt(self.log.iter().map(String::as_str), &self.crew, unit)
+            }),
+            Err(error) => {
+                self.notice = error;
+                return;
+            }
+        };
+        self.notice = format!("Routing in {}", live.workspace.display());
+        live.continuation = None;
+        live.reply.clear();
+        let mission = mission::Mission::launch(
+            live.profiles.clone(),
+            live.route(request),
+            live.workspace.clone(),
+        );
+        live.mission = Some((COMMANDER.into(), mission));
+        self.crew[0].mission = command.clone();
+        self.input.clear();
+        self.push_log(format!("YOU  {command}"));
+    }
+
     fn abandon_continuation(&mut self) {
         let Some(live) = &mut self.live else { return };
         if live.mission.is_some() {
@@ -548,7 +1094,11 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.panel.is_some() && !(control && matches!(key.code, KeyCode::Char('q' | 'c'))) {
+            return self.panel_key(key);
+        }
+        if control {
             match key.code {
                 KeyCode::Char('q' | 'c') if self.mission_running() => {
                     self.notice = "Wait for the running mission before quitting.".into();
@@ -566,7 +1116,9 @@ impl App {
         }
         match key.code {
             KeyCode::F(2) => self.select_profile(),
+            KeyCode::F(3) => self.open_settings(),
             KeyCode::F(4) => self.abandon_continuation(),
+            KeyCode::F(6) => self.dismiss_update(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
             KeyCode::Enter if self.editing => self.submit(),
@@ -576,13 +1128,20 @@ impl App {
             }
             KeyCode::Char(c) if self.editing => self.input.push(c),
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(3),
+            KeyCode::Down => self.selected = (self.selected + 1).min(self.crew.len() - 1),
+            KeyCode::Home => self.selected = 0,
             _ => {}
         }
     }
     pub fn click(&mut self, x: u16, y: u16) {
         let point = ratatui::layout::Position::new(x, y);
-        if self
+        if self.panel.is_some() {
+            self.panel_click(x, y);
+        } else if self.settings_area.contains(point) {
+            self.open_settings();
+        } else if self.update_area.contains(point) {
+            self.dismiss_update();
+        } else if self
             .live
             .as_ref()
             .is_some_and(|live| live.abandon_area.contains(point))
@@ -601,13 +1160,75 @@ impl App {
         } else if self.send_area.contains(point) {
             self.submit();
         } else if self.crew_area.contains(point) {
-            self.selected = ((y.saturating_sub(self.crew_area.y))
-                / (self.crew_area.height / 4).max(1))
-            .min(3) as usize;
+            let row = usize::from((y - self.crew_area.y) / self.crew_row_height.max(1));
+            if self.crew_offset + row < self.crew.len() {
+                self.selected = self.crew_offset + row;
+            }
             self.editing = false;
         }
     }
+    fn crew_counts(&self) -> [String; 4] {
+        let count = |status| {
+            self.crew
+                .iter()
+                .filter(|member| member.status == status)
+                .count()
+        };
+        [
+            format!("{:02}  CREW", self.crew.len()),
+            format!("{:02}  RUNNING", count(Status::Running)),
+            format!("{:02}  NEED ATTENTION", count(Status::Error)),
+            if self.live.is_some() {
+                "LIVE  /  COMMANDER".into()
+            } else {
+                "PREVIEW  /  NO DISPATCH".into()
+            },
+        ]
+    }
+
+    fn selected_details(&self) -> Vec<Line<'static>> {
+        let member = &self.crew[self.selected];
+        if member.is_commander() {
+            let entry = self
+                .live
+                .as_ref()
+                .map_or_else(|| "preview".into(), Live::entry_label);
+            vec![
+                Line::raw("ENTRY MODEL"),
+                Line::raw(entry),
+                Line::raw(""),
+                Line::raw("SPECIALISTS"),
+                Line::raw(format!("{} on roster", self.crew.len() - 1)),
+            ]
+        } else {
+            vec![
+                Line::raw("ROLE"),
+                Line::raw(member.role.clone()),
+                Line::raw(""),
+                Line::raw("WORKSPACE"),
+                Line::raw(specialists::workspace_label(member)),
+            ]
+        }
+    }
+
+    fn feed_entries(&self) -> Vec<(&str, &str)> {
+        if self.selected == 0 {
+            self.log_times
+                .iter()
+                .zip(&self.log)
+                .map(|(at, text)| (at.as_str(), text.as_str()))
+                .collect()
+        } else {
+            self.crew[self.selected]
+                .history
+                .iter()
+                .map(|entry| (entry.at.as_str(), entry.text.as_str()))
+                .collect()
+        }
+    }
+
     pub fn draw(&mut self, f: &mut Frame) {
+        self.selected = self.selected.min(self.crew.len() - 1);
         let t = self.theme.clone();
         let a = f.area();
         let base = Style::default()
@@ -622,20 +1243,40 @@ impl App {
                 h.min(a.height.saturating_sub(y)),
             )
         };
-        f.render_widget(
-            Paragraph::new(
-                "  ▣  AGENT COMMAND     File   Crew   Missions   Radio    |    PRIVATEER / 01",
-            )
-            .style(
-                Style::default()
-                    .fg(color("272c32"))
-                    .bg(color(&t.ivory))
-                    .bold(),
-            ),
-            r(0, 0, a.width, 1),
-        );
+        self.draw_menu_bar(f, a);
         let compact = a.height < 36 || a.width < 105;
-        if !compact {
+        let banner_rows = self.draw_update_banner(f, a);
+        let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
+        let mode = deck_mode(a, compact);
+        let deck_rows = match mode {
+            token_burn::DeckMode::Full if !cards.is_empty() => {
+                self.draw_deck(
+                    f,
+                    &cards,
+                    mode,
+                    r(
+                        3,
+                        2,
+                        a.width.saturating_sub(6),
+                        token_burn::FULL_CARD_HEIGHT,
+                    ),
+                );
+                0
+            }
+            token_burn::DeckMode::Full => 0,
+            token_burn::DeckMode::Compact => {
+                let rows = cards.len().min(COMPACT_DECK_MAX_ROWS) as u16;
+                self.draw_deck(
+                    f,
+                    &cards,
+                    mode,
+                    r(1, 1 + banner_rows, a.width.saturating_sub(2), rows),
+                );
+                rows
+            }
+        };
+        let top_shift = (banner_rows + deck_rows).saturating_sub(1);
+        if !compact && cards.is_empty() {
             let banner = if a.width >= 105 {
                 banner()
             } else {
@@ -663,25 +1304,18 @@ impl App {
                 Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
                 r(3, 6, a.width.saturating_sub(6), 1),
             );
+        }
+        if !compact {
             let ma = r(3, 8, a.width.saturating_sub(6), 3);
             f.render_widget(
                 Block::default().style(Style::default().bg(color("191e25"))),
                 ma,
             );
             let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
-            let labels = if self.live.is_some() {
-                ["", "", "", ""]
-            } else {
-                [
-                    "04  AGENTS ONLINE",
-                    "02  ACTIVE MISSIONS",
-                    "00  NEED ATTENTION",
-                    "UI PROTOTYPE  /  SAMPLE DATA",
-                ]
-            };
+            let labels = self.crew_counts();
             for (i, label) in labels.iter().enumerate() {
                 f.render_widget(
-                    Paragraph::new(*label)
+                    Paragraph::new(label.as_str())
                         .alignment(ratatui::layout::Alignment::Center)
                         .style(Style::default().fg(color(if i == 3 {
                             &t.amber
@@ -696,9 +1330,9 @@ impl App {
         let main = if compact {
             r(
                 1,
-                2,
+                2 + top_shift,
                 a.width.saturating_sub(2),
-                a.height.saturating_sub(8 + usage_rows),
+                a.height.saturating_sub(8 + usage_rows + top_shift),
             )
         } else {
             r(
@@ -745,12 +1379,22 @@ impl App {
                 16.min(cols[0].height.saturating_sub(7))
             },
         );
-        let stride = (self.crew_area.height / 4).max(1);
-        for (i, name) in NAMES.iter().enumerate() {
-            let y = self.crew_area.y + i as u16 * stride;
-            if y + stride > self.crew_area.bottom() {
-                break;
-            }
+        let stride = (if compact { 2 } else { 4 })
+            .min(self.crew_area.height)
+            .max(1);
+        let visible = usize::from((self.crew_area.height / stride).max(1));
+        self.crew_row_height = stride;
+        self.crew_offset = (self.selected + 1).saturating_sub(visible);
+        for (row_index, (i, member)) in self
+            .crew
+            .iter()
+            .enumerate()
+            .skip(self.crew_offset)
+            .take(visible)
+            .enumerate()
+        {
+            let name = &member.name;
+            let y = self.crew_area.y + row_index as u16 * stride;
             let row = r(self.crew_area.x, y, self.crew_area.width, stride);
             if i == self.selected {
                 f.render_widget(
@@ -767,7 +1411,11 @@ impl App {
                 Line::from(vec![
                     Span::styled(
                         " ●",
-                        Style::default().fg(color(if i == 1 { &t.amber } else { &t.accent })),
+                        Style::default().fg(color(match member.status {
+                            Status::Running => &t.amber,
+                            Status::Error => "b86d67",
+                            _ => &t.accent,
+                        })),
                     ),
                     Span::styled(format!(" {name}  "), style),
                     Span::styled(
@@ -779,7 +1427,10 @@ impl App {
                         })),
                     ),
                 ]),
-                Line::styled(format!("   {}", self.status(i).to_lowercase()), style),
+                Line::styled(
+                    format!("   {} · {}", self.status(i).to_lowercase(), member.role),
+                    style,
+                ),
             ];
             f.render_widget(
                 Paragraph::new(lines),
@@ -806,23 +1457,21 @@ impl App {
         let x = cols[1].x + 2;
         let y = cols[1].y + 3;
         let w = cols[1].width.saturating_sub(4);
+        let selected = &self.crew[self.selected];
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("{}  ", NAMES[self.selected]),
-                    Style::default().bold(),
-                ),
+                Span::styled(format!("{}  ", selected.name), Style::default().bold()),
                 Span::styled(
                     format!(
                         "● {}",
-                        if self.paused[self.selected] {
+                        if selected.paused {
                             "PAUSED"
                         } else {
                             self.status(self.selected)
                         }
                     ),
                     Style::default()
-                        .fg(color(if self.selected == 1 {
+                        .fg(color(if selected.status == Status::Running {
                             &t.amber
                         } else {
                             &t.accent
@@ -832,50 +1481,33 @@ impl App {
             ])),
             r(x, y, w, 1),
         );
-        let elapsed = if self.live.is_some() {
-            "—"
-        } else if self.selected == 0 {
-            "12m 34s"
-        } else if self.selected == 1 {
-            "04m 18s"
-        } else {
-            "—"
-        };
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    self.missions[self.selected].clone(),
+                    selected.mission.clone(),
                     Style::default().fg(color("d4d9df")),
                 ),
                 Line::styled(
-                    format!("AGENT {:02}  /  ELAPSED {elapsed}", self.selected + 1),
+                    format!(
+                        "{}  /  {:02}",
+                        selected.role.to_uppercase(),
+                        self.selected + 1
+                    ),
                     Style::default().fg(color(&t.muted)),
                 ),
             ])
             .wrap(Wrap { trim: false }),
             r(x, y + 2, w, 4),
         );
-        if self.live.is_none() && cols[1].height > 22 {
+        let by = cols[1].bottom().saturating_sub(5);
+        if by > y + 7 {
             f.render_widget(
-                Paragraph::new(vec![
-                    Line::raw("WORKSPACE"),
-                    Line::raw("Agent-Commander UI"),
-                    Line::raw(""),
-                    Line::raw("CURRENT STEP"),
-                    Line::raw("Refining layout and interaction"),
-                    Line::raw(""),
-                    Line::raw("PROGRESS"),
-                    Line::from(vec![
-                        Span::styled("━━━━━━━━━━━━━━━━", Style::default().fg(color(&t.accent))),
-                        Span::styled("━━━━━━━━", Style::default().fg(color("273335"))),
-                        Span::raw("  68%"),
-                    ]),
-                ])
-                .style(Style::default().fg(color(&t.muted))),
-                r(x, y + 6, w, 8),
+                Paragraph::new(self.selected_details())
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(color(&t.muted))),
+                r(x, y + 6, w, by - y - 7),
             );
         }
-        let by = cols[1].bottom().saturating_sub(5);
         self.new_area = r(x, by, 15.min(w), 3);
         self.pause_area = r(x + 16, by, 12.min(w.saturating_sub(16)), 3);
         fn button(text: &str, primary: bool, t: &Theme) -> Paragraph<'static> {
@@ -896,7 +1528,7 @@ impl App {
         f.render_widget(button("+ New mission", true, &t), self.new_area);
         f.render_widget(
             button(
-                if self.paused[self.selected] {
+                if self.crew[self.selected].paused {
                     "▶ Resume"
                 } else {
                     "Ⅱ Pause"
@@ -913,12 +1545,11 @@ impl App {
             cols[2].height.saturating_sub(6),
         );
         let keep = (usize::from(feed.height) + 1).div_ceil(3);
-        let mut lines: Vec<_> = self
-            .log
+        let entries = self.feed_entries();
+        let mut lines: Vec<_> = entries
             .iter()
-            .zip(self.log_times.iter())
-            .skip(self.log.len().saturating_sub(keep))
-            .flat_map(|(entry, stamp)| {
+            .skip(entries.len().saturating_sub(keep))
+            .flat_map(|(stamp, entry)| {
                 let (source, message) = entry.split_once("  ").unwrap_or(("SYSTEM", entry));
                 [
                     Line::from(vec![
@@ -942,9 +1573,7 @@ impl App {
             live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
             let now = usage::now();
             let label = if live.profiles.is_empty() {
-                vec![Line::raw(
-                    "No profiles · agent-command auth login PROVIDER PROFILE",
-                )]
+                vec![Line::raw(panel::NO_PROVIDER_HINT)]
             } else {
                 {
                     let latch = live.usage.map_or_else(
@@ -992,12 +1621,14 @@ impl App {
                         .as_ref()
                         .is_some_and(|live| live.pending.is_some())
                     {
-                        "Re-enter the original task to resume…"
+                        "Re-enter the original task to resume…".into()
+                    } else if self.selected == 0 {
+                        "Message Commander or /spawn NAME ROLE [TASK]…".into()
                     } else {
-                        "Give your selected agent a mission…"
+                        format!("Give {} a task…", self.crew[self.selected].name)
                     }
                 } else {
-                    &self.input
+                    self.input.clone()
                 }
             ))
             .block(
@@ -1026,6 +1657,8 @@ impl App {
         f.render_widget(
             Paragraph::new(if pending && self.notice.is_empty() {
                 "Interrupted continuation pending · re-enter task, then Send"
+            } else if self.notice.is_empty() && self.no_provider_connected() {
+                panel::NO_PROVIDER_HINT
             } else if self.notice.is_empty() {
                 if self.live.is_some() {
                     "   Ready"
@@ -1057,6 +1690,95 @@ impl App {
                     live.abandon_area,
                 );
             }
+        }
+        self.draw_panel(f, a);
+    }
+}
+
+const MENU_BRAND: &str = "  ▣  AGENT COMMAND";
+const MENU_ITEMS: &str = "File   Crew   Missions   Radio    |    PRIVATEER";
+const MENU_SHIP_NUMBER: &str = " / 01";
+const MENU_SETTINGS: &str = " Settings ";
+
+impl App {
+    fn draw_menu_bar(&mut self, f: &mut Frame, area: Rect) {
+        let bar = Rect::new(area.x, area.y, area.width, 1).intersection(area);
+        let settings_width = MENU_SETTINGS.chars().count() as u16;
+        let wide = format!("{MENU_BRAND}     {MENU_ITEMS}{MENU_SHIP_NUMBER}");
+        let labels = if wide.chars().count() + usize::from(settings_width) < usize::from(bar.width)
+        {
+            wide
+        } else {
+            format!("{MENU_BRAND}   {MENU_ITEMS}")
+        };
+        f.render_widget(
+            Paragraph::new(labels).style(
+                Style::default()
+                    .fg(color("272c32"))
+                    .bg(color(&self.theme.ivory))
+                    .bold(),
+            ),
+            bar,
+        );
+        self.settings_area = Rect::new(
+            bar.right().saturating_sub(settings_width),
+            bar.y,
+            settings_width,
+            1,
+        )
+        .intersection(bar);
+        f.render_widget(
+            Paragraph::new(MENU_SETTINGS).style(
+                Style::default()
+                    .fg(color(&self.theme.ivory))
+                    .bg(color("272c32"))
+                    .bold(),
+            ),
+            self.settings_area,
+        );
+    }
+
+    fn draw_update_banner(&mut self, f: &mut Frame, area: Rect) -> u16 {
+        let Some(text) = &self.update_banner else {
+            self.update_area = Rect::default();
+            return 0;
+        };
+        self.update_area = Rect::new(area.x, area.y + 1, area.width, 1).intersection(area);
+        f.render_widget(
+            Paragraph::new(format!("{UPDATE_DISMISS_HINT} {text}")).style(
+                Style::default()
+                    .fg(color("1b2027"))
+                    .bg(color(&self.theme.amber))
+                    .bold(),
+            ),
+            self.update_area,
+        );
+        1
+    }
+
+    fn draw_deck(
+        &self,
+        f: &mut Frame,
+        cards: &[token_burn::AccountCard],
+        mode: token_burn::DeckMode,
+        area: Rect,
+    ) {
+        if mode == token_burn::DeckMode::Compact {
+            token_burn::render_deck_as(mode, cards, area, f.buffer_mut(), &self.deck_palette);
+            return;
+        }
+        let shown = &cards[..cards.len().min(FULL_DECK_MAX_CARDS)];
+        let columns = Layout::horizontal(vec![Constraint::Fill(1); shown.len()])
+            .spacing(1)
+            .split(area);
+        for (card, column) in shown.iter().zip(columns.iter()) {
+            token_burn::render_deck_as(
+                mode,
+                std::slice::from_ref(card),
+                *column,
+                f.buffer_mut(),
+                &self.deck_palette,
+            );
         }
     }
 }
@@ -1126,7 +1848,6 @@ pub fn snapshot(path: &Path) -> io::Result<()> {
     fs::write(path, svg)
 }
 
-/// Latest source modification time, used to exit cleanly before a development rebuild.
 pub fn source_stamp(root: &Path) -> SystemTime {
     fn walk(path: &Path) -> SystemTime {
         if path.is_dir() {
@@ -1195,7 +1916,9 @@ case "${1}" in
         fi
         ;;
 esac
-test -f workspace-marker && test "$(cat)" = "Mission input" || exit 9
+prompt=$(cat)
+case "$prompt" in "You are Commander"*"Operator: Mission input") ;; *) exit 9 ;; esac
+test -f workspace-marker || exit 9
 long=
 remaining=58
 while test "$remaining" -gt 0; do
@@ -1522,14 +2245,13 @@ while test ! -f release; do sleep 0.01; done
             }
             wait_for(&mut app, |app| !app.mission_running());
             terminal.draw(|f| app.draw(f)).unwrap();
-            assert_eq!(app.status(0), "FAILED");
+            assert_eq!(app.status(0), "ERROR");
             assert_eq!(
                 app.notice,
-                "Atlas: No eligible signed-in subscription profile. Skipped: claude/alpha usage state unreadable; claude/zulu latched."
+                "Commander: No eligible signed-in subscription profile. Skipped: claude/alpha usage state unreadable; claude/zulu latched."
             );
-            assert!(
-                row(&terminal, height - 2).contains("Atlas: No eligible signed-in subscription")
-            );
+            assert!(row(&terminal, height - 2)
+                .contains("Commander: No eligible signed-in subscription"));
         }
     }
 
@@ -1654,6 +2376,240 @@ while test ! -f release; do sleep 0.01; done
     }
 
     #[cfg(unix)]
+    const ORCHESTRATOR_PROVIDER: &str = r#"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+prompt=$(cat)
+case "$prompt" in
+  "You are Commander"*"Operator: Review the patch please")
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Spawning a reviewer.\nSPAWN_SPECIALIST: nova | reviewer | Check the README"}]}}' ;;
+  "You are Commander"*"nova (reviewer, DONE)"*"Spawning a reviewer."*"Operator: Hi")
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello again"}]}}' ;;
+  "You are nova"*"Task: Check the README")
+    test -f README || exit 3
+    printf 'reviewed\n' > review.txt
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Working\nREADME looks good"}]}}' ;;
+  *) exit 9 ;;
+esac
+"#;
+
+    fn screen(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn region(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(unix)]
+    fn send(app: &mut App, text: &str) {
+        app.input = text.into();
+        app.submit();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commander_delegates_to_an_isolated_specialist_and_survives_restart() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("orchestrator", ORCHESTRATOR_PROVIDER);
+        let repository = fixture.root.join("work");
+        specialists::tests::git_repository(&repository);
+        let profiles = vec![fixture.profile(Provider::Claude, "alpha")];
+        let open = || App::from_live(test_live(repository.clone(), profiles.clone(), None));
+
+        let mut app = open();
+        assert_eq!(app.crew.len(), 1);
+        assert!(app.crew[0].is_commander());
+        send(&mut app, "Review the patch please");
+        wait_for(&mut app, |app| {
+            app.crew
+                .get(1)
+                .is_some_and(|nova| nova.status == Status::Done)
+        });
+        assert_eq!(app.status(0), "DONE");
+        assert!(app.log.contains(&"YOU  Review the patch please".to_owned()));
+        assert!(app
+            .log
+            .contains(&"Commander  Spawning a reviewer.".to_owned()));
+        assert_eq!(
+            app.log.back().unwrap(),
+            "nova  DONE · README looks good",
+            "{:?}",
+            app.log
+        );
+
+        let nova = app.crew[1].clone();
+        let workspace = nova.workspace.clone().unwrap();
+        assert!(matches!(
+            workspace.isolation,
+            specialists::Isolation::Worktree { .. }
+        ));
+        assert!(workspace.path.join("review.txt").is_file());
+        assert!(!repository.join("review.txt").exists());
+        let worktrees = std::process::Command::new("git")
+            .current_dir(&repository)
+            .args(["worktree", "list"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&worktrees.stdout).contains(workspace.path.to_str().unwrap())
+        );
+        let history: Vec<_> = nova
+            .history
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(
+            history,
+            [
+                "TASK  Check the README",
+                "nova  Working",
+                "nova  README looks good"
+            ]
+        );
+        assert!(!app.log.iter().any(|line| line == "nova  Working"));
+
+        for (width, height, keyboard) in INPUT_MATRIX {
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            assert!(
+                crew.contains("Commander") && crew.contains("nova"),
+                "{crew}"
+            );
+            assert!(crew.contains("done · rev"), "{width}x{height}: {crew}");
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            } else {
+                app.click(app.crew_area.x, app.crew_area.y + app.crew_row_height + 1);
+            }
+            assert_eq!(app.selected, 1);
+            let buffer = screen(&mut app, width, height);
+            let feed = Rect::new(
+                app.pause_area.right() + 2,
+                app.crew_area.y,
+                width - app.pause_area.right() - 3,
+                app.input_area.y - app.crew_area.y,
+            );
+            assert!(region(&buffer, feed).contains("README looks good"));
+            assert!(region(&buffer, Rect::new(0, 0, width, height)).contains("nova  ● DONE"));
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            } else {
+                app.click(app.crew_area.x, app.crew_area.y + 1);
+            }
+            assert_eq!(app.selected, 0);
+            let buffer = screen(&mut app, width, height);
+            let commander_feed = region(&buffer, feed);
+            assert!(
+                commander_feed.contains("DONE · README") && !commander_feed.contains("Working"),
+                "{width}x{height}: {commander_feed}"
+            );
+        }
+
+        let mut app = open();
+        assert_eq!(app.crew.len(), 2);
+        assert_eq!(app.crew[1].name, "nova");
+        assert_eq!(app.crew[1].status, Status::Done);
+        assert_eq!(app.crew[1].history, nova.history);
+        assert!(app
+            .log
+            .contains(&"nova  DONE · README looks good".to_owned()));
+        send(&mut app, "Hi");
+        wait_for(&mut app, |app| !app.mission_running());
+        assert_eq!(
+            app.log.back().unwrap(),
+            "Commander  Hello again",
+            "{}",
+            app.notice
+        );
+
+        send(&mut app, "/roster");
+        assert!(app.log.back().unwrap().starts_with(
+            "SYSTEM  Roster: Commander (entry, DONE) · nova (reviewer, DONE) · entry claude/alpha"
+        ));
+        send(&mut app, "/remove commander");
+        assert_eq!(app.crew.len(), 2);
+        send(&mut app, "/remove nova");
+        assert_eq!(app.crew.len(), 1);
+        assert!(!workspace.path.exists());
+        assert_eq!(open().crew.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_model_is_auto_chosen_overridable_and_falls_back_to_first_profile() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("entry-model", ORCHESTRATOR_PROVIDER);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "alpha"),
+            fixture.profile(Provider::Claude, "beta"),
+        ];
+        let mut app = App::from_live(test_live(fixture.root.clone(), profiles.clone(), None));
+        let entry = app.live.as_ref().unwrap().entry.clone().unwrap();
+        assert_eq!(entry.1, "auto");
+        assert!(entry.0.starts_with("claude/"));
+        send(&mut app, "/entry claude/beta");
+        assert_eq!(app.notice, "Entry model: claude/beta (override)");
+        let mut reopened = test_live(fixture.root.clone(), profiles.clone(), None);
+        assert_eq!(reopened.load_override(), None);
+        assert_eq!(reopened.preferred, Some(1));
+        send(&mut app, "/entry nobody/else");
+        assert_eq!(app.notice, "nobody/else is not a signed-in profile.");
+        send(&mut app, "/entry auto");
+        assert!(app.notice.ends_with("(auto)"), "{}", app.notice);
+        let buffer = screen(&mut app, 120, 40);
+        assert!(region(&buffer, Rect::new(0, 0, 120, 40)).contains("ENTRY MODEL"));
+
+        let signed_out = Fixture::new("entry-signed-out", "exit 1\n");
+        let profiles = vec![signed_out.profile(Provider::Claude, "gamma")];
+        let app = App::from_live(test_live(signed_out.root.clone(), profiles, None));
+        assert_eq!(
+            app.live.as_ref().unwrap().entry,
+            Some(("claude/gamma".into(), "first signed-in"))
+        );
+    }
+
+    #[test]
+    fn preview_spawn_ask_and_remove_stay_in_memory() {
+        let mut app = App::default();
+        for text in [
+            "/spawn atlas builder Build it",
+            "/spawn atlas again",
+            "/ask ghost x",
+        ] {
+            app.input = text.into();
+            app.submit();
+        }
+        assert_eq!(app.crew.len(), 2);
+        assert_eq!(app.notice, "No specialist named ghost.");
+        assert_eq!(app.crew[1].mission, "Build it");
+        assert_eq!(app.selected, 1);
+        app.input = "/spawn".into();
+        app.submit();
+        assert_eq!(app.input, "/spawn");
+        app.input = "/remove atlas".into();
+        app.submit();
+        assert_eq!(app.crew.len(), 1);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[cfg(unix)]
     const INPUT_MATRIX: [(u16, u16, bool); 4] = [
         (80, 24, true),
         (80, 24, false),
@@ -1661,24 +2617,30 @@ while test ! -f release; do sleep 0.01; done
         (120, 40, false),
     ];
 
-    #[cfg(unix)]
     fn click_center(app: &mut App, area: Rect) {
         app.click(area.x + area.width / 2, area.y + area.height / 2);
     }
 
     #[test]
     fn controls_and_unicode() {
-        let mut a = App::default();
+        let mut a = App {
+            input: "/spawn nova reviewer".into(),
+            ..App::default()
+        };
+        a.submit();
+        a.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(a.paused[1]);
+        assert!(a.crew[1].paused);
+        a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         a.editing = true;
         for c in "Build λ".chars() {
             a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         a.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         a.submit();
-        assert_eq!(a.missions[1], "Build");
+        assert_eq!(a.crew[1].mission, "Build");
+        assert_eq!(a.crew[1].history.back().unwrap().text, "TASK  Build");
         assert!(a.input.is_empty());
     }
     #[test]
@@ -1712,5 +2674,204 @@ while test ! -f release; do sleep 0.01; done
         assert_eq!(a.theme.accent, "123456");
         assert!(!a.notice.is_empty());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deck_palette_follows_theme_and_falls_back_when_it_does_not_parse() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-command-deck-theme-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "accent = '123456'").unwrap();
+        let mut app = App::default();
+        app.poll_theme(&path);
+        assert_eq!(app.deck_palette.accent, color("123456"));
+        fs::write(&path, "accent = [").unwrap();
+        app.theme_stamp = None;
+        app.poll_theme(&path);
+        assert_eq!(app.deck_palette, token_burn::TokenBurnPalette::default());
+        assert_eq!(app.theme.accent, "123456");
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
+
+    fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        region(buffer, Rect::new(0, y, buffer.area.width, 1))
+    }
+
+    #[cfg(unix)]
+    fn cell_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        (0..buffer.area.height).find_map(|y| {
+            let symbols: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let width = needle.chars().count();
+            (0..symbols.len().saturating_sub(width - 1))
+                .find_map(|x| (symbols[x..x + width].concat() == needle).then_some((x as u16, y)))
+        })
+    }
+
+    #[test]
+    fn update_banner_appears_from_an_injected_receiver_and_dismisses() {
+        for (index, (width, height)) in SIZES.into_iter().enumerate() {
+            let mut app = App::default();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.watch_updates(Some(receiver));
+            app.poll_update();
+            assert!(app.update_banner.is_none());
+            sender.send("9.9.9".to_owned()).unwrap();
+            app.poll_update();
+            let buffer = screen(&mut app, width, height);
+            let banner = row(&buffer, 1);
+            assert!(banner.starts_with(UPDATE_DISMISS_HINT), "{banner}");
+            assert!(
+                banner.contains("Agent Command 9.9.9 is available"),
+                "{banner}"
+            );
+            assert!(app.input_area.bottom() <= height);
+            assert!(region(&buffer, app.crew_area).contains("Commander"));
+            if index == 0 {
+                app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+            } else {
+                let banner = app.update_area;
+                click_center(&mut app, banner);
+            }
+            assert!(app.update_banner.is_none());
+            let buffer = screen(&mut app, width, height);
+            assert!(!row(&buffer, 1).contains("9.9.9"));
+            drop(sender);
+            app.poll_update();
+            assert!(app.update_receiver.is_none());
+        }
+        let mut app = App::default();
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        app.watch_updates(Some(receiver));
+        drop(sender);
+        app.poll_update();
+        assert!(app.update_receiver.is_none() && app.update_banner.is_none());
+    }
+
+    #[cfg(unix)]
+    fn observe(profile: &auth::Profile, status: &str, five: f64, week: f64) {
+        let now = usage::now();
+        usage::Usage::observe_claude(
+            profile,
+            &serde_json::json!({
+                "type":"rate_limit_event",
+                "rate_limit_info":{
+                    "status":status,"resetsAt":now.wall + 7200,
+                    "unifiedWindows":{
+                        "five_hour":{"utilization":five,"resetsAt":now.wall + 7200},
+                        "seven_day":{"utilization":week,"resetsAt":now.wall + 86400}
+                    }
+                }
+            }),
+            now,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_burn_deck_renders_known_unknown_and_latched_usage() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("token-burn-deck", ORCHESTRATOR_PROVIDER);
+        let known = fixture.profile(Provider::Claude, "known");
+        let fresh = fixture.profile(Provider::Claude, "fresh");
+        let held = fixture.profile(Provider::Claude, "held");
+        observe(&known, "allowed", 0.36, 0.88);
+        observe(&held, "rejected", 1.0, 0.5);
+        let mut app = App::from_live(test_live(
+            fixture.root.clone(),
+            vec![known, fresh, held],
+            None,
+        ));
+        let palette = app.deck_palette;
+
+        let compact = screen(&mut app, 80, 24);
+        let [known_row, fresh_row, held_row] = [1, 2, 3].map(|y| row(&compact, y));
+        assert!(known_row.contains("claude · known"), "{known_row}");
+        assert!(
+            known_row.contains("64%") && known_row.contains("12%"),
+            "{known_row}"
+        );
+        assert!(known_row.contains("↻ 2h") || known_row.contains("↻ 1h 59m"));
+        assert!(fresh_row.contains("claude · fresh") && fresh_row.contains("--"));
+        assert!(fresh_row.contains("↻ -"), "{fresh_row}");
+        assert!(held_row.contains("claude · held") && held_row.contains("0%"));
+        let (x, y) = cell_at(&compact, "--").unwrap();
+        assert_eq!((y, compact[(x, y)].fg), (2, palette.unknown));
+        let (x, y) = cell_at(&compact, " - ").unwrap();
+        assert_eq!(compact[(x, y)].bg, palette.unknown);
+        let (x, y) = cell_at(&compact, "↻ -").unwrap();
+        assert_eq!(compact[(x, y)].fg, palette.muted);
+        assert!(app.crew_area.y > 3 && app.input_area.bottom() <= 24);
+
+        let full = screen(&mut app, 120, 40);
+        let deck = region(&full, Rect::new(0, 2, 120, token_burn::FULL_CARD_HEIGHT));
+        for expected in [
+            "claude · known",
+            "claude · fresh",
+            "claude · held",
+            "64%",
+            "12%",
+            "▸ provider default · unscored",
+            "▸ latched",
+        ] {
+            assert!(deck.contains(expected), "{expected}\n{deck}");
+        }
+        assert_eq!(full[(3, 2)].symbol(), "╭");
+        let (x, y) = cell_at(&full, "--").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.unknown);
+        let (x, y) = cell_at(&full, "▸ latched").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.muted);
+        assert!(app.input_area.bottom() <= 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commander_specialist_and_deck_are_visible_together() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("deck-crew", ORCHESTRATOR_PROVIDER);
+        let repository = fixture.root.join("work");
+        specialists::tests::git_repository(&repository);
+        let profile = fixture.profile(Provider::Claude, "alpha");
+        observe(&profile, "allowed", 0.5, 0.25);
+        let mut app = App::from_live(test_live(repository, vec![profile], None));
+        send(&mut app, "/spawn atlas builder");
+        assert_eq!(app.crew.len(), 2, "{}", app.notice);
+        send(&mut app, "/roster");
+        app.selected = 1;
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            assert!(
+                crew.contains("Commander") && crew.contains("atlas"),
+                "{crew}"
+            );
+            let whole = region(&buffer, buffer.area);
+            assert!(whole.contains("claude · alpha") && whole.contains("50%"));
+            assert!(region(&buffer, app.input_area).contains("Give atlas a task"));
+            app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            let buffer = screen(&mut app, width, height);
+            let whole = region(&buffer, buffer.area);
+            assert!(whole.contains("Roster:"), "{width}x{height}\n{whole}");
+            assert!(whole.contains("claude · alpha"));
+            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.editing = true;
+            app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert_eq!(app.input, "x");
+            app.input.clear();
+        }
     }
 }

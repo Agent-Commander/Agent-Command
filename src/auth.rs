@@ -8,7 +8,7 @@ mod privacy;
 use std::{
     env, fmt, fs, io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +169,32 @@ fn inherited_provider_variable(key: &str) -> bool {
 }
 
 impl Profile {
+    pub(crate) fn new(root: PathBuf, provider: Provider, name: &str) -> Result<Self, &'static str> {
+        validate_name(name)?;
+        Ok(Self {
+            provider,
+            name: name.into(),
+            root,
+            #[cfg(test)]
+            executable: None,
+        })
+    }
+
+    pub(crate) fn signed_in(&self) -> bool {
+        self.authenticated_command().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare(&self) -> io::Result<()> {
+        self.directory(true).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_provider(mut self) -> Self {
+        self.executable = Some(PathBuf::from("agent-command-test-absent-provider"));
+        self
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn fixture(root: &Path, provider: Provider, executable: PathBuf) -> Self {
         Self::named_fixture(root, provider, "fixture", executable)
@@ -336,6 +362,75 @@ pub(crate) fn profiles(root: &Path) -> io::Result<Vec<Profile>> {
     Ok(profiles)
 }
 
+pub(crate) const NAME_RULE: &str = "Use a profile name of 1–64 lowercase letters, digits, _ or -, starting with a letter or digit. Windows device names are reserved.";
+
+pub(crate) fn validate_name(name: &str) -> Result<(), &'static str> {
+    if valid_name(name) {
+        Ok(())
+    } else {
+        Err(NAME_RULE)
+    }
+}
+
+pub(crate) fn installed(provider: Provider) -> bool {
+    env::var_os("PATH").is_some_and(|path| on_path(provider.binary(), &path))
+}
+
+fn on_path(binary: &str, path: &std::ffi::OsStr) -> bool {
+    let extensions = executable_extensions();
+    env::split_paths(path).any(|directory| {
+        extensions
+            .iter()
+            .any(|extension| directory.join(format!("{binary}{extension}")).is_file())
+    })
+}
+
+fn executable_extensions() -> Vec<String> {
+    if cfg!(windows) {
+        let listed = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new())
+            .chain(listed.split(';').map(str::to_owned))
+            .collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+fn session(profile: &Profile, action: &str, stdio: fn() -> Stdio) -> io::Result<ExitStatus> {
+    let directory = profile.directory(action == "login")?;
+    profile
+        .command(&directory)
+        .current_dir(&directory)
+        .args(profile.provider.action(action))
+        .stdin(stdio())
+        .stdout(stdio())
+        .stderr(stdio())
+        .status()
+}
+
+pub(crate) fn sign_in(profile: &Profile) -> io::Result<ExitStatus> {
+    session(profile, "login", Stdio::inherit)
+}
+
+pub(crate) fn sign_out(profile: &Profile) -> io::Result<ExitStatus> {
+    session(profile, "logout", Stdio::inherit)
+}
+
+pub(crate) fn sign_out_quietly(profile: &Profile) -> io::Result<ExitStatus> {
+    session(profile, "logout", Stdio::null)
+}
+
+pub(crate) fn succeeded(profile: &Profile, status: ExitStatus) -> io::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} exited with {status}",
+            profile.provider.binary()
+        )))
+    }
+}
+
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     if matches!(args, [] | [_])
         && args
@@ -357,30 +452,15 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     };
     let provider =
         Provider::named(provider).ok_or_else(|| invalid("Provider must be claude or codex"))?;
-    if !valid_name(name) {
-        return Err(invalid("Use a profile name of 1–64 lowercase letters, digits, _ or -, starting with a letter or digit. Windows device names are reserved."));
-    }
-    let profile = Profile {
-        provider,
-        name: name.clone(),
-        root,
-        #[cfg(test)]
-        executable: None,
-    };
+    let profile = Profile::new(root, provider, name).map_err(invalid)?;
     let status = match (action.as_str(), rest) {
         ("status", []) => {
             profile.authenticated_command()?;
             println!("{profile} is signed in");
             return Ok(());
         }
-        ("login" | "logout", []) => {
-            let directory = profile.directory(action == "login")?;
-            profile
-                .command(&directory)
-                .current_dir(&directory)
-                .args(provider.action(action))
-                .status()?
-        }
+        ("login", []) => sign_in(&profile)?,
+        ("logout", []) => sign_out(&profile)?,
         ("run", arguments) => profile
             .authenticated_command()?
             .args(
@@ -395,4 +475,33 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_lookup_finds_only_present_executables() {
+        let directory = env::temp_dir().join(format!("ac-path-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let binary = if cfg!(windows) {
+            "fake-cli.exe"
+        } else {
+            "fake-cli"
+        };
+        fs::write(directory.join(binary), "").unwrap();
+        let path = env::join_paths([directory.clone()]).unwrap();
+        assert!(on_path("fake-cli", &path));
+        assert!(!on_path("absent-cli", &path));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn profile_names_follow_the_existing_rule() {
+        assert!(validate_name("main").is_ok());
+        for refused in ["", "Main", "-main", "con", "has space"] {
+            assert_eq!(validate_name(refused), Err(NAME_RULE), "{refused:?}");
+        }
+    }
 }
