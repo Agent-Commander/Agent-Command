@@ -155,22 +155,69 @@ it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 /spawn NAME ROLE [TASK]   create a specialist, optionally delegating TASK
 /ask NAME TASK            delegate TASK to a specialist
 /roster                   list the crew in Commander's feed
+/diff [NAME]              show the branch diff (+added −removed per file)
+/pr [NAME] [--commit]     push the branch and open a pull request
+/settle NAME              move finished work to the Settled drawer
+/unsettle NAME            bring a settled specialist back to the queue
+/settled                  show or hide the Settled drawer (also F7)
 /remove NAME              remove a specialist and its workspace
 /settings                 open Settings (also F3 or the top-bar item)
 /connect                  connect a provider profile
 ```
 
 Commander can also reply with `SPAWN_SPECIALIST: NAME | ROLE | TASK` or
-`DELEGATE: NAME | TASK` lines. Each specialist runs in its own `git worktree`
-(or an isolated directory outside Git repositories) with its own history.
-Delegations run one at a time; the roster shows IDLE, RUNNING, DONE or ERROR,
-and each result is posted back to Commander's feed. Select a specialist with
-↑ ↓ or a click to inspect its history; Home or the Commander row returns.
+`DELEGATE: NAME | TASK` lines. `/diff` and `/pr` use the selected specialist
+when NAME is left out.
+
+### Parallel specialists
+
+Specialists run in parallel, up to four at once, each in its own isolated
+workspace. Each one streams its own status and history; Commander stays
+available while they work, and each result is posted to Commander's feed as
+it finishes. A specialist runs one task at a time: a task sent to a busy
+specialist is queued for its workspace and starts when the current one ends.
+Quitting waits for running work; closing the app stops every running
+specialist.
+
+A specialist that ends its reply with `NEEDS_APPROVAL: QUESTION` is marked
+NEEDS_APPROVAL. Answer it with `/ask NAME ...`.
+
+### Named branches, diffs and pull requests
+
+Inside a Git repository each specialist gets a `git worktree` on its own named
+branch, `ac/<name>-<topic>`, where the topic comes from the first task (or the
+role). A taken name gets a numeric suffix (`-2`, `-3`, ...). Outside Git a
+specialist gets a plain isolated directory, and diff and PR report that they
+need a Git branch.
+
+The chart room shows the selected specialist's branch, its base, and
+`+added −removed` against the base commit, including uncommitted and new
+files. `/pr` commits uncommitted changes only when you confirm with
+`--commit`, pushes the branch with `git push -u` (never forced), and opens the
+pull request with the GitHub CLI `gh` when it is installed. Without a remote
+or `gh` it says exactly what is missing; the push still happens when only `gh`
+is missing. Removing a specialist deletes its branch only when the branch is
+merged or pushed; otherwise the branch is kept and named in the feed.
+
+### Inbox roster
+
+The crew roster is sorted by what needs you: NEEDS_APPROVAL and ERROR first,
+then RUNNING, then DONE, then IDLE; within a group the most recently active
+come first. Commander always stays on top. `/settle NAME` moves finished work
+into a collapsed `SETTLED` drawer at the bottom of the roster without deleting
+its history or branch. Press F7, click the drawer row or run `/settled` to show
+or hide it. Sending a settled specialist a new task brings it back to the
+queue. Select a specialist with ↑ ↓ or a click to inspect its history; Home or
+the Commander row returns.
 
 ```sh
 agent-command specialist spawn nova reviewer Review the patch
 agent-command specialist list
 agent-command specialist status nova
+agent-command specialist diff nova
+agent-command specialist pr nova --commit
+agent-command specialist settle nova
+agent-command specialist unsettle nova
 agent-command specialist remove nova
 ```
 
@@ -199,7 +246,8 @@ Open `agent-command` from the workspace where the mission should run. By
 default, missions use the highest-ranked eligible profile (Auto). Press F2 or
 click the profile row to cycle Auto and a saved override for each profile.
 Enter a mission and press Enter or click Send. The status and assistant output appear
-in the mission panel and ship's log. One mission runs at a time. Add, reconnect
+in the mission panel and ship's log. Commander runs one mission at a time;
+specialists run alongside it. Add, reconnect
 or sign out profiles from Settings (F3) or `/connect` without restarting; the
 CLI `auth login` and `auth logout` run the same sign-in and sign-out code.
 
