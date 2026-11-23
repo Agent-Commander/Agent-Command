@@ -64,16 +64,6 @@ impl Endpoint {
         }
     }
 
-    fn refresh_gate(self) -> Result<(), String> {
-        match self {
-            Self::ModelsFree => Ok(()),
-            Self::AgentsCoding => Err(format!(
-                "{} response fields are not verified against the published reference; previous data kept",
-                self.scope()
-            )),
-        }
-    }
-
     fn bundled(self) -> &'static str {
         match self {
             Self::ModelsFree => include_str!("catalog/bundled-models-free.json"),
@@ -507,13 +497,176 @@ fn page_url(endpoint: Endpoint, page: u64) -> String {
     }
 }
 
+struct MeasuredModel {
+    creator: &'static str,
+    slug: &'static str,
+    model: &'static str,
+    effort: &'static str,
+}
+
+const MEASURED_MODELS: [MeasuredModel; 3] = [
+    MeasuredModel {
+        creator: "OpenAI",
+        slug: "gpt-5-codex-low",
+        model: "gpt-5-codex",
+        effort: "low",
+    },
+    MeasuredModel {
+        creator: "OpenAI",
+        slug: "gpt-5-codex-medium",
+        model: "gpt-5-codex",
+        effort: "medium",
+    },
+    MeasuredModel {
+        creator: "OpenAI",
+        slug: "gpt-5-codex-high",
+        model: "gpt-5-codex",
+        effort: "high",
+    },
+];
+
+struct MeasuredAgent {
+    agent: &'static str,
+    creator: &'static str,
+    provider: &'static str,
+    model: &'static str,
+    effort: &'static str,
+}
+
+const MEASURED_AGENTS: [MeasuredAgent; 3] = [
+    MeasuredAgent {
+        agent: "Codex",
+        creator: "OpenAI",
+        provider: "OpenAI",
+        model: "gpt-5-codex",
+        effort: "low",
+    },
+    MeasuredAgent {
+        agent: "Codex",
+        creator: "OpenAI",
+        provider: "OpenAI",
+        model: "gpt-5-codex",
+        effort: "medium",
+    },
+    MeasuredAgent {
+        agent: "Codex",
+        creator: "OpenAI",
+        provider: "OpenAI",
+        model: "gpt-5-codex",
+        effort: "high",
+    },
+];
+
+fn dispatchable(model: &str, effort: &str) -> Option<&'static routing::Configuration> {
+    routing::supported(Provider::Codex, model, effort)
+}
+
+fn identify_model(raw: &Value) -> Option<&'static routing::Configuration> {
+    let slug = raw["slug"].as_str()?;
+    let creator = raw["model_creator"]["name"].as_str()?;
+    MEASURED_MODELS
+        .iter()
+        .find(|measured| measured.slug == slug && measured.creator == creator)
+        .and_then(|measured| dispatchable(measured.model, measured.effort))
+}
+
+fn agent_creator_matches(raw: &Value, expected: &str) -> bool {
+    match &raw["agent_creator"]["name"] {
+        Value::Null => true,
+        Value::String(name) => name == expected,
+        _ => false,
+    }
+}
+
+fn pinned_model_slug(model: &Value) -> Option<&str> {
+    let slug = model["slug"].as_str()?;
+    match &model["release_slug"] {
+        Value::Null => Some(slug),
+        Value::String(release) if release == slug => Some(slug),
+        _ => None,
+    }
+}
+
+fn identify_agent(raw: &Value) -> Option<&'static routing::Configuration> {
+    if raw["is_router"] != Value::Bool(false) {
+        return None;
+    }
+    let agent = raw["agent"]["name"].as_str()?;
+    let provider = raw["provider"].as_str()?;
+    let model = pinned_model_slug(&raw["model"])?;
+    let effort = raw["model"]["effort"].as_str()?;
+    MEASURED_AGENTS
+        .iter()
+        .find(|measured| {
+            measured.agent == agent
+                && measured.provider == provider
+                && measured.model == model
+                && measured.effort == effort
+                && agent_creator_matches(raw, measured.creator)
+        })
+        .and_then(|measured| dispatchable(measured.model, measured.effort))
+}
+
 struct Page {
     data: Vec<Value>,
     total_pages: u64,
-    version: Option<String>,
+    tier: String,
+    version: String,
 }
 
-fn parse_page(bytes: &[u8], requested: u64) -> Result<Page, String> {
+fn version_field(endpoint: Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::ModelsFree => "intelligence_index_version",
+        Endpoint::AgentsCoding => "coding_agent_index_version",
+    }
+}
+
+fn parse_version(endpoint: Endpoint, value: &Value) -> Result<String, String> {
+    let field = version_field(endpoint);
+    let version = match (endpoint, &value[field]) {
+        (Endpoint::ModelsFree, Value::Number(number)) => number.to_string(),
+        (Endpoint::AgentsCoding, Value::String(text)) => text.clone(),
+        _ => return Err(format!("{field} is missing or has the wrong type")),
+    };
+    if !valid_version(&version) {
+        return Err(format!("{field} is malformed"));
+    }
+    Ok(version)
+}
+
+fn parse_pagination(value: &Value, requested: u64, rows: usize) -> Result<u64, String> {
+    let pagination = value["pagination"]
+        .as_object()
+        .ok_or("response has no pagination object")?;
+    if pagination.get("page").and_then(Value::as_u64) != Some(requested) {
+        return Err(format!("expected page {requested}"));
+    }
+    if !pagination
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .is_some_and(|size| size >= 1 && rows as u64 <= size)
+    {
+        return Err("pagination page_size is missing or smaller than the page".into());
+    }
+    let total = pagination
+        .get("total_pages")
+        .and_then(Value::as_u64)
+        .filter(|total| *total <= MAX_PAGES)
+        .ok_or("pagination total is out of bounds")?;
+    let has_more = pagination
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or("pagination has_more is missing")?;
+    if total == 0 && (requested != 1 || rows != 0) {
+        return Err("pagination total is out of bounds".into());
+    }
+    if has_more != (requested < total) {
+        return Err("pagination has_more contradicts total_pages".into());
+    }
+    Ok(total.max(1))
+}
+
+fn parse_page(endpoint: Endpoint, bytes: &[u8], requested: u64) -> Result<Page, String> {
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("response exceeds the size bound".into());
     }
@@ -522,39 +675,30 @@ fn parse_page(bytes: &[u8], requested: u64) -> Result<Page, String> {
         .as_array()
         .ok_or("response has no data array")?
         .clone();
-    let version = match &value["version"] {
-        Value::Null => None,
-        Value::String(version) if valid_version(version) => Some(version.clone()),
-        _ => return Err("response version is malformed".into()),
-    };
-    let total_pages = match &value["pagination"] {
-        Value::Null if requested == 1 => 1,
-        Value::Null => return Err("pagination disappeared".into()),
-        pagination => {
-            if pagination["page"].as_u64() != Some(requested) {
-                return Err(format!("expected page {requested}"));
-            }
-            pagination["total_pages"]
-                .as_u64()
-                .filter(|total| (1..=MAX_PAGES).contains(total))
-                .ok_or("pagination total is out of bounds")?
-        }
-    };
+    if !data.iter().all(Value::is_object) {
+        return Err("response data holds a non-object row".into());
+    }
+    let tier = value["tier"]
+        .as_str()
+        .filter(|tier| valid_version(tier))
+        .ok_or("response tier is missing or malformed")?
+        .to_owned();
     Ok(Page {
+        total_pages: parse_pagination(&value, requested, data.len())?,
+        version: parse_version(endpoint, &value)?,
+        tier,
         data,
-        total_pages,
-        version,
     })
 }
 
-fn fetch_all(
-    endpoint: Endpoint,
-    key: &ApiKey,
-    fetcher: &dyn Fetcher,
-) -> Result<(Vec<Value>, Option<String>), String> {
+struct Fetched {
+    rows: Vec<Value>,
+    version: String,
+}
+
+fn fetch_all(endpoint: Endpoint, key: &ApiKey, fetcher: &dyn Fetcher) -> Result<Fetched, String> {
     let mut rows = Vec::new();
-    let mut expected_total = None;
-    let mut expected_version = None;
+    let mut first: Option<Page> = None;
     let mut page = 1;
     loop {
         let url = page_url(endpoint, page);
@@ -563,83 +707,120 @@ fn fetch_all(
             .fetch(&url, key)
             .map_err(|error| error.to_string())?;
         check_status(response.status)?;
-        let parsed = parse_page(&response.body, page)?;
-        if *expected_total.get_or_insert(parsed.total_pages) != parsed.total_pages {
-            return Err("pagination total changed between pages".into());
+        let mut parsed = parse_page(endpoint, &response.body, page)?;
+        if let Some(first) = &first {
+            if parsed.total_pages != first.total_pages {
+                return Err("pagination total changed between pages".into());
+            }
+            if parsed.version != first.version {
+                return Err(format!("{} changed between pages", version_field(endpoint)));
+            }
+            if parsed.tier != first.tier {
+                return Err("tier changed between pages".into());
+            }
         }
-        if page == 1 {
-            expected_version = parsed.version.clone();
-        } else if parsed.version != expected_version {
-            return Err("version changed between pages".into());
-        }
-        rows.extend(parsed.data);
+        rows.append(&mut parsed.data);
         if rows.len() > MAX_ROWS {
             return Err(format!("more than {MAX_ROWS} rows"));
         }
-        if page == parsed.total_pages {
-            return Ok((rows, expected_version));
+        let first = first.get_or_insert(parsed);
+        if page == first.total_pages {
+            return Ok(Fetched {
+                rows,
+                version: first.version.clone(),
+            });
         }
         page += 1;
     }
 }
 
-fn number(value: &Value) -> Result<Option<f64>, String> {
+fn number(value: &Value, field: &str) -> Result<Option<f64>, String> {
     match value {
         Value::Null => Ok(None),
         Value::Number(number) => Ok(number.as_f64()),
-        _ => Err("metric is not numeric".into()),
+        _ => Err(format!("{field} is not numeric")),
+    }
+}
+
+fn model_speed(raw: &Value) -> Result<Option<f64>, String> {
+    match &raw["performance_v3"] {
+        Value::Null => Ok(None),
+        Value::Object(performance) => number(
+            performance
+                .get("mean_output_tokens_per_second")
+                .unwrap_or(&Value::Null),
+            "performance_v3.mean_output_tokens_per_second",
+        ),
+        _ => Err("performance_v3 is not an object".into()),
+    }
+}
+
+fn measured_metrics(endpoint: Endpoint, raw: &Value) -> Result<(Option<f64>, Option<f64>), String> {
+    match endpoint {
+        Endpoint::ModelsFree => Ok((
+            number(
+                &raw["evaluations"]["artificial_analysis_coding_index"],
+                "evaluations.artificial_analysis_coding_index",
+            )?,
+            model_speed(raw)?,
+        )),
+        Endpoint::AgentsCoding => Ok((
+            number(&raw["coding_agent_index"], "coding_agent_index")?,
+            number(&raw["time_per_task_seconds"], "time_per_task_seconds")?,
+        )),
+    }
+}
+
+fn identify(endpoint: Endpoint, raw: &Value) -> Option<&'static routing::Configuration> {
+    match endpoint {
+        Endpoint::ModelsFree => identify_model(raw),
+        Endpoint::AgentsCoding => identify_agent(raw),
     }
 }
 
 fn normalize(endpoint: Endpoint, raw: &Value) -> Result<Option<Row>, String> {
-    let (owner, slug, index, speed) = match endpoint {
-        Endpoint::ModelsFree => (
-            &raw["model_creator"]["slug"],
-            &raw["slug"],
-            &raw["evaluations"]["artificial_analysis_coding_index"],
-            &raw["median_output_tokens_per_second"],
-        ),
-        Endpoint::AgentsCoding => (
-            &raw["agent"]["slug"],
-            &raw["model"]["slug"],
-            &raw["coding_index"],
-            &raw["median_seconds_per_task"],
-        ),
-    };
-    let (Some(owner), Some(slug)) = (owner.as_str(), slug.as_str()) else {
-        return Err("row identity is missing".into());
-    };
-    let Some(configuration) = routing::by_index_slug(endpoint, owner, slug) else {
+    let Some(configuration) = identify(endpoint, raw) else {
         return Ok(None);
     };
+    let (coding_index, speed) = measured_metrics(endpoint, raw)?;
     Ok(Some(Row {
         provider: configuration.provider.binary().into(),
         model: configuration.model.into(),
         effort: configuration.effort.into(),
-        coding_index: number(index)?,
-        speed: number(speed)?.map(|value| Speed {
+        coding_index,
+        speed: speed.map(|value| Speed {
             unit: endpoint.speed_unit(),
             value,
         }),
     }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Refreshed {
+    pub(crate) published: usize,
+    pub(crate) skipped: usize,
+}
+
 fn build_snapshot(
     endpoint: Endpoint,
-    raw: &[Value],
-    version: Option<String>,
+    fetched: Fetched,
     retrieved: &str,
 ) -> Result<Snapshot, String> {
     let mut rows = Vec::new();
-    for row in raw {
-        if let Some(row) = normalize(endpoint, row)? {
+    for raw in &fetched.rows {
+        if let Some(row) = normalize(endpoint, raw)? {
             rows.push(row);
         }
     }
-    let version = version.unwrap_or_else(|| retrieved.to_owned());
+    if rows.is_empty() {
+        return Err(format!(
+            "no supported rows among {} published rows; previous data kept",
+            fetched.rows.len()
+        ));
+    }
     let snapshot = Snapshot::sealed(
         endpoint,
-        version,
+        fetched.version,
         format!(
             "Artificial Analysis {} retrieved {retrieved}",
             endpoint.scope()
@@ -648,6 +829,23 @@ fn build_snapshot(
     );
     snapshot.validate(endpoint)?;
     Ok(snapshot)
+}
+
+fn refresh_endpoint(
+    state: &Path,
+    endpoint: Endpoint,
+    key: &ApiKey,
+    fetcher: &dyn Fetcher,
+    retrieved: &str,
+) -> Result<Refreshed, String> {
+    let fetched = fetch_all(endpoint, key, fetcher)?;
+    let total = fetched.rows.len();
+    let snapshot = build_snapshot(endpoint, fetched, retrieved)?;
+    publish(state, &snapshot).map_err(|error| error.to_string())?;
+    Ok(Refreshed {
+        published: snapshot.rows.len(),
+        skipped: total - snapshot.rows.len(),
+    })
 }
 
 fn publish(state: &Path, snapshot: &Snapshot) -> io::Result<()> {
@@ -670,19 +868,11 @@ pub(crate) fn refresh(
     key: &ApiKey,
     fetcher: &dyn Fetcher,
     retrieved: &str,
-) -> Vec<(Endpoint, Result<usize, String>)> {
+) -> Vec<(Endpoint, Result<Refreshed, String>)> {
     Endpoint::ALL
         .into_iter()
         .map(|endpoint| {
-            let outcome = endpoint
-                .refresh_gate()
-                .and_then(|()| fetch_all(endpoint, key, fetcher))
-                .and_then(|(raw, version)| build_snapshot(endpoint, &raw, version, retrieved))
-                .and_then(|snapshot| {
-                    publish(state, &snapshot)
-                        .map(|()| snapshot.rows.len())
-                        .map_err(|error| error.to_string())
-                })
+            let outcome = refresh_endpoint(state, endpoint, key, fetcher, retrieved)
                 .map_err(|error| key.redact(&error));
             (endpoint, outcome)
         })
@@ -711,7 +901,12 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
             let mut failed = false;
             for (endpoint, outcome) in refresh(&state, &key, &CurlFetcher, &retrieved) {
                 match outcome {
-                    Ok(rows) => println!("{} refreshed · {rows} rows", endpoint.scope()),
+                    Ok(refreshed) => println!(
+                        "{} refreshed · {} rows · {} unsupported rows skipped",
+                        endpoint.scope(),
+                        refreshed.published,
+                        refreshed.skipped
+                    ),
                     Err(error) => {
                         failed = true;
                         println!("{} kept previous data · {error}", endpoint.scope());
@@ -898,6 +1093,7 @@ mod tests {
         requested: RefCell<Vec<String>>,
         failure: Option<String>,
         status: u16,
+        refused: Option<(Endpoint, u16)>,
     }
 
     impl Fetcher for FixtureFetcher {
@@ -906,33 +1102,42 @@ mod tests {
             if let Some(failure) = &self.failure {
                 return Err(io::Error::other(failure.clone()));
             }
+            let status = match self.refused {
+                Some((endpoint, status)) if url.starts_with(&endpoint.source()) => status,
+                _ => self.status,
+            };
             Ok(Response {
-                status: self.status,
+                status,
                 body: serde_json::to_vec(&self.pages[url]).unwrap(),
             })
         }
     }
 
-    fn sanitized_model(slug: &str, creator: &str, index: Value, speed: Value) -> Value {
-        json!({"id": format!("fixture-{slug}"), "name": format!("Fixture {slug}"), "slug": slug,
-               "model_creator": {"id": format!("fixture-{creator}"), "name": creator, "slug": creator},
-               "evaluations": {"artificial_analysis_coding_index": index},
-               "median_output_tokens_per_second": speed})
+    fn fixture(text: &str) -> Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn second_page(endpoint: Endpoint) -> String {
+        page_url(endpoint, 2)
     }
 
     fn pages() -> HashMap<String, Value> {
-        let models = Endpoint::ModelsFree.source();
         HashMap::from([
             (
-                models.clone(),
-                json!({"version": "fixture-v2", "pagination": {"page": 1, "total_pages": 2},
-                       "data": [sanitized_model("claude-sonnet", "anthropic", json!(49.0), json!(75.0))]}),
+                Endpoint::ModelsFree.source(),
+                fixture(include_str!("catalog/fixtures/models-free-page-1.json")),
             ),
             (
-                format!("{models}?page=2"),
-                json!({"version": "fixture-v2", "pagination": {"page": 2, "total_pages": 2},
-                       "data": [sanitized_model("gpt-5-codex", "openai", json!(52.5), json!(null)),
-                                sanitized_model("unlisted-model", "unlisted", json!(10.0), json!(1.0))]}),
+                second_page(Endpoint::ModelsFree),
+                fixture(include_str!("catalog/fixtures/models-free-page-2.json")),
+            ),
+            (
+                Endpoint::AgentsCoding.source(),
+                fixture(include_str!("catalog/fixtures/agents-coding-page-1.json")),
+            ),
+            (
+                second_page(Endpoint::AgentsCoding),
+                fixture(include_str!("catalog/fixtures/agents-coding-page-2.json")),
             ),
         ])
     }
@@ -943,13 +1148,14 @@ mod tests {
             requested: RefCell::default(),
             failure: None,
             status: 200,
+            refused: None,
         }
     }
 
     fn outcome_for(
-        outcomes: &[(Endpoint, Result<usize, String>)],
+        outcomes: &[(Endpoint, Result<Refreshed, String>)],
         endpoint: Endpoint,
-    ) -> Result<usize, String> {
+    ) -> Result<Refreshed, String> {
         outcomes
             .iter()
             .find(|(candidate, _)| *candidate == endpoint)
@@ -958,16 +1164,28 @@ mod tests {
             .clone()
     }
 
-    fn models_source(state: &Path) -> Source {
+    fn source_for(state: &Path, endpoint: Endpoint) -> Source {
         Catalog::load(Some(state))
             .sources
             .into_iter()
-            .find(|source| source.endpoint == Endpoint::ModelsFree)
+            .find(|source| source.endpoint == endpoint)
             .unwrap()
     }
 
+    fn key() -> ApiKey {
+        ApiKey::new(SYNTHETIC_KEY.into()).unwrap()
+    }
+
+    fn published(published: usize, skipped: usize) -> Result<Refreshed, String> {
+        Ok(Refreshed { published, skipped })
+    }
+
+    fn codex(catalog: &Catalog, effort: &str) -> Metrics {
+        catalog.metrics(Provider::Codex, "gpt-5-codex", effort)
+    }
+
     #[test]
-    fn refresh_uses_published_language_paths_without_requiring_a_body_status() {
+    fn documented_shape_pages_publish_both_endpoints() {
         assert_eq!(
             Endpoint::ModelsFree.source(),
             "https://artificialanalysis.ai/api/v2/language/models/free"
@@ -976,74 +1194,220 @@ mod tests {
             Endpoint::AgentsCoding.source(),
             "https://artificialanalysis.ai/api/v2/language/agents/coding"
         );
-        let state = state("paths");
-        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
+        let state = state("documented");
         let fixture = fetcher(pages());
-        let outcomes = refresh(&state, &key, &fixture, "2026-11-23T00:00:00Z");
-        assert_eq!(outcome_for(&outcomes, Endpoint::ModelsFree), Ok(2));
+        let outcomes = refresh(&state, &key(), &fixture, "2026-11-23T00:00:00Z");
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::AgentsCoding),
+            published(2, 6)
+        );
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::ModelsFree),
+            published(2, 4)
+        );
         assert_eq!(
             fixture.requested.borrow().as_slice(),
             [
+                "https://artificialanalysis.ai/api/v2/language/agents/coding",
+                "https://artificialanalysis.ai/api/v2/language/agents/coding?page=2",
                 "https://artificialanalysis.ai/api/v2/language/models/free",
-                "https://artificialanalysis.ai/api/v2/language/models/free?page=2"
+                "https://artificialanalysis.ai/api/v2/language/models/free?page=2",
             ]
         );
+        assert_eq!(
+            source_for(&state, Endpoint::AgentsCoding).snapshot.version,
+            "fixture-2"
+        );
+        assert_eq!(
+            source_for(&state, Endpoint::ModelsFree).snapshot.version,
+            "4"
+        );
         let catalog = Catalog::load(Some(&state));
-        let sonnet = catalog.metrics(Provider::Claude, "sonnet", DEFAULT_EFFORT);
         assert_eq!(
-            sonnet.index,
-            Some(Score {
-                endpoint: Endpoint::ModelsFree,
-                value: 49.0
-            })
+            codex(&catalog, "high"),
+            Metrics {
+                index: Some(Score {
+                    endpoint: Endpoint::AgentsCoding,
+                    value: 47.0
+                }),
+                speed: Some(Speed {
+                    unit: SpeedUnit::SecondsPerTask,
+                    value: 310.0
+                }),
+            }
         );
         assert_eq!(
-            sonnet.speed,
-            Some(Speed {
-                unit: SpeedUnit::TokensPerSecond,
-                value: 75.0
-            })
+            codex(&catalog, "medium"),
+            Metrics {
+                index: Some(Score {
+                    endpoint: Endpoint::AgentsCoding,
+                    value: 39.0
+                }),
+                speed: None,
+            }
         );
-        let codex = catalog.metrics(Provider::Codex, "gpt-5-codex", DEFAULT_EFFORT);
-        assert_eq!(codex.index.unwrap().value, 52.5);
-        assert_eq!(codex.speed, None);
-        assert_eq!(models_source(&state).snapshot.version, "fixture-v2");
+        assert_eq!(codex(&catalog, "low"), Metrics::default());
+        assert_eq!(codex(&catalog, DEFAULT_EFFORT), Metrics::default());
+        let models = &source_for(&state, Endpoint::ModelsFree).snapshot.rows;
+        assert_eq!(
+            models[0],
+            synthetic_row(
+                "gpt-5-codex",
+                "high",
+                41.5,
+                Speed {
+                    unit: SpeedUnit::TokensPerSecond,
+                    value: 88.0
+                }
+            )
+        );
+        assert_eq!(
+            (
+                models[1].effort.as_str(),
+                models[1].coding_index,
+                models[1].speed
+            ),
+            ("low", None, None)
+        );
+        for provider_model in ["opus", "sonnet", DEFAULT_EFFORT] {
+            assert_eq!(
+                catalog.metrics(Provider::Claude, provider_model, DEFAULT_EFFORT),
+                Metrics::default()
+            );
+        }
         fs::remove_dir_all(state).unwrap();
     }
 
+    type RowEdit = Box<dyn FnOnce(&mut Value)>;
+
+    fn agent_row(edit: impl FnOnce(&mut Value)) -> Value {
+        let mut row = pages()[&Endpoint::AgentsCoding.source()]["data"][0].clone();
+        edit(&mut row);
+        row
+    }
+
     #[test]
-    fn unverified_agent_schema_is_never_requested_or_published() {
-        let state = state("agents-gate");
-        write(&state, Endpoint::AgentsCoding, &agents_snapshot());
-        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
-        let fixture = fetcher(pages());
-        let outcomes = refresh(&state, &key, &fixture, "2026-11-23T00:00:00Z");
+    fn identity_and_effort_never_borrow_a_different_measurement() {
+        assert_eq!(
+            identify_agent(&agent_row(|_| {})),
+            routing::supported(Provider::Codex, "gpt-5-codex", "high")
+        );
+        assert!(identify_agent(&agent_row(|row| {
+            row["agent_creator"] = Value::Null;
+        }))
+        .is_some());
+        let refused: [(&str, RowEdit); 10] = [
+            ("router", Box::new(|row| row["is_router"] = json!(true))),
+            (
+                "router flag missing",
+                Box::new(|row| row["is_router"] = Value::Null),
+            ),
+            (
+                "router flag text",
+                Box::new(|row| row["is_router"] = json!("false")),
+            ),
+            (
+                "default effort",
+                Box::new(|row| row["model"]["effort"] = json!("default")),
+            ),
+            (
+                "missing effort",
+                Box::new(|row| row["model"]["effort"] = Value::Null),
+            ),
+            (
+                "other effort",
+                Box::new(|row| row["model"]["effort"] = json!("minimal")),
+            ),
+            (
+                "dated release",
+                Box::new(|row| row["model"]["release_slug"] = json!("gpt-5-codex-fixture")),
+            ),
+            (
+                "api provider",
+                Box::new(|row| row["provider"] = json!("Fixture Cloud API")),
+            ),
+            (
+                "other creator",
+                Box::new(|row| row["agent_creator"]["name"] = json!("Fixture Labs")),
+            ),
+            (
+                "other agent",
+                Box::new(|row| row["agent"]["name"] = json!("Fixture Agent")),
+            ),
+        ];
+        for (case, edit) in refused {
+            assert_eq!(identify_agent(&agent_row(edit)), None, "{case}");
+        }
+        let model =
+            |slug: &str, creator: &str| json!({"slug": slug, "model_creator": {"name": creator}});
+        assert_eq!(
+            identify_model(&model("gpt-5-codex-medium", "OpenAI")),
+            routing::supported(Provider::Codex, "gpt-5-codex", "medium")
+        );
+        for (slug, creator) in [
+            ("gpt-5-codex", "OpenAI"),
+            ("gpt-5-codex-medium", "Fixture Labs"),
+            ("claude-opus", "Anthropic"),
+            ("claude-sonnet", "Anthropic"),
+        ] {
+            assert_eq!(identify_model(&model(slug, creator)), None, "{slug}");
+        }
+        assert_eq!(
+            identify_model(
+                &json!({"slug": "gpt-5-codex-medium", "model_creator": {"slug": "openai"}})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn measured_identities_name_only_explicit_dispatchable_configurations() {
+        let dispatched: Vec<_> = MEASURED_MODELS
+            .iter()
+            .map(|measured| (measured.model, measured.effort))
+            .chain(
+                MEASURED_AGENTS
+                    .iter()
+                    .map(|measured| (measured.model, measured.effort)),
+            )
+            .collect();
+        for (model, effort) in dispatched {
+            let configuration = dispatchable(model, effort).unwrap();
+            assert_ne!(configuration.model, DEFAULT_EFFORT);
+            assert_ne!(configuration.effort, DEFAULT_EFFORT);
+        }
+    }
+
+    #[test]
+    fn each_endpoint_tier_refusal_keeps_only_its_own_cache() {
+        let state = state("tier");
+        refresh(&state, &key(), &fetcher(pages()), "2026-11-23T00:00:00Z");
+        let agents_before = source_for(&state, Endpoint::AgentsCoding).snapshot;
+        let models_before = source_for(&state, Endpoint::ModelsFree).snapshot;
+        let free_tier = FixtureFetcher {
+            refused: Some((Endpoint::AgentsCoding, 403)),
+            ..fetcher(pages())
+        };
+        let outcomes = refresh(&state, &key(), &free_tier, "2026-11-24T00:00:00Z");
         assert_eq!(
             outcome_for(&outcomes, Endpoint::AgentsCoding).unwrap_err(),
-            "agents/coding response fields are not verified against the published reference; previous data kept"
+            "access refused for this key or plan tier (HTTP 403); previous data kept"
         );
-        assert!(fixture
-            .requested
-            .borrow()
-            .iter()
-            .all(|url| !url.contains("agents")));
-        let kept = &Catalog::load(Some(&state)).sources[0];
-        assert_eq!(kept.origin, Origin::Cache);
-        assert_eq!(kept.snapshot, agents_snapshot());
-        fs::remove_dir_all(state).unwrap();
-    }
-
-    #[test]
-    fn tier_refusal_keeps_previously_valid_data() {
-        let state = state("tier");
-        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
-        refresh(&state, &key, &fetcher(pages()), "2026-11-23T00:00:00Z");
-        let before = models_source(&state).snapshot;
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::ModelsFree),
+            published(2, 4)
+        );
+        let agents = source_for(&state, Endpoint::AgentsCoding);
+        assert_eq!(
+            (agents.origin, agents.snapshot),
+            (Origin::Cache, agents_before.clone())
+        );
+        let models = source_for(&state, Endpoint::ModelsFree).snapshot;
+        assert_ne!(models.provenance, models_before.provenance);
+        assert!(models
+            .provenance
+            .ends_with("retrieved 2026-11-24T00:00:00Z"));
         for (status, expected) in [
-            (
-                403,
-                "access refused for this key or plan tier (HTTP 403); previous data kept",
-            ),
             (
                 401,
                 "access refused for this key or plan tier (HTTP 401); previous data kept",
@@ -1051,21 +1415,294 @@ mod tests {
             (429, "rate limited (HTTP 429); previous data kept"),
             (410, "unexpected HTTP 410; previous data kept"),
         ] {
+            let before = Catalog::load(Some(&state)).sources;
             let refusal = FixtureFetcher {
                 status,
                 ..fetcher(pages())
             };
-            let outcomes = refresh(&state, &key, &refusal, "2026-11-24T00:00:00Z");
-            assert_eq!(
-                outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
-                expected
-            );
-            assert_eq!(refusal.requested.borrow().len(), 1, "{status}");
-            let after = models_source(&state);
-            assert_eq!(after.origin, Origin::Cache, "{status}");
-            assert_eq!(after.snapshot, before, "{status}");
+            let outcomes = refresh(&state, &key(), &refusal, "2026-11-25T00:00:00Z");
+            for endpoint in Endpoint::ALL {
+                assert_eq!(
+                    outcome_for(&outcomes, endpoint).unwrap_err(),
+                    expected,
+                    "{status}"
+                );
+            }
+            assert_eq!(refusal.requested.borrow().len(), 2, "{status}");
+            for (after, before) in Catalog::load(Some(&state)).sources.iter().zip(&before) {
+                assert_eq!(after.origin, Origin::Cache, "{status}");
+                assert_eq!(after.snapshot, before.snapshot, "{status}");
+            }
         }
         fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn empty_supported_refresh_keeps_a_valid_cache() {
+        let state = state("empty");
+        refresh(&state, &key(), &fetcher(pages()), "2026-11-23T00:00:00Z");
+        let before = Catalog::load(Some(&state)).sources;
+        let mut unsupported = pages();
+        for endpoint in Endpoint::ALL {
+            let first = unsupported.get_mut(&endpoint.source()).unwrap();
+            first["data"].as_array_mut().unwrap().remove(0);
+        }
+        let second = unsupported
+            .get_mut(&second_page(Endpoint::AgentsCoding))
+            .unwrap();
+        second["data"].as_array_mut().unwrap().remove(1);
+        unsupported
+            .get_mut(&second_page(Endpoint::ModelsFree))
+            .unwrap()["data"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let outcomes = refresh(
+            &state,
+            &key(),
+            &fetcher(unsupported),
+            "2026-11-24T00:00:00Z",
+        );
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::AgentsCoding).unwrap_err(),
+            "no supported rows among 6 published rows; previous data kept"
+        );
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
+            "no supported rows among 4 published rows; previous data kept"
+        );
+        let mut empty = pages();
+        for endpoint in Endpoint::ALL {
+            let first = empty.get_mut(&endpoint.source()).unwrap();
+            first["data"] = json!([]);
+            first["pagination"] =
+                json!({"page": 1, "page_size": 50, "total_pages": 0, "has_more": false});
+        }
+        let fixture = fetcher(empty);
+        let outcomes = refresh(&state, &key(), &fixture, "2026-11-25T00:00:00Z");
+        for endpoint in Endpoint::ALL {
+            assert_eq!(
+                outcome_for(&outcomes, endpoint).unwrap_err(),
+                "no supported rows among 0 published rows; previous data kept"
+            );
+        }
+        assert_eq!(fixture.requested.borrow().len(), 2);
+        for (after, before) in Catalog::load(Some(&state)).sources.iter().zip(&before) {
+            assert_eq!(after.origin, Origin::Cache);
+            assert_eq!(after.snapshot, before.snapshot);
+        }
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    type PageEdit = (
+        &'static str,
+        Endpoint,
+        u64,
+        Box<dyn Fn(&mut Value)>,
+        &'static str,
+    );
+
+    fn malformed_cases() -> Vec<PageEdit> {
+        use Endpoint::{AgentsCoding as Agents, ModelsFree as Models};
+        vec![
+            (
+                "no pagination",
+                Models,
+                1,
+                Box::new(|page| page["pagination"] = Value::Null),
+                "response has no pagination object",
+            ),
+            (
+                "page",
+                Agents,
+                2,
+                Box::new(|page| page["pagination"]["page"] = json!(3)),
+                "expected page 2",
+            ),
+            (
+                "zero page",
+                Models,
+                1,
+                Box::new(|page| page["pagination"]["page"] = json!(0)),
+                "expected page 1",
+            ),
+            (
+                "has_more",
+                Agents,
+                1,
+                Box::new(|page| page["pagination"]["has_more"] = json!(false)),
+                "pagination has_more contradicts total_pages",
+            ),
+            (
+                "has_more missing",
+                Models,
+                2,
+                Box::new(|page| page["pagination"]["has_more"] = Value::Null),
+                "pagination has_more is missing",
+            ),
+            (
+                "page_size",
+                Agents,
+                1,
+                Box::new(|page| page["pagination"]["page_size"] = json!(2)),
+                "pagination page_size is missing or smaller than the page",
+            ),
+            (
+                "bound",
+                Models,
+                1,
+                Box::new(|page| page["pagination"]["total_pages"] = json!(MAX_PAGES + 1)),
+                "pagination total is out of bounds",
+            ),
+            (
+                "total",
+                Agents,
+                2,
+                Box::new(|page| {
+                    page["pagination"]["total_pages"] = json!(3);
+                    page["pagination"]["has_more"] = json!(true);
+                }),
+                "pagination total changed between pages",
+            ),
+            (
+                "model version",
+                Models,
+                2,
+                Box::new(|page| page["intelligence_index_version"] = json!(5)),
+                "intelligence_index_version changed between pages",
+            ),
+            (
+                "model version type",
+                Models,
+                1,
+                Box::new(|page| page["intelligence_index_version"] = json!("4")),
+                "intelligence_index_version is missing or has the wrong type",
+            ),
+            (
+                "agent version",
+                Agents,
+                2,
+                Box::new(|page| page["coding_agent_index_version"] = json!("fixture-3")),
+                "coding_agent_index_version changed between pages",
+            ),
+            (
+                "agent version type",
+                Agents,
+                1,
+                Box::new(|page| page["coding_agent_index_version"] = json!(2)),
+                "coding_agent_index_version is missing or has the wrong type",
+            ),
+            (
+                "tier",
+                Agents,
+                2,
+                Box::new(|page| page["tier"] = json!("commercial")),
+                "tier changed between pages",
+            ),
+            (
+                "tier missing",
+                Models,
+                1,
+                Box::new(|page| page["tier"] = Value::Null),
+                "response tier is missing or malformed",
+            ),
+            (
+                "row shape",
+                Agents,
+                1,
+                Box::new(|page| page["data"][1] = json!("row")),
+                "response data holds a non-object row",
+            ),
+            (
+                "agent metric",
+                Agents,
+                1,
+                Box::new(|page| page["data"][0]["coding_agent_index"] = json!("47")),
+                "coding_agent_index is not numeric",
+            ),
+            (
+                "agent speed",
+                Agents,
+                2,
+                Box::new(|page| page["data"][1]["time_per_task_seconds"] = json!(0)),
+                "speed out of range for gpt-5-codex",
+            ),
+            (
+                "model range",
+                Models,
+                1,
+                Box::new(|page| {
+                    page["data"][0]["evaluations"]["artificial_analysis_coding_index"] = json!(250)
+                }),
+                "coding index out of range for gpt-5-codex",
+            ),
+            (
+                "model speed",
+                Models,
+                1,
+                Box::new(|page| page["data"][0]["performance_v3"] = json!(88)),
+                "performance_v3 is not an object",
+            ),
+        ]
+    }
+
+    #[test]
+    fn malformed_pagination_or_metrics_reject_only_that_endpoint() {
+        let state = state("malformed");
+        refresh(&state, &key(), &fetcher(pages()), "2026-11-23T00:00:00Z");
+        for (case, endpoint, page, edit, expected) in malformed_cases() {
+            let before = source_for(&state, endpoint).snapshot;
+            let mut edited = pages();
+            edit(edited.get_mut(&page_url(endpoint, page)).unwrap());
+            let outcomes = refresh(&state, &key(), &fetcher(edited), "2026-11-24T00:00:00Z");
+            assert_eq!(
+                outcome_for(&outcomes, endpoint).unwrap_err(),
+                expected,
+                "{case}"
+            );
+            let other = Endpoint::ALL
+                .into_iter()
+                .find(|candidate| *candidate != endpoint)
+                .unwrap();
+            assert!(outcome_for(&outcomes, other).is_ok(), "{case}");
+            let after = source_for(&state, endpoint);
+            assert_eq!(after.origin, Origin::Cache, "{case}");
+            assert_eq!(after.snapshot, before, "{case}");
+        }
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn legacy_and_retired_fields_are_never_read_as_measurements() {
+        let mut legacy = pages()[&Endpoint::ModelsFree.source()]["data"][0].clone();
+        legacy["performance_v3"] = Value::Null;
+        legacy["performance"] = json!({"median_output_tokens_per_second": 120.0});
+        legacy["median_output_tokens_per_second"] = json!(130.0);
+        let row = normalize(Endpoint::ModelsFree, &legacy).unwrap().unwrap();
+        assert_eq!((row.coding_index, row.speed), (Some(41.5), None));
+        legacy["performance_v3"] = json!({"mean_output_tokens_per_second": null});
+        assert_eq!(
+            normalize(Endpoint::ModelsFree, &legacy)
+                .unwrap()
+                .unwrap()
+                .speed,
+            None
+        );
+        legacy["evaluations"] = Value::Null;
+        assert_eq!(
+            normalize(Endpoint::ModelsFree, &legacy)
+                .unwrap()
+                .unwrap()
+                .coding_index,
+            None
+        );
+        let mut agent = agent_row(|_| {});
+        agent["coding_index"] = json!(80.0);
+        agent["median_seconds_per_task"] = json!(1.0);
+        agent["coding_agent_index"] = Value::Null;
+        agent["time_per_task_seconds"] = Value::Null;
+        let row = normalize(Endpoint::AgentsCoding, &agent).unwrap().unwrap();
+        assert_eq!((row.coding_index, row.speed), (None, None));
     }
 
     #[test]
@@ -1088,9 +1725,8 @@ mod tests {
             .collect();
         assert!(removed.contains(&KEY_VARIABLE.to_owned()));
         assert!(removed.contains(&"CURL_HOME".to_owned()));
-        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
         assert_eq!(
-            curl_config(&Endpoint::ModelsFree.source(), &key),
+            curl_config(&Endpoint::ModelsFree.source(), &key()),
             format!(
                 "url = \"https://artificialanalysis.ai/api/v2/language/models/free\"\nheader = \"x-api-key: {SYNTHETIC_KEY}\"\n"
             )
@@ -1109,74 +1745,25 @@ mod tests {
     }
 
     #[test]
-    fn refresh_publishes_only_fully_validated_same_origin_pages() {
-        let state = state("refresh");
-        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
-        let models = Endpoint::ModelsFree.source();
-        let second = format!("{models}?page=2");
-        assert_eq!(
-            outcome_for(
-                &refresh(&state, &key, &fetcher(pages()), "2026-11-23T00:00:00Z"),
-                Endpoint::ModelsFree
-            ),
-            Ok(2)
-        );
-
-        let mut broken = pages();
-        broken.get_mut(&second).unwrap()["pagination"]["page"] = json!(3);
-        let mut changed = pages();
-        changed.get_mut(&second).unwrap()["version"] = json!("fixture-v3");
-        let mut out_of_range = pages();
-        out_of_range.get_mut(&models).unwrap()["data"][0]["evaluations"]
-            ["artificial_analysis_coding_index"] = json!(250);
-        let mut runaway = pages();
-        runaway.get_mut(&models).unwrap()["pagination"]["total_pages"] = json!(MAX_PAGES + 1);
-        let mut shifting = pages();
-        shifting.get_mut(&second).unwrap()["pagination"]["total_pages"] = json!(3);
-        let mut textual = pages();
-        textual.get_mut(&models).unwrap()["data"][0]["median_output_tokens_per_second"] =
-            json!("75");
-        for (attempt, (case, pages, expected)) in [
-            ("page", broken, "expected page 2"),
-            ("version", changed, "version changed between pages"),
-            (
-                "range",
-                out_of_range,
-                "coding index out of range for sonnet",
-            ),
-            ("bound", runaway, "pagination total is out of bounds"),
-            ("total", shifting, "pagination total changed between pages"),
-            ("numeric", textual, "metric is not numeric"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let retrieved = format!("2026-11-24T00:00:0{attempt}Z");
-            let outcomes = refresh(&state, &key, &fetcher(pages), &retrieved);
-            assert_eq!(
-                outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
-                expected,
-                "{case}"
-            );
-            let source = models_source(&state);
-            assert_eq!(source.origin, Origin::Cache, "{case}");
-            assert_eq!(source.snapshot.version, "fixture-v2", "{case}");
-        }
-
+    fn refresh_redacts_the_key_and_stays_on_the_published_origin() {
+        let state = state("redact");
         let leaking = FixtureFetcher {
             failure: Some(format!("denied for {SYNTHETIC_KEY}")),
             ..fetcher(pages())
         };
-        let outcomes = refresh(&state, &key, &leaking, "2026-11-25T00:00:00Z");
-        assert_eq!(
-            outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
-            "denied for [redacted]"
-        );
+        let outcomes = refresh(&state, &key(), &leaking, "2026-11-25T00:00:00Z");
+        for endpoint in Endpoint::ALL {
+            assert_eq!(
+                outcome_for(&outcomes, endpoint).unwrap_err(),
+                "denied for [redacted]"
+            );
+        }
+        refresh(&state, &key(), &fetcher(pages()), "2026-11-25T00:00:00Z");
         for entry in fs::read_dir(cache_directory(&state)).unwrap() {
             let text = fs::read_to_string(entry.unwrap().path()).unwrap();
             assert!(!text.contains(SYNTHETIC_KEY));
         }
-        assert_eq!(format!("{key:?}"), "ApiKey(redacted)");
+        assert_eq!(format!("{:?}", key()), "ApiKey(redacted)");
         assert!(ApiKey::new("key with\nnewline".into()).is_err());
         assert!(ApiKey::new("key\"quote".into()).is_err());
         assert!(
@@ -1190,7 +1777,7 @@ mod tests {
         assert!(
             require_same_origin("https://artificialanalysis.ai/api/v2/data/llms/models").is_err()
         );
-        assert!(require_same_origin(&page_url(Endpoint::ModelsFree, 2)).is_ok());
+        assert!(require_same_origin(&page_url(Endpoint::AgentsCoding, 2)).is_ok());
         fs::remove_dir_all(state).unwrap();
     }
 }

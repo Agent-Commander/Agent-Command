@@ -34,13 +34,15 @@ the bundled snapshot for that endpoint only. The other endpoint is unaffected.
 any fallback, the version, the row count and the provenance.
 
 **Bundled snapshot provenance.** The bundled snapshots are dated 2026-11-23
-and contain no rows. The coding-agent leaderboard
-(`https://artificialanalysis.ai/agents/coding-agents`) and the Data API
-reference could not be reached from the authoring environment. The network
-proxy refused the connection. So neither the values nor permission to
-redistribute them could be verified, and none were invented. Until a verified
-refresh, every index and speed shows as missing (`index n/a`, `speed n/a`).
-Test rows are labeled `synthetic test fixture` or use `fixture-` identifiers.
+and contain no rows. The Data API documentation asks for attribution and
+directs users to Artificial Analysis for redistribution rights. No
+redistribution permission is documented for this project, so no published
+values are bundled and none were invented. On a cold start, before a
+verified refresh, every index and speed shows as missing (`index n/a`,
+`speed n/a`), `/standard` and `/hard` start nothing, and `/any`, `/ordinary`
+and `/urgent` rank by headroom and then identity. A licensed snapshot is still
+needed for meaningful cold-start ranking. Test rows are labeled
+`synthetic test fixture` or use `fixture-` identifiers.
 
 **Refresh.** Agent Command needs no key by default and makes no network
 request unless the user runs `agent-command catalog refresh` with
@@ -51,28 +53,50 @@ to state and redacts it from errors. A refresh:
 
 - starts `curl` with `-q`, so no `.curlrc` or other implicit configuration is read;
 - removes `ARTIFICIAL_ANALYSIS_API_KEY` and `CURL_HOME` from the `curl` environment;
-- requests only the fixed HTTPS URLs and their `?page=N` forms;
+- requests only the fixed HTTPS URLs and their 1-indexed `?page=N` forms;
 - disables redirects, so requests stay on the same origin;
 - limits responses to 4 MiB and 20 pages;
 - reads the HTTP status itself and does not depend on a `status` field in the body;
-- treats HTTP 401 or 403 (key or plan tier refused), 429 and any other non-200 status as a failure for that endpoint and keeps its previous data;
-- checks the `data` array, the page number, a constant page total, and a constant version across pages.
+- treats HTTP 401 (key refused), 403 (plan tier or approval refused), 429 (daily limit) and any other non-200 status as a failure for that endpoint only and keeps its previous data;
+- requires `tier`, `data` (objects only) and `pagination` with `page` equal to the requested page, `page_size` at least the page's row count, `total_pages` at most 20, and `has_more` true exactly when more pages follow;
+- requires the same `tier`, `total_pages` and index version on every page.
 
-`models/free` rows are read from `slug`, `model_creator.slug`,
-`evaluations.artificial_analysis_coding_index` and
-`median_output_tokens_per_second`. These names follow the earlier public
-free-tier shape. They were not checked against the current reference because
-it could not be reached.
+Schema source: the public Data API reference
+(`https://artificialanalysis.ai/data-api/docs/reference`). It could not be
+reached from the authoring environment (proxy refusal), so the parser follows
+the schema recorded in the task and is checked only against synthetic
+documented-shape fixtures in `src/catalog/fixtures/`.
 
-`agents/coding` is never requested. Its response fields could not be checked
-against the published reference, so refresh reports
-`agents/coding response fields are not verified against the published reference; previous data kept`
-and keeps the previous cache or bundled snapshot.
+| Endpoint | Version | Row identity | Coding index | Speed |
+|---|---|---|---|---|
+| `models/free` | numeric `intelligence_index_version` | `slug` + `model_creator.name` | `evaluations.artificial_analysis_coding_index` | `performance_v3.mean_output_tokens_per_second` |
+| `agents/coding` (Pro/Commercial) | string `coding_agent_index_version` | `agent.name`, `agent_creator.name` when present, `model.slug`, `model.release_slug`, `model.effort`, `provider`, `is_router` | `coding_agent_index` | `time_per_task_seconds` |
 
-Rows are normalized through the supported-configuration table. Unknown models
-are skipped. A row with a malformed metric rejects the whole endpoint. Each
-endpoint is published atomically after it is fully validated. A failed endpoint
-keeps its previous data.
+All metrics are nullable. A null or missing metric stays missing and is never
+treated as a measurement. The deprecated
+`performance.median_output_tokens_per_second` (null from 2026-12-10) is not
+read.
+
+Rows map to a dispatchable configuration only through an exact measured
+identity:
+
+| Endpoint | Published identity | Configuration |
+|---|---|---|
+| `models/free` | creator `OpenAI`, slug `gpt-5-codex-low` / `-medium` / `-high` | codex `gpt-5-codex` low / medium / high |
+| `agents/coding` | agent `Codex`, creator `OpenAI` or absent, provider `OpenAI`, `is_router` false, model slug `gpt-5-codex` with no different `release_slug`, effort `low` / `medium` / `high` | codex `gpt-5-codex` low / medium / high |
+
+Rolling aliases (`opus`, `sonnet`, provider defaults) and default effort have
+no measured identity, so they never borrow a measurement of a specific
+version or effort. Routers, rows with a missing or non-boolean `is_router`,
+other agents, creators or providers (including API gateways), dated releases
+that differ from the dispatched slug, and unknown rows are skipped and
+counted. They do not stop the other rows on the page. These identity values
+are local policy; they have not been checked against live data.
+
+A matched row with a malformed metric rejects the whole endpoint. A refresh
+that yields no supported rows keeps the previous data. Each endpoint is
+published atomically after it is fully validated. A failed endpoint keeps its
+previous data.
 
 ## Eligibility (Stage 2 gate)
 

@@ -1,0 +1,37 @@
+{
+  "tier": "pro",
+  "coding_agent_index_version": "fixture-2",
+  "pagination": {"page": 2, "page_size": 4, "total_pages": 2, "has_more": false},
+  "data": [
+    {
+      "agent": {"name": "Codex"},
+      "agent_creator": {"name": "OpenAI"},
+      "model": {"slug": "gpt-5-codex", "effort": "low"},
+      "provider": "Fixture API Gateway",
+      "is_router": false,
+      "coding_agent_index": 92.0,
+      "time_per_task_seconds": 8.0
+    },
+    {
+      "agent": {"name": "Codex"},
+      "model": {"slug": "gpt-5-codex", "effort": "medium"},
+      "provider": "OpenAI",
+      "is_router": false,
+      "coding_agent_index": 39.0,
+      "time_per_task_seconds": null
+    },
+    {
+      "agent": {"name": "Claude Code"},
+      "agent_creator": {"name": "Anthropic"},
+      "model": {"slug": "claude-opus", "effort": "high"},
+      "provider": "Anthropic",
+      "is_router": false,
+      "coding_agent_index": 91.0,
+      "time_per_task_seconds": 9.0
+    },
+    {
+      "id": "fixture-agent-unidentified",
+      "coding_agent_index": 90.0
+    }
+  ]
+}

@@ -21,49 +21,29 @@ pub(crate) struct Configuration {
     pub(crate) provider: Provider,
     pub(crate) model: &'static str,
     pub(crate) effort: &'static str,
-    models_slug: Option<&'static str>,
-    agents_slug: Option<&'static str>,
 }
 
 const fn configuration(
     provider: Provider,
     model: &'static str,
     effort: &'static str,
-    slug: Option<&'static str>,
 ) -> Configuration {
     Configuration {
         provider,
         model,
         effort,
-        models_slug: slug,
-        agents_slug: slug,
     }
 }
 
 pub(crate) const SUPPORTED: [Configuration; 8] = [
-    configuration(Provider::Claude, DEFAULT, DEFAULT, None),
-    configuration(Provider::Claude, "opus", DEFAULT, Some("claude-opus")),
-    configuration(Provider::Claude, "sonnet", DEFAULT, Some("claude-sonnet")),
-    configuration(Provider::Codex, DEFAULT, DEFAULT, None),
-    configuration(
-        Provider::Codex,
-        "gpt-5-codex",
-        "low",
-        Some("gpt-5-codex-low"),
-    ),
-    configuration(
-        Provider::Codex,
-        "gpt-5-codex",
-        "medium",
-        Some("gpt-5-codex-medium"),
-    ),
-    configuration(
-        Provider::Codex,
-        "gpt-5-codex",
-        "high",
-        Some("gpt-5-codex-high"),
-    ),
-    configuration(Provider::Codex, "gpt-5-codex", DEFAULT, Some("gpt-5-codex")),
+    configuration(Provider::Claude, DEFAULT, DEFAULT),
+    configuration(Provider::Claude, "opus", DEFAULT),
+    configuration(Provider::Claude, "sonnet", DEFAULT),
+    configuration(Provider::Codex, DEFAULT, DEFAULT),
+    configuration(Provider::Codex, "gpt-5-codex", "low"),
+    configuration(Provider::Codex, "gpt-5-codex", "medium"),
+    configuration(Provider::Codex, "gpt-5-codex", "high"),
+    configuration(Provider::Codex, "gpt-5-codex", DEFAULT),
 ];
 
 pub(crate) fn supported(
@@ -75,33 +55,6 @@ pub(crate) fn supported(
         configuration.provider == provider
             && configuration.model == model
             && configuration.effort == effort
-    })
-}
-
-fn index_owner(endpoint: Endpoint, owner: &str) -> Option<Provider> {
-    match (endpoint, owner) {
-        (Endpoint::ModelsFree, "anthropic") | (Endpoint::AgentsCoding, "claude-code") => {
-            Some(Provider::Claude)
-        }
-        (Endpoint::ModelsFree, "openai") | (Endpoint::AgentsCoding, "codex") => {
-            Some(Provider::Codex)
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn by_index_slug(
-    endpoint: Endpoint,
-    owner: &str,
-    slug: &str,
-) -> Option<&'static Configuration> {
-    let provider = index_owner(endpoint, owner)?;
-    SUPPORTED.iter().find(|configuration| {
-        let candidate = match endpoint {
-            Endpoint::ModelsFree => configuration.models_slug,
-            Endpoint::AgentsCoding => configuration.agents_slug,
-        };
-        configuration.provider == provider && candidate == Some(slug)
     })
 }
 
@@ -1052,10 +1005,5 @@ exit 3
             ]
         );
         assert!(supported(Provider::Claude, "opus", "high").is_none());
-        assert_eq!(
-            by_index_slug(Endpoint::AgentsCoding, "codex", "gpt-5-codex-high"),
-            Some(&SUPPORTED[6])
-        );
-        assert!(by_index_slug(Endpoint::ModelsFree, "codex", "gpt-5-codex-high").is_none());
     }
 }

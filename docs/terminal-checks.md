@@ -60,10 +60,13 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 |---|---|
 | Bundled snapshots are dated, sourced, and contain no unverified values | `bundled_snapshots_are_dated_sourced_and_carry_no_unverified_values` |
 | Per-endpoint SHA-256, scope, schema, version, range, unit and size checks fall back independently | `cache_integrity_falls_back_independently_per_endpoint` |
-| Refresh uses an injected fetcher, enforces the same HTTPS origin, pagination and version, redacts the key, and publishes only validated endpoints | `refresh_publishes_only_fully_validated_same_origin_pages` |
-| Refresh requests the published `/api/v2/language/...` paths and does not require a body `status` | `refresh_uses_published_language_paths_without_requiring_a_body_status` |
-| A key or plan-tier refusal (401/403), 429 or 410 keeps the previously valid cache | `tier_refusal_keeps_previously_valid_data` |
-| The unverified `agents/coding` schema is never requested and its cache is kept | `unverified_agent_schema_is_never_requested_or_published` |
+| Two-page documented-shape fixtures for both endpoints publish only exact dispatchable identities, and refresh requests the published `/api/v2/language/...` paths | `documented_shape_pages_publish_both_endpoints` |
+| Routers, missing or default effort, dated releases, API-gateway providers, other creators and alias rows never borrow a measurement | `identity_and_effort_never_borrow_a_different_measurement`, `measured_identities_name_only_explicit_dispatchable_configurations` |
+| A plan-tier refusal (403) on one endpoint keeps that cache while the other refreshes; 401, 429 and 410 keep both | `each_endpoint_tier_refusal_keeps_only_its_own_cache` |
+| Malformed pagination, `tier`, index version, row shape or matched metric rejects only that endpoint and keeps its cache | `malformed_pagination_or_metrics_reject_only_that_endpoint` |
+| A refresh with no supported rows, or an empty result, never erases a valid cache | `empty_supported_refresh_keeps_a_valid_cache` |
+| Deprecated `performance.median_output_tokens_per_second` and the retired field names are never read as measurements | `legacy_and_retired_fields_are_never_read_as_measurements` |
+| Refresh redacts the key and stays on the published HTTPS origin | `refresh_redacts_the_key_and_stays_on_the_published_origin` |
 | `curl` starts with `-q`, gets the key only on standard input, and does not inherit the key or `CURL_HOME` | `curl_reads_no_implicit_config_and_inherits_no_key` |
 | Without a key, `catalog refresh` refuses and `catalog show` reports bundled provenance | `catalog_entry_point_shows_bundled_provenance_and_refuses_refresh_without_key` |
 | Latched, exhausted, corrupt and sign-in-refused profiles are excluded; stale, unreported and past-reset readings are not | `routing_gate_excludes_latched_exhausted_corrupt_and_refused_profiles` |
