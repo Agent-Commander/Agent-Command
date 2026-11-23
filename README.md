@@ -271,6 +271,93 @@ agent-command specialist unsettle nova
 agent-command specialist remove nova
 ```
 
+## Headless daemon, remote connect and MCP
+
+`agent-command daemon` owns Commander's specialist threads without any terminal
+window, so closing a laptop lid or a TUI never kills a running mission. It uses
+the same `agent-command-orchestrator-v1` roster and histories as the UI.
+
+```sh
+agent-command daemon                                   # http://127.0.0.1:47100, scope supervised
+agent-command daemon --root ~/src/project              # workspace root for new threads
+agent-command daemon --bind 100.64.0.7:47100 --allow-remote   # a Tailscale or LAN address
+agent-command daemon --print-service [linux|macos|windows]    # render a user-level service
+agent-command daemon --install-service                 # write it; prints, never runs, activation commands
+```
+
+Security defaults:
+
+- Binds loopback by default. A non-loopback address needs `--allow-remote`;
+  wildcard binds (`0.0.0.0`, `::`) are always refused — name the Tailscale or LAN IP.
+- Every request, loopback included, needs `Authorization: Bearer <token>`.
+  Missing or wrong tokens get `401`. The 256-bit token is generated on first
+  start, stored mode `0600` in the private `agent-command-daemon-v1` directory
+  under the profile root (never in a worktree), printed once for pairing, and
+  compared in constant time.
+- Outside callers get `supervised` scope (or `--scope read-only`). Full access
+  and permission skipping cannot be requested; tool inputs reject unknown
+  fields, and workspaces must resolve inside `--root` (no `..`, no outside paths).
+
+Endpoints: `GET /health`, `GET /threads`, `GET /threads/NAME?since=N`,
+`GET /events?thread=NAME&since=N` (Server-Sent Events), `POST /mcp` (MCP JSON-RPC).
+
+Service files: Linux writes `~/.config/systemd/user/agent-command.service`
+(`systemctl --user enable --now agent-command.service`, plus
+`loginctl enable-linger "$USER"` to survive logout); macOS writes
+`~/Library/LaunchAgents/com.agent-command.daemon.plist` (`launchctl bootstrap gui/$(id -u) …`);
+Windows prints a per-user `schtasks /SC ONLOGON /RL LIMITED` command.
+
+### Connect from another machine
+
+```sh
+export AGENT_COMMAND_TOKEN=…            # the pairing token from the daemon host
+agent-command connect http://100.64.0.7:47100 --once           # verify health and list threads
+agent-command connect http://100.64.0.7:47100                  # live status view
+agent-command connect http://100.64.0.7:47100 --thread nova    # stream one thread
+agent-command connect http://box.tailnet.ts.net:47100 --token-env AC_BOX_TOKEN
+```
+
+`connect` checks `/health` and the token first, then reconnects with backoff
+(1 s up to 30 s) when the network drops; streams resume from the last entry
+seen. Loopback daemons read the local token file automatically. A rejected
+token stops immediately instead of retrying.
+
+### MCP server for outside agents
+
+`agent-command mcp` speaks MCP (JSON-RPC 2.0, protocol `2025-06-18`, also
+`2025-03-26` and `2024-11-05`) over stdio. `mcp --connect URL` bridges stdio to
+a daemon's authenticated `/mcp` endpoint.
+
+| Tool | Purpose |
+| --- | --- |
+| `list_threads`, `search_threads`, `read_thread` | inspect threads and transcripts (`since` sequence numbers) |
+| `create_thread` | new specialist in its own worktree or private directory |
+| `launch_mission` | run a task on an idle thread |
+| `message_thread` | run now when idle, queue behind the current mission otherwise |
+| `delegate_task` | create if needed and run a seven-field brief: `role`, `goal`, `context`, `requirements`, `done_when`, `do_not`, `return` |
+| `wait_thread` | block until idle or `timeout_ms` (max 600000) |
+| `interrupt_thread` | stop the mission and drop queued messages |
+
+Connect OpenBot (or Nagatha, or any MCP client) with a stdio server entry:
+
+```json
+{
+  "mcpServers": {
+    "agent-command": {
+      "command": "agent-command",
+      "args": ["mcp", "--root", "/home/me/src/project"]
+    },
+    "agent-command-remote": {
+      "command": "agent-command",
+      "args": ["mcp", "--connect", "http://100.64.0.7:47100", "--token-env", "AC_BOX_TOKEN"]
+    }
+  }
+}
+```
+
+Clients that speak HTTP directly can `POST` JSON-RPC to `http://HOST:PORT/mcp`
+with `Content-Type: application/json` and the bearer header.
+
 ## Subscription profiles
 
 Install Claude Code and/or Codex CLI and put the provider executable on PATH.
