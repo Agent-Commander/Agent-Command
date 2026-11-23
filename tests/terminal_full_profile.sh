@@ -37,18 +37,30 @@ for dimensions in 80x24 120x40; do
     height=${dimensions#*x}
     t new-session -d -s "$dimensions" -x "$width" -y "$height" -c "$fixture/work" \
         env SUB_AUTH_DIR="$profiles" AGENT_COMMAND_THEME="$fixture/no-theme" "$binary"
-    await_capture "$dimensions" 'claude/0'
     if test "$width" = 80; then
-        t send-keys -t "$dimensions:0.0" F2
+        await_capture "$dimensions" 'claude/0'
+        await_capture "$dimensions" '· Auto'
+        for expected in 'Override saved: claude/0' 'Override saved: claude/1234567890abc'; do
+            t send-keys -t "$dimensions:0.0" F2
+            await_capture "$dimensions" "$expected"
+        done
+        await_capture "$dimensions" "claude/$long"
+        grep -Fq '5h unavailable' "$fixture/screen"
+        grep -Fq '· Override' "$fixture/screen"
     else
+        await_capture "$dimensions" "claude/$long"
+        grep -Fq '· Override' "$fixture/screen"
+        grep -Fq '5h unavailable' "$fixture/screen"
         mouse=$(printf '\033[<0;8;%sM' "$((height - 8))" | od -An -v -tx1)
-        t send-keys -H -t "$dimensions:0.0" $mouse
+        for expected in 'Auto routing' 'Override saved: claude/0' 'Override saved: claude/1234567890abc'; do
+            t send-keys -H -t "$dimensions:0.0" $mouse
+            await_capture "$dimensions" "$expected"
+        done
     fi
-    await_capture "$dimensions" "claude/$long"
-    grep -Fq '5h unavailable' "$fixture/screen"
     await_capture "$dimensions" "stale age unknown"
     grep -Eq "Week 97% used / 3% left.*stale" "$fixture/screen"
     grep -Fq 'No latch' "$fixture/screen"
-    printf '%s full profile, unavailable five-hour window and stale weekly window visible\n' "$dimensions"
+    grep -Fq "\"profile\":\"claude/$long\"" "$profiles/agent-command-routing-v1/override.json"
+    printf '%s full profile, override, unavailable five-hour window and stale weekly window visible\n' "$dimensions"
     t kill-session -t "$dimensions"
 done

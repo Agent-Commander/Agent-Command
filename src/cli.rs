@@ -12,14 +12,16 @@ use std::{
     time::Duration,
 };
 pub fn run_cli(args: &[String]) -> io::Result<()> {
-    if let Some(("auth", rest)) = args
+    match args
         .split_first()
         .map(|(first, rest)| (first.as_str(), rest))
     {
-        return crate::auth::run(rest);
+        Some(("auth", rest)) => return crate::auth::run(rest),
+        Some(("catalog", rest)) => return crate::catalog::run(rest),
+        _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {

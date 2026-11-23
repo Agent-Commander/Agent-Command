@@ -1,7 +1,9 @@
 mod auth;
+mod catalog;
 mod checkpoint;
 mod cli;
 mod mission;
+mod routing;
 mod usage;
 pub use cli::run_cli;
 
@@ -89,7 +91,9 @@ pub fn color(hex: &str) -> Color {
 struct Live {
     workspace: PathBuf,
     profiles: Vec<auth::Profile>,
-    selected_profile: usize,
+    profile_root: Option<PathBuf>,
+    preferred: Option<usize>,
+    last_routed: Option<usize>,
     profile_area: Rect,
     usage: Option<usage::Usage>,
     usage_checked_at: Option<u64>,
@@ -103,13 +107,91 @@ struct Live {
 }
 
 impl Live {
+    fn new(
+        workspace: PathBuf,
+        profiles: Vec<auth::Profile>,
+        profile_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            workspace,
+            profiles,
+            profile_root,
+            preferred: None,
+            last_routed: None,
+            profile_area: Rect::default(),
+            usage: None,
+            usage_checked_at: None,
+            usage_worker: None,
+            running_profile: None,
+            continuation: None,
+            pending: None,
+            abandon_area: Rect::default(),
+            mission: None,
+            outcomes: ["READY"; 4],
+        }
+    }
+
+    fn displayed_profile(&self) -> usize {
+        self.running_profile
+            .or(self.preferred)
+            .or(self.last_routed)
+            .unwrap_or(0)
+    }
+
+    fn load_override(&mut self) -> Option<String> {
+        let root = self.profile_root.as_ref()?;
+        let label = match auth::existing_private_state(root, routing::STATE_DIRECTORY)
+            .and_then(|state| state.map_or(Ok(None), |state| routing::load_override(&state)))
+        {
+            Ok(label) => label?,
+            Err(error) => {
+                return Some(format!(
+                    "Cannot read routing override: {error}. Using Auto."
+                ))
+            }
+        };
+        self.preferred = self
+            .profiles
+            .iter()
+            .position(|profile| profile.to_string() == label);
+        self.preferred
+            .is_none()
+            .then(|| format!("Routing override {label} is not an available profile. Using Auto."))
+    }
+
+    fn save_override(&self) -> io::Result<()> {
+        let root = self
+            .profile_root
+            .as_ref()
+            .ok_or_else(|| io::Error::other("No profile root"))?;
+        let label = self.preferred.map(|index| self.profiles[index].to_string());
+        routing::save_override(&routing::state_directory(root)?, label.as_deref())
+    }
+
+    fn catalog(&self) -> catalog::Catalog {
+        let state = self.profile_root.as_ref().and_then(|root| {
+            auth::existing_private_state(root, routing::STATE_DIRECTORY)
+                .ok()
+                .flatten()
+        });
+        catalog::Catalog::load(state.as_deref())
+    }
+
+    fn route_mode(&self) -> &'static str {
+        if self.preferred.is_some() {
+            "Override"
+        } else {
+            "Auto"
+        }
+    }
+
     fn refresh_usage(&mut self) {
         let now = usage::now();
         if self.usage_checked_at == Some(now.elapsed / 1_000_000_000) {
             return;
         }
         self.usage_checked_at = Some(now.elapsed / 1_000_000_000);
-        let displayed = self.running_profile.unwrap_or(self.selected_profile);
+        let displayed = self.displayed_profile();
         self.usage = self
             .profiles
             .get(displayed)
@@ -191,8 +273,11 @@ impl Default for App {
 impl App {
     fn live(workspace: PathBuf) -> Self {
         let mut app = Self::default();
-        let profiles = auth::root()
-            .and_then(|root| auth::profiles(&root))
+        let root = auth::root();
+        let profiles = root
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+            .and_then(|root| auth::profiles(root))
             .unwrap_or_else(|error| {
                 app.notice = format!("Cannot load profiles: {error}");
                 Vec::new()
@@ -201,21 +286,12 @@ impl App {
             app.notice = format!("Cannot read continuation state: {error}");
             None
         });
-        app.live = Some(Live {
-            workspace,
-            profiles,
-            selected_profile: 0,
-            profile_area: Rect::default(),
-            usage: None,
-            usage_checked_at: None,
-            usage_worker: None,
-            running_profile: None,
-            continuation: None,
-            pending,
-            abandon_area: Rect::default(),
-            mission: None,
-            outcomes: ["READY"; 4],
-        });
+        let mut live = Live::new(workspace, profiles, root.ok());
+        live.pending = pending;
+        if let Some(notice) = live.load_override() {
+            app.notice = notice;
+        }
+        app.live = Some(live);
         app.log.clear();
         app.log_times.clear();
         app.missions = std::array::from_fn(|_| "Standing by for a new mission".into());
@@ -224,11 +300,23 @@ impl App {
 
     fn select_profile(&mut self) {
         let Some(live) = &mut self.live else { return };
-        if live.mission.is_none() && !live.profiles.is_empty() {
-            live.selected_profile = (live.selected_profile + 1) % live.profiles.len();
-            live.usage_checked_at = None;
-            live.refresh_usage();
+        if live.mission.is_some() || live.profiles.is_empty() {
+            return;
         }
+        live.preferred = match live.preferred {
+            None => Some(0),
+            Some(index) if index + 1 < live.profiles.len() => Some(index + 1),
+            Some(_) => None,
+        };
+        live.usage_checked_at = None;
+        live.refresh_usage();
+        self.notice = match live.save_override() {
+            Ok(()) => match live.preferred {
+                Some(index) => format!("Override saved: {}", live.profiles[index]),
+                None => "Auto routing: highest-ranked eligible profile".into(),
+            },
+            Err(error) => format!("Override not saved: {error}"),
+        };
     }
 
     fn status(&self, index: usize) -> &'static str {
@@ -248,16 +336,13 @@ impl App {
             };
             let agent = *agent;
             match running.events.try_recv() {
-                Ok(mission::Event::Running { profile, rotated }) => {
+                Ok(mission::Event::Running { profile, reason }) => {
                     live.outcomes[agent] = "RUNNING";
                     live.running_profile = Some(profile);
+                    live.last_routed = Some(profile);
                     live.usage_checked_at = None;
                     live.refresh_usage();
-                    if rotated {
-                        let reason = format!(
-                            "{} selected because the preferred profile is latched.",
-                            live.profiles[profile]
-                        );
+                    if let Some(reason) = reason {
                         self.notice = reason.clone();
                         self.push_log(format!("SYSTEM  {reason}"));
                     }
@@ -381,21 +466,28 @@ impl App {
                 self.input.clear();
                 return;
             }
-            let Some(profile) = live.profiles.get(live.selected_profile).cloned() else {
+            if live.profiles.is_empty() {
                 self.notice = "Sign in with agent-command auth login PROVIDER PROFILE.".into();
                 return;
+            }
+            let request = match routing::parse(&command) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.notice = error;
+                    return;
+                }
             };
-            self.notice = format!("Starting {profile} in {}", live.workspace.display());
+            self.notice = format!("Routing in {}", live.workspace.display());
             live.outcomes[self.selected] = "STARTING";
             live.continuation = None;
+            let route = mission::Route {
+                request,
+                preferred: live.preferred.map(|index| live.profiles[index].to_string()),
+                catalog: live.catalog(),
+            };
             live.mission = Some((
                 self.selected,
-                mission::Mission::launch(
-                    live.profiles.clone(),
-                    live.selected_profile,
-                    live.workspace.clone(),
-                    command.clone(),
-                ),
+                mission::Mission::launch(live.profiles.clone(), route, live.workspace.clone()),
             ));
             self.missions[self.selected] = command;
             self.input.clear();
@@ -818,14 +910,12 @@ impl App {
         if let Some(live) = &mut self.live {
             live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
             let now = usage::now();
-            let selected = live.running_profile.unwrap_or(live.selected_profile);
-            let label = live.profiles.get(selected).map_or_else(
-                || {
-                    vec![Line::raw(
-                        "No profiles · agent-command auth login PROVIDER PROFILE",
-                    )]
-                },
-                |profile| {
+            let label = if live.profiles.is_empty() {
+                vec![Line::raw(
+                    "No profiles · agent-command auth login PROVIDER PROFILE",
+                )]
+            } else {
+                {
                     let latch = live.usage.map_or_else(
                         || "State unavailable".into(),
                         |usage| usage.latch_label(now),
@@ -836,11 +926,11 @@ impl App {
                         "F2 / click"
                     };
                     vec![
-                        Line::raw(format!("{control} · {latch}")),
-                        Line::raw(profile.to_string()),
+                        Line::raw(format!("{control} · {latch} · {}", live.route_mode())),
+                        Line::raw(live.profiles[live.displayed_profile()].to_string()),
                     ]
-                },
-            );
+                }
+            };
             let [five, week] = live.usage.unwrap_or_default().rows(now);
             f.render_widget(
                 Paragraph::new(label).style(Style::default().fg(color(&t.accent))),
@@ -1032,6 +1122,18 @@ pub fn source_stamp(root: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_live(
+        workspace: PathBuf,
+        profiles: Vec<auth::Profile>,
+        preferred: Option<usize>,
+    ) -> Live {
+        let root = profiles.first().map(|profile| profile.root().to_owned());
+        Live {
+            preferred,
+            ..Live::new(workspace, profiles, root)
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn live_mission_uses_selected_profile_and_renders_output_and_outcome() {
@@ -1086,21 +1188,11 @@ while test ! -f release-mission; do sleep 0.01; done
             (120, 40, false, "Codex"),
         ] {
             let mut app = App {
-                live: Some(Live {
-                    workspace: workspace.clone(),
-                    profiles: vec![codex.clone(), claude.clone()],
-                    selected_profile: usize::from(!key),
-                    profile_area: Rect::default(),
-                    usage: None,
-                    usage_checked_at: None,
-                    usage_worker: None,
-                    running_profile: None,
-                    continuation: None,
-                    pending: None,
-                    abandon_area: Rect::default(),
-                    mission: None,
-                    outcomes: ["READY"; 4],
-                }),
+                live: Some(test_live(
+                    workspace.clone(),
+                    vec![codex.clone(), claude.clone()],
+                    key.then_some(0),
+                )),
                 ..App::default()
             };
             let mut terminal =
@@ -1181,21 +1273,7 @@ while test ! -f release-mission; do sleep 0.01; done
             let (_fixture, workspace, profiles) =
                 mission::tests::limit_fixture(&format!("continuation-panel-{width}"), usage::now());
             let mut app = App {
-                live: Some(Live {
-                    workspace: workspace.clone(),
-                    profiles,
-                    selected_profile: 0,
-                    profile_area: Rect::default(),
-                    usage: None,
-                    usage_checked_at: None,
-                    usage_worker: None,
-                    running_profile: None,
-                    continuation: None,
-                    pending: None,
-                    abandon_area: Rect::default(),
-                    mission: None,
-                    outcomes: ["READY"; 4],
-                }),
+                live: Some(test_live(workspace.clone(), profiles, Some(0))),
                 input: "Keep the finished step".into(),
                 editing: keyboard,
                 ..App::default()
@@ -1258,21 +1336,11 @@ while test ! -f release-mission; do sleep 0.01; done
 
         for (width, height, key) in [(80, 24, true), (120, 40, false)] {
             let mut app = App {
-                live: Some(Live {
-                    workspace: fixture.root.clone(),
-                    profiles: vec![ready.clone(), latched.clone()],
-                    selected_profile: 0,
-                    profile_area: Rect::default(),
-                    usage: None,
-                    usage_checked_at: None,
-                    usage_worker: None,
-                    running_profile: None,
-                    continuation: None,
-                    pending: None,
-                    abandon_area: Rect::default(),
-                    mission: None,
-                    outcomes: ["READY"; 4],
-                }),
+                live: Some(test_live(
+                    fixture.root.clone(),
+                    vec![ready.clone(), latched.clone()],
+                    None,
+                )),
                 ..App::default()
             };
             app.poll_mission();
@@ -1293,19 +1361,145 @@ while test ! -f release-mission; do sleep 0.01; done
             let initial = panel(&terminal);
             assert!(initial[0].contains("No latch") && initial[1].contains("claude/ready"));
             assert!(initial[2].contains("5h unavailable"));
-            if key {
-                app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-            } else {
-                app.click(area.x, area.y);
-            }
-            terminal.draw(|f| app.draw(f)).unwrap();
-            let changed = panel(&terminal);
+            assert!(initial[0].contains("Auto"));
+            let mut press = |app: &mut App| {
+                if key {
+                    app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                } else {
+                    app.click(area.x, area.y);
+                }
+                terminal.draw(|f| app.draw(f)).unwrap();
+                panel(&terminal)
+            };
+            let first = press(&mut app);
+            assert!(first[0].contains("Override") && first[1].contains("claude/ready"));
+            let changed = press(&mut app);
             assert!(
                 changed[0].contains("Latched") && changed[1].contains(&format!("claude/{long}"))
             );
             assert!(changed[2].contains("5h 25% used / 75% left, reset"));
             assert!(changed[3].contains("Week 60% used / 40% left, reset"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_persists_across_reopen_and_shows_fallback_reason_with_keyboard_and_mouse() {
+        use auth::Provider;
+        use serde_json::json;
+        use usage::{tests::Fixture, Usage};
+
+        for (width, height, keyboard) in [(80, 24, true), (120, 40, false)] {
+            let fixture = Fixture::new(
+                &format!("override-panel-{width}"),
+                r#"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+cat > /dev/null
+while test ! -f release; do sleep 0.01; done
+"#,
+            );
+            let profiles = vec![
+                fixture.profile(Provider::Claude, "alpha"),
+                fixture.profile(Provider::Claude, "zulu"),
+            ];
+            let now = usage::now();
+            Usage::observe_claude(
+                &profiles[1],
+                &json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":now.wall + 600}}),
+                now,
+            )
+            .unwrap();
+            let mut app = App {
+                live: Some(test_live(fixture.root.clone(), profiles.clone(), None)),
+                ..App::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| {
+                let buffer = terminal.backend().buffer();
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            terminal.draw(|f| app.draw(f)).unwrap();
+            for _ in 0..2 {
+                let area = app.live.as_ref().unwrap().profile_area;
+                if keyboard {
+                    app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                } else {
+                    app.click(area.x + area.width / 2, area.y);
+                }
+                terminal.draw(|f| app.draw(f)).unwrap();
+            }
+            assert!(row(&terminal, height - 2).contains("Override saved: claude/zulu"));
+
+            let mut reopened = test_live(fixture.root.clone(), profiles.clone(), None);
+            assert_eq!(reopened.load_override(), None);
+            assert_eq!(reopened.preferred, Some(1));
+            let mut app = App {
+                live: Some(reopened),
+                input: "Do work".into(),
+                editing: keyboard,
+                ..App::default()
+            };
+            app.poll_mission();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let area = app.live.as_ref().unwrap().profile_area;
+            assert!(
+                row(&terminal, area.y).contains("Latched")
+                    && row(&terminal, area.y).contains("Override")
+            );
+            assert!(row(&terminal, area.y + 1).contains("claude/zulu"));
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                let send = app.send_area;
+                click_center(&mut app, send);
+            }
+            wait_for(&mut app, |app| app.status(0) == "RUNNING");
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let notice = row(&terminal, height - 2);
+            assert!(
+                notice.contains("Override claude/zulu skipped: latched · rotated → claude/alpha"),
+                "{notice}"
+            );
+            assert!(row(&terminal, area.y + 1).contains("claude/alpha"));
+            fs::write(fixture.root.join("release"), "").unwrap();
+            wait_for(&mut app, |app| !app.mission_running());
+            assert_eq!(app.status(0), "DONE", "{}", app.notice);
+
+            fs::write(
+                profiles[0].usage_directory().unwrap().join("state.json"),
+                b"{",
+            )
+            .unwrap();
+            app.input = "Do work".into();
+            app.editing = keyboard;
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                let send = app.send_area;
+                click_center(&mut app, send);
+            }
+            wait_for(&mut app, |app| !app.mission_running());
+            terminal.draw(|f| app.draw(f)).unwrap();
+            assert_eq!(app.status(0), "FAILED");
+            assert_eq!(
+                app.notice,
+                "Atlas: No eligible signed-in subscription profile. Skipped: claude/alpha usage state unreadable; claude/zulu latched."
+            );
+            assert!(
+                row(&terminal, height - 2).contains("Atlas: No eligible signed-in subscription")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn click_center(app: &mut App, area: Rect) {
+        app.click(area.x + area.width / 2, area.y + area.height / 2);
     }
 
     #[test]

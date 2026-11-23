@@ -97,9 +97,10 @@ an NTFS directory so Agent Command can enforce user-only access. The
 provider handles browser sign-in and manages its own session in that profile.
 Logout keeps the named profile directory and its settings.
 
-Open `agent-command` from the workspace where the mission should run. Press
-F2 or click the profile row to choose the provider and profile. Enter a
-mission and press Enter or click Send. The status and assistant output appear
+Open `agent-command` from the workspace where the mission should run. By
+default, missions use the highest-ranked eligible profile (Auto). Press F2 or
+click the profile row to cycle Auto and a saved override for each profile.
+Enter a mission and press Enter or click Send. The status and assistant output appear
 in the mission panel and ship's log. One mission runs at a time. Reopen the
 TUI after adding a profile in another terminal.
 
@@ -159,6 +160,21 @@ and abandoned continuations. A launched or abandoned claim cannot be resumed.
 The launch is fenced durably immediately before dispatch. If the app exits
 at that boundary, it rejects a repeat rather than risk starting two processes.
 Pending claims from the previous Stage 2 revision can be abandoned. Their old digest cannot authorize a launch under the current snapshot format.
+
+### Model catalog and routing
+
+```sh
+agent-command catalog show
+ARTIFICIAL_ANALYSIS_API_KEY=… agent-command catalog refresh
+```
+
+Start a mission with `/urgent` or `/ordinary` to choose a scheduling policy.
+Use `/standard` or `/hard` to require a minimum published coding index. Use
+`/split first ;; second` to send explicit independent units to separate
+eligible profiles. The bundled catalog snapshots contain no benchmark values,
+so every index reads as missing until a verified refresh. See
+[docs/routing.md](docs/routing.md) for integrity checks, ranking precedence,
+split allocation and override behavior.
 
 Reverting the Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the
 Stage 2 state directories.

@@ -98,6 +98,27 @@ impl Usage {
                 .any(|window| window.used >= 100.0 && window.reset > now.wall)
     }
 
+    fn open_windows(self, now: Tick) -> impl Iterator<Item = Window> {
+        [self.five, self.week]
+            .into_iter()
+            .flatten()
+            .filter(move |window| window.reset > now.wall)
+    }
+
+    pub(crate) fn remaining(self, now: Tick) -> Option<f64> {
+        self.open_windows(now)
+            .map(|window| (100.0 - window.used).clamp(0.0, 100.0))
+            .min_by(f64::total_cmp)
+    }
+
+    pub(crate) fn headroom_rate(self, now: Tick) -> Option<f64> {
+        self.open_windows(now)
+            .map(|window| {
+                (100.0 - window.used).clamp(0.0, 100.0) / (window.reset - now.wall) as f64
+            })
+            .min_by(f64::total_cmp)
+    }
+
     pub(crate) fn rows(self, now: Tick) -> [String; 2] {
         let row = |name, window: Option<Window>| match window {
             Some(window) => {

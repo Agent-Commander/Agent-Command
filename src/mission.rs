@@ -1,6 +1,8 @@
 use crate::{
     auth::{Profile, Provider},
+    catalog::Catalog,
     checkpoint::{Checkpoint, Claim, Progress},
+    routing::{self, Candidate, Configuration, Request},
     usage::{self, Usage},
 };
 use serde_json::Value;
@@ -18,9 +20,15 @@ use std::{
 };
 
 pub(crate) enum Event {
-    Running { profile: usize, rotated: bool },
+    Running {
+        profile: usize,
+        reason: Option<String>,
+    },
     Output(String),
-    Continuing { from: usize, to: usize },
+    Continuing {
+        from: usize,
+        to: usize,
+    },
     Finished(io::Result<()>),
 }
 
@@ -35,32 +43,44 @@ impl Drop for Mission {
     }
 }
 
+pub(crate) struct Route {
+    pub(crate) request: Request,
+    pub(crate) preferred: Option<String>,
+    pub(crate) catalog: Catalog,
+}
+
+impl Route {
+    #[cfg(test)]
+    pub(crate) fn single(prompt: &str, preferred: Option<String>) -> Self {
+        Self {
+            request: Request {
+                units: vec![prompt.into()],
+                ..Request::default()
+            },
+            preferred,
+            catalog: Catalog::default(),
+        }
+    }
+}
+
 impl Mission {
-    pub(crate) fn launch(
-        profiles: Vec<Profile>,
-        preferred: usize,
-        workspace: PathBuf,
-        prompt: String,
-    ) -> Self {
-        Self::launch_with_clock(profiles, preferred, workspace, prompt, usage::now)
+    pub(crate) fn launch(profiles: Vec<Profile>, route: Route, workspace: PathBuf) -> Self {
+        Self::launch_with_clock(profiles, route, workspace, usage::now)
     }
 
     fn launch_with_clock(
         profiles: Vec<Profile>,
-        preferred: usize,
+        route: Route,
         workspace: PathBuf,
-        prompt: String,
         clock: fn() -> usage::Tick,
     ) -> Self {
         Self::start(
             Execution {
                 profiles,
                 workspace,
-                prompt,
                 clock,
             },
-            preferred,
-            None,
+            Work::Routed(route),
         )
     }
 
@@ -75,22 +95,28 @@ impl Mission {
             Execution {
                 profiles,
                 workspace,
-                prompt,
                 clock: usage::now,
             },
-            interrupted,
-            Some(claim),
+            Work::Resume {
+                interrupted,
+                prompt,
+                claim,
+            },
         )
     }
 
-    fn start(execution: Execution, preferred: usize, claim: Option<Claim>) -> Self {
+    fn start(execution: Execution, work: Work) -> Self {
         let (sender, events) = mpsc::sync_channel(64);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         thread::spawn(move || {
-            let result = match claim {
-                Some(claim) => execution.resume(preferred, claim, &sender, &worker_cancel),
-                None => execution.run(preferred, &sender, &worker_cancel),
+            let result = match work {
+                Work::Routed(route) => execution.route(&route, &sender, &worker_cancel),
+                Work::Resume {
+                    interrupted,
+                    prompt,
+                    claim,
+                } => execution.resume(interrupted, &prompt, claim, &sender, &worker_cancel),
             };
             let _ = sender.send(Event::Finished(result));
         });
@@ -98,26 +124,127 @@ impl Mission {
     }
 }
 
+enum Work {
+    Routed(Route),
+    Resume {
+        interrupted: usize,
+        prompt: String,
+        claim: Claim,
+    },
+}
+
 struct Execution {
     profiles: Vec<Profile>,
     workspace: PathBuf,
-    prompt: String,
     clock: fn() -> usage::Tick,
 }
 
+fn default_configuration(provider: Provider) -> &'static Configuration {
+    routing::supported(provider, "default", "default").expect("provider default configuration")
+}
+
 impl Execution {
-    fn run(
+    fn route(
         &self,
-        preferred: usize,
+        route: &Route,
         sender: &SyncSender<Event>,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
-        let (index, command) = select_command(&self.profiles, preferred, (self.clock)())?;
+        let now = (self.clock)();
+        let (candidates, exclusions) = routing::candidates(&self.profiles, &route.catalog, now);
+        let ranked = routing::rank(candidates, route.request.policy, route.request.difficulty);
+        if route.request.split {
+            return self.run_split(&route.request.units, ranked, &exclusions, sender, cancel);
+        }
+        let rotation = self.rotation(route.preferred.as_deref(), now);
+        let choice = routing::choose(ranked, &exclusions, route.preferred.as_deref(), &rotation)
+            .map_err(io::Error::other)?;
+        self.dispatch(
+            &choice.candidate,
+            &route.request.units[0],
+            Some(choice.reason),
+            sender,
+            cancel,
+        )
+    }
+
+    fn rotation(&self, preferred: Option<&str>, now: usage::Tick) -> Vec<String> {
+        let Some(index) = preferred.and_then(|label| {
+            self.profiles
+                .iter()
+                .position(|profile| profile.to_string() == label)
+        }) else {
+            return Vec::new();
+        };
+        usage::choices(&self.profiles, index, now)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|index| self.profiles[index].to_string())
+            .collect()
+    }
+
+    fn run_split(
+        &self,
+        units: &[String],
+        ranked: Result<Vec<Candidate>, String>,
+        exclusions: &[routing::Exclusion],
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let ranked = routing::require_ranked(ranked, exclusions).map_err(io::Error::other)?;
+        let plan = routing::allocate(units.len(), &ranked);
+        if plan.len() != units.len() {
+            return Err(io::Error::other(
+                "No eligible profile has headroom for every split unit.",
+            ));
+        }
+        for (position, (unit, candidate)) in units.iter().zip(&plan).enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let usage = Usage::read(&self.profiles[candidate.profile]);
+            if let Some(reason) = routing::allowance_refusal(&usage, (self.clock)()) {
+                return Err(io::Error::other(format!(
+                    "Split unit {} of {} stopped: {} {reason}.",
+                    position + 1,
+                    units.len(),
+                    candidate.label
+                )));
+            }
+            let reason = format!(
+                "Unit {}/{} → {}",
+                position + 1,
+                units.len(),
+                routing::describe(candidate)
+            );
+            self.dispatch(candidate, unit, Some(reason), sender, cancel)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch(
+        &self,
+        candidate: &Candidate,
+        prompt: &str,
+        reason: Option<String>,
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let index = candidate.profile;
         let profile = &self.profiles[index];
+        let command = profile.authenticated_command().map_err(|error| {
+            io::Error::other(format!("{profile} sign-in refused at dispatch: {error}"))
+        })?;
         let limit = run(
-            (command, profile.clone(), index, index != preferred),
+            Launch {
+                command,
+                profile: profile.clone(),
+                index,
+                reason,
+                configuration: candidate.configuration,
+            },
             &self.workspace,
-            self.prompt.clone(),
+            prompt.to_owned(),
             sender,
             cancel,
             self.clock,
@@ -142,12 +269,20 @@ impl Execution {
             return Ok(());
         }
         let claim = checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
-        self.continue_with((index, to, next), &claim, sender, cancel)
+        self.continue_with(
+            (index, to, next),
+            candidate.configuration,
+            prompt,
+            &claim,
+            sender,
+            cancel,
+        )
     }
 
     fn resume(
         &self,
         index: usize,
+        prompt: &str,
         claim: Claim,
         sender: &SyncSender<Event>,
         cancel: &AtomicBool,
@@ -168,24 +303,39 @@ impl Execution {
             ));
         }
         let next = profile.authenticated_command()?;
-        self.continue_with((index, to, next), &claim, sender, cancel)
+        self.continue_with(
+            (index, to, next),
+            default_configuration(profile.provider),
+            prompt,
+            &claim,
+            sender,
+            cancel,
+        )
     }
 
     fn continue_with(
         &self,
         selection: (usize, usize, std::process::Command),
+        configuration: &'static Configuration,
+        prompt: &str,
         claim: &Claim,
         sender: &SyncSender<Event>,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
-        let (index, to, next) = selection;
+        let (index, to, command) = selection;
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
         if run(
-            (next, self.profiles[to].clone(), to, false),
+            Launch {
+                command,
+                profile: self.profiles[to].clone(),
+                index: to,
+                reason: None,
+                configuration,
+            },
             &self.workspace,
-            self.prompt.clone(),
+            prompt.to_owned(),
             sender,
             cancel,
             self.clock,
@@ -218,24 +368,12 @@ impl Execution {
     }
 }
 
-fn select_command(
-    profiles: &[Profile],
-    preferred: usize,
-    now: usage::Tick,
-) -> io::Result<(usize, std::process::Command)> {
-    for index in usage::choices(profiles, preferred, now)? {
-        match profiles[index].authenticated_command() {
-            Ok(command) if !Usage::read(&profiles[index])?.blocked(now) => {
-                return Ok((index, command))
-            }
-            Ok(_) => continue,
-            Err(error) if index == preferred => return Err(error),
-            Err(_) => continue,
-        }
-    }
-    Err(io::Error::other(
-        "Profile is latched and no eligible signed-in alternative is available",
-    ))
+struct Launch {
+    command: std::process::Command,
+    profile: Profile,
+    index: usize,
+    reason: Option<String>,
+    configuration: &'static Configuration,
 }
 
 struct Continuation<'a> {
@@ -245,7 +383,7 @@ struct Continuation<'a> {
 }
 
 fn run(
-    selection: (std::process::Command, Profile, usize, bool),
+    launch: Launch,
     workspace: &std::path::Path,
     prompt: String,
     sender: &SyncSender<Event>,
@@ -253,10 +391,17 @@ fn run(
     clock: fn() -> usage::Tick,
     continuation: Option<Continuation<'_>>,
 ) -> io::Result<Option<Progress>> {
-    let (mut command, profile, index, rotated) = selection;
+    let Launch {
+        mut command,
+        profile,
+        index,
+        reason,
+        configuration,
+    } = launch;
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
     }
+    command.args(configuration.arguments());
     match profile.provider {
         Provider::Claude => command.args([
             "--print",
@@ -298,7 +443,7 @@ fn run(
     let stdout_sender = sender.clone();
     let _ = sender.send(Event::Running {
         profile: index,
-        rotated,
+        reason,
     });
     let limited = Arc::new(AtomicBool::new(false));
     let output_limit = Arc::clone(&limited);
@@ -451,6 +596,10 @@ pub(crate) mod tests {
 
     const FAKE_NOW: i64 = 1_000;
 
+    fn prefer(profiles: &[Profile], prompt: &str) -> Route {
+        Route::single(prompt, Some(profiles[0].to_string()))
+    }
+
     fn git_workspace(fixture: &Fixture) -> PathBuf {
         let workspace = fixture.root.join("work");
         std::fs::create_dir(&workspace).unwrap();
@@ -487,7 +636,8 @@ pub(crate) mod tests {
 profile=${CLAUDE_CONFIG_DIR##*/}
 work="${CLAUDE_CONFIG_DIR%/profiles/claude/*}/work"
 if test "$1" = auth; then
-    if test "$profile" = standby && test -f "$work/.git/change-after-checkpoint"; then
+    if test "$profile" = standby && test -f "$work/.git/change-after-checkpoint" \
+        && ls "${CLAUDE_CONFIG_DIR%/claude/*}"/agent-command-checkpoints-v1/*.json >/dev/null 2>&1; then
         printf 'changed\n' >> "$work/completed"
     fi
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
@@ -561,9 +711,8 @@ printf 'continued\n' >> completed
         let (_fixture, workspace, profiles) = limit_fixture("continue", usage::tick(FAKE_NOW, 0));
         let mission = Mission::launch_with_clock(
             profiles.clone(),
-            0,
+            prefer(&profiles, "Keep the finished step"),
             workspace.clone(),
-            "Keep the finished step".into(),
             || usage::tick(FAKE_NOW + 901, 901),
         );
         let (links, result) = drain(&mission);
@@ -635,13 +784,10 @@ printf 'continued\n' >> completed
                 )
                 .unwrap();
             }
-            let mission = Mission::launch_with_clock(
-                profiles,
-                0,
-                workspace.clone(),
-                "Keep the finished step".into(),
-                || usage::tick(FAKE_NOW, 0),
-            );
+            let route = prefer(&profiles, "Keep the finished step");
+            let mission = Mission::launch_with_clock(profiles, route, workspace.clone(), || {
+                usage::tick(FAKE_NOW, 0)
+            });
             let (links, result) = drain(&mission);
             assert!(links.is_empty(), "{case}");
             assert!(
@@ -667,9 +813,8 @@ printf 'continued\n' >> completed
         std::fs::write(workspace.join(".git/reject-continuation"), "").unwrap();
         let mission = Mission::launch_with_clock(
             profiles.clone(),
-            0,
+            prefer(&profiles, "Keep the finished step"),
             workspace.clone(),
-            "Keep the finished step".into(),
             || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
@@ -794,9 +939,8 @@ printf 'continued\n' >> completed
         std::fs::write(workspace.join(".git/completed-before-limit"), "").unwrap();
         let mission = Mission::launch_with_clock(
             profiles.clone(),
-            0,
+            prefer(&profiles, "Keep the finished step"),
             workspace.clone(),
-            "Keep the finished step".into(),
             || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
@@ -821,9 +965,8 @@ printf 'continued\n' >> completed
         std::fs::write(workspace.join(".git/change-after-checkpoint"), "").unwrap();
         let mission = Mission::launch_with_clock(
             profiles.clone(),
-            0,
+            prefer(&profiles, "Keep the finished step"),
             workspace.clone(),
-            "Keep the finished step".into(),
             || usage::tick(FAKE_NOW, 0),
         );
         let (links, result) = drain(&mission);
@@ -877,13 +1020,14 @@ printf '%s\n' "$profile" >> starts
         for profile in &profiles[1..] {
             Usage::observe_claude(profile, &event, now).unwrap();
         }
-        let mission = Mission::launch(profiles.into(), 0, fixture.root.clone(), "New work".into());
+        let route = prefer(&profiles, "New work");
+        let mission = Mission::launch(profiles.into(), route, fixture.root.clone());
         assert!(matches!(
             mission.events.recv_timeout(Duration::from_secs(3)).unwrap(),
             Event::Running {
                 profile: 2,
-                rotated: true
-            }
+                reason: Some(reason)
+            } if reason.starts_with("Override claude/first skipped: latched · rotated → claude/bravo")
         ));
         assert!(matches!(
             mission.events.recv_timeout(Duration::from_secs(3)).unwrap(),
@@ -921,17 +1065,13 @@ exit 1
         let workspace = git_workspace(&fixture);
         for provider in [Provider::Claude, Provider::Codex] {
             let selected = fixture.profile(provider, "original");
-            let mission = Mission::launch(
-                vec![selected.clone()],
-                0,
-                workspace.clone(),
-                "Do work".into(),
-            );
+            let route = prefer(std::slice::from_ref(&selected), "Do work");
+            let mission = Mission::launch(vec![selected.clone()], route, workspace.clone());
             assert!(matches!(
                 mission.events.recv_timeout(Duration::from_secs(3)).unwrap(),
                 Event::Running {
                     profile: 0,
-                    rotated: false
+                    reason: Some(_)
                 }
             ));
             let Event::Finished(result) =
@@ -948,6 +1088,185 @@ exit 1
         assert_eq!(
             std::fs::read_to_string(workspace.join("starts")).unwrap(),
             "claude\ncodex\n"
+        );
+    }
+
+    const ROUTED_PROVIDER: &str = r#"
+case "$1" in
+    auth) printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'; exit ;;
+    -c) if test "$5" = login; then printf '%s\n' 'Logged in using ChatGPT' >&2; exit; fi ;;
+esac
+mkdir running.lock || exit 5
+prompt=$(cat)
+profile=${CLAUDE_CONFIG_DIR##*/}
+test -n "$CLAUDE_CONFIG_DIR" || profile=${CODEX_HOME##*/}
+printf '%s|%s|%s\n' "$profile" "$*" "$prompt" >> starts
+sleep 0.05
+rmdir running.lock
+"#;
+
+    fn synthetic_catalog(rows: Vec<crate::catalog::Row>) -> Catalog {
+        use crate::catalog::{Endpoint, Origin, Snapshot, Source};
+        Catalog {
+            sources: vec![Source {
+                endpoint: Endpoint::AgentsCoding,
+                origin: Origin::Cache,
+                snapshot: Snapshot::sealed(
+                    Endpoint::AgentsCoding,
+                    "synthetic-1".into(),
+                    "synthetic test fixture".into(),
+                    rows,
+                ),
+            }],
+        }
+    }
+
+    fn agent_row(provider: &str, model: &str, effort: &str, index: f64) -> crate::catalog::Row {
+        crate::catalog::Row {
+            provider: provider.into(),
+            model: model.into(),
+            effort: effort.into(),
+            coding_index: Some(index),
+            speed: None,
+        }
+    }
+
+    fn finish(mission: &Mission) -> (Vec<String>, io::Result<()>) {
+        let mut reasons = Vec::new();
+        loop {
+            match mission.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Running {
+                    reason: Some(reason),
+                    ..
+                } => reasons.push(reason),
+                Event::Finished(result) => return (reasons, result),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn routed_dispatch_passes_selected_model_and_effort_to_native_cli() {
+        let fixture = Fixture::new("routed-arguments", ROUTED_PROVIDER);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "alpha"),
+            fixture.profile(Provider::Codex, "beta"),
+        ];
+        let rows = || {
+            vec![
+                agent_row("claude", "opus", "default", 60.0),
+                agent_row("codex", "gpt-5-codex", "high", 70.0),
+            ]
+        };
+        let route = |difficulty, preferred: Option<&str>, rows| Route {
+            request: Request {
+                difficulty,
+                units: vec!["Routed work".into()],
+                ..Request::default()
+            },
+            preferred: preferred.map(str::to_owned),
+            catalog: synthetic_catalog(rows),
+        };
+        for (difficulty, preferred) in [
+            (routing::Difficulty::Hard, None),
+            (routing::Difficulty::Hard, Some("claude/alpha")),
+        ] {
+            let mission = Mission::launch(
+                profiles.clone(),
+                route(difficulty, preferred, rows()),
+                fixture.root.clone(),
+            );
+            let (reasons, result) = finish(&mission);
+            result.unwrap();
+            assert_eq!(reasons.len(), 1);
+        }
+        let starts = std::fs::read_to_string(fixture.root.join("starts")).unwrap();
+        assert_eq!(
+            starts,
+            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-5-codex\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
+alpha|--model opus --print --verbose --output-format stream-json --setting-sources user --|Routed work\n"
+        );
+        let below = vec![agent_row("claude", "opus", "default", 50.0)];
+        let mission = Mission::launch(
+            profiles,
+            route(routing::Difficulty::Hard, None, below),
+            fixture.root.clone(),
+        );
+        let (reasons, result) = finish(&mission);
+        assert!(reasons.is_empty());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "No eligible model meets the hard floor 55; best published index is 50.0."
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
+            starts
+        );
+    }
+
+    #[test]
+    fn split_mission_sends_each_unit_once_in_sequence_to_allocated_profiles() {
+        let fixture = Fixture::new("split-mission", ROUTED_PROVIDER);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "big"),
+            fixture.profile(Provider::Claude, "latched"),
+            fixture.profile(Provider::Claude, "small"),
+        ];
+        let now = usage::now();
+        for (profile, status, used) in [
+            (&profiles[0], "allowed", 0.4),
+            (&profiles[1], "rejected", 0.1),
+            (&profiles[2], "allowed", 0.7),
+        ] {
+            Usage::observe_claude(
+                profile,
+                &json!({"type":"rate_limit_event","rate_limit_info":{
+                    "status":status,"resetsAt":now.wall + 3600,
+                    "unifiedWindows":{"five_hour":{"utilization":used,"resetsAt":now.wall + 3600}}
+                }}),
+                now,
+            )
+            .unwrap();
+        }
+        let request = routing::parse("/split unit a ;; unit b ;; unit c").unwrap();
+        let mission = Mission::launch(
+            profiles,
+            Route {
+                request,
+                preferred: None,
+                catalog: Catalog::default(),
+            },
+            fixture.root.clone(),
+        );
+        let (reasons, result) = finish(&mission);
+        result.unwrap();
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons[0].starts_with("Unit 1/3 → claude/big provider default"));
+        assert!(reasons[2].starts_with("Unit 3/3 → claude/small provider default"));
+        let starts = std::fs::read_to_string(fixture.root.join("starts")).unwrap();
+        let sent: Vec<_> = starts
+            .lines()
+            .map(|line| {
+                let mut fields = line.split('|');
+                (fields.next().unwrap(), fields.nth(1).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [("big", "unit a"), ("big", "unit b"), ("small", "unit c")]
+        );
+        let none = Mission::launch(
+            vec![fixture.profile(Provider::Claude, "latched")],
+            Route {
+                request: routing::parse("/split x ;; y").unwrap(),
+                preferred: None,
+                catalog: Catalog::default(),
+            },
+            fixture.root.clone(),
+        );
+        assert_eq!(
+            finish(&none).1.unwrap_err().to_string(),
+            "No eligible signed-in subscription profile. Skipped: claude/latched latched."
         );
     }
 }

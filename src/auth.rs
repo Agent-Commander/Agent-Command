@@ -18,9 +18,15 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
-    const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub(crate) const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
-    fn binary(self) -> &'static str {
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.binary() == name)
+    }
+
+    pub(crate) fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -107,6 +113,18 @@ pub(crate) fn root() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn private_state_directory(root: &Path, name: &str) -> io::Result<PathBuf> {
+    privacy::create(root)?;
+    let directory = root.join(name);
+    privacy::create(&directory)?;
+    Ok(directory)
+}
+
+pub(crate) fn existing_private_state(root: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+    let directory = root.join(name);
+    Ok(optional_private(&directory)?.then_some(directory))
+}
+
 fn optional_private(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
@@ -171,6 +189,11 @@ impl Profile {
         };
         profile.directory(true).unwrap();
         profile
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn usage_directory(&self) -> io::Result<PathBuf> {
@@ -332,10 +355,8 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let [action, provider, name, rest @ ..] = args else {
         return Err(invalid("Use agent-command auth --help"));
     };
-    let provider = Provider::ALL
-        .into_iter()
-        .find(|p| p.binary() == provider)
-        .ok_or_else(|| invalid("Provider must be claude or codex"))?;
+    let provider =
+        Provider::named(provider).ok_or_else(|| invalid("Provider must be claude or codex"))?;
     if !valid_name(name) {
         return Err(invalid("Use a profile name of 1–64 lowercase letters, digits, _ or -, starting with a letter or digit. Windows device names are reserved."));
     }

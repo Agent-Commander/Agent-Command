@@ -55,3 +55,22 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | Nested repository added after a valid claim | `reopened_claim_refuses_a_new_nested_repository` |
 | Terminal directory, FIFO, Unix socket, or device | `terminal_directory_is_not_a_missing_worktree_file`, `fifo_omitted_by_git_is_refused_by_path`, `unix_socket_omitted_by_git_is_refused_by_path`, `character_device_is_refused_by_path_before_open` |
 | Unreadable file, staged gitlink, or working symlink | `unreadable_regular_file_is_refused_by_path`, `staged_gitlink_is_refused_by_path`, `working_symlink_is_refused_by_path` |
+
+| Stage 3 catalog and routing | Executable check |
+|---|---|
+| Bundled snapshots are dated, sourced, and contain no unverified values | `bundled_snapshots_are_dated_sourced_and_carry_no_unverified_values` |
+| Per-endpoint SHA-256, scope, schema, version, range, unit and size checks fall back independently | `cache_integrity_falls_back_independently_per_endpoint` |
+| Refresh uses an injected fetcher, enforces the same HTTPS origin, pagination and version, redacts the key, and publishes only validated endpoints | `refresh_publishes_only_fully_validated_same_origin_pages` |
+| Without a key, `catalog refresh` refuses and `catalog show` reports bundled provenance | `catalog_entry_point_shows_bundled_provenance_and_refuses_refresh_without_key` |
+| Latched, exhausted, corrupt and sign-in-refused profiles are excluded; stale, unreported and past-reset readings are not | `routing_gate_excludes_latched_exhausted_corrupt_and_refused_profiles` |
+| Hard and standard floors never pick a below-floor or unscored model and give the reason | `difficulty_floor_never_selects_a_below_floor_or_unscored_model` |
+| Ordinary policy ranks by the minimum headroom-to-reset rate, with stable ties and unknown headroom last | `ordinary_policy_ranks_by_soonest_expiring_headroom_with_stable_ties` |
+| Urgent policy ranks the fastest same-unit measurement first, then headroom; input order does not matter | `urgent_policy_puts_fastest_same_unit_first_and_breaks_ties_by_headroom` |
+| Default policy prefers the comparable exact coding index | `default_policy_prefers_comparable_exact_coding_index` |
+| Split allocation by headroom, ties and unknown headroom | `split_units_spread_by_headroom_without_ineligible_or_repeated_profiles` |
+| Split directives require explicit units | `split_requests_need_explicit_independent_units` |
+| Split units run once each, in order, with no concurrent workspace writer and no ineligible profile | `split_mission_sends_each_unit_once_in_sequence_to_allocated_profiles` |
+| Native Claude/Codex arguments carry the routed model and effort; a floor miss starts nothing | `routed_dispatch_passes_selected_model_and_effort_to_native_cli`, `configurations_produce_native_execution_arguments` |
+| Override persistence, rotation and fallback reasons | `override_persists_and_falls_back_with_visible_reason` |
+| The override survives reopening, and the latch fallback and read-error reasons are visible with keyboard at 80×24 and mouse at 120×40 | `override_persists_across_reopen_and_shows_fallback_reason_with_keyboard_and_mouse` |
+| Real terminal: Auto, then the override with F2 at 80×24, persisted across a new process, then mouse cycling at 120×40 | `sh tests/terminal_full_profile.sh` |
