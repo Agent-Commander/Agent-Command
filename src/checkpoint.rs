@@ -34,11 +34,34 @@ enum Status {
     Abandoned,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Handoff {
+    #[default]
+    SameProvider,
+    CrossProvider,
+    AfterReset,
+}
+
+impl Handoff {
+    pub(crate) fn permits(self, interrupted: &Profile, alternate: &Profile) -> bool {
+        let same_profile = interrupted.to_string() == alternate.to_string();
+        let same_provider = interrupted.provider == alternate.provider;
+        match self {
+            Self::SameProvider => same_provider && !same_profile,
+            Self::CrossProvider => !same_provider,
+            Self::AfterReset => same_profile,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Claim {
     status: Status,
     checkpoint: Checkpoint,
     pub(crate) alternate: String,
+    #[serde(default)]
+    pub(crate) handoff: Handoff,
 }
 
 #[derive(Serialize)]
@@ -83,16 +106,26 @@ impl Checkpoint {
         Ok(checkpoint)
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn reserve(
         &self,
         profile: &Profile,
         workspace: &Path,
         alternate: &Profile,
     ) -> io::Result<Claim> {
+        self.reserve_handoff(profile, workspace, alternate, Handoff::SameProvider)
+    }
+
+    pub(crate) fn reserve_handoff(
+        &self,
+        profile: &Profile,
+        workspace: &Path,
+        alternate: &Profile,
+        handoff: Handoff,
+    ) -> io::Result<Claim> {
         if self.version != 2
             || self.interrupted_profile != profile.to_string()
-            || profile.provider != alternate.provider
-            || self.interrupted_profile == alternate.to_string()
+            || !handoff.permits(profile, alternate)
         {
             return Err(io::Error::other(
                 "Checkpoint does not match this continuation",
@@ -109,6 +142,7 @@ impl Checkpoint {
             status: Status::Claimed,
             checkpoint: self.clone(),
             alternate: alternate.to_string(),
+            handoff,
         };
         write_new(&path, &claim)?;
         Ok(claim)
@@ -203,7 +237,10 @@ Original task:
             .open(path.with_extension("lock"))?;
         lock.lock()?;
         let mut current: Self = serde_json::from_slice(&fs::read(&path)?)?;
-        if current.checkpoint.claim_path(profile)? != path || current.alternate != self.alternate {
+        if current.checkpoint.claim_path(profile)? != path
+            || current.alternate != self.alternate
+            || current.handoff != self.handoff
+        {
             return Err(io::Error::other(
                 "Continuation claim does not match the reserved checkpoint",
             ));
@@ -220,6 +257,44 @@ Original task:
         fs::rename(temporary, &path)?;
         sync_parent(&path)
     }
+}
+
+pub(crate) const DIRECTORY: &str = "agent-command-checkpoints-v1";
+
+#[derive(Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct Census {
+    pub(crate) checkpoints: usize,
+    pub(crate) claimed: usize,
+    pub(crate) launched: usize,
+    pub(crate) abandoned: usize,
+    pub(crate) unreadable: usize,
+}
+
+pub(crate) fn census(profile_root: &Path) -> io::Result<Census> {
+    let mut census = Census::default();
+    let entries = match fs::read_dir(profile_root.join(DIRECTORY)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(census),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") => census.checkpoints += 1,
+            Some("claim") => match fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Claim>(&bytes).ok())
+                .map(|claim| claim.status)
+            {
+                Some(Status::Claimed) => census.claimed += 1,
+                Some(Status::Launched) => census.launched += 1,
+                Some(Status::Abandoned) => census.abandoned += 1,
+                None => census.unreadable += 1,
+            },
+            _ => {}
+        }
+    }
+    Ok(census)
 }
 
 fn workspace_id(workspace: &Path) -> io::Result<[u8; 32]> {
@@ -832,6 +907,58 @@ mod tests {
         )
         .unwrap();
         nested
+    }
+
+    #[test]
+    fn handoff_scope_fences_each_continuation_kind_and_survives_reopen() {
+        let (fixture, workspace, profiles) =
+            crate::mission::tests::limit_fixture("handoff-scope", crate::usage::now());
+        let codex = fixture.profile(crate::auth::Provider::Codex, "backup");
+        let save = || {
+            Checkpoint::save(
+                &profiles[0],
+                Uuid::new_v4(),
+                &workspace,
+                Progress::default(),
+            )
+            .unwrap()
+        };
+        let refused = |checkpoint: &Checkpoint, alternate: &Profile, handoff: Handoff| {
+            checkpoint
+                .reserve_handoff(&profiles[0], &workspace, alternate, handoff)
+                .unwrap_err()
+                .to_string()
+        };
+        let checkpoint = save();
+        for (alternate, handoff) in [
+            (&codex, Handoff::SameProvider),
+            (&profiles[0], Handoff::SameProvider),
+            (&profiles[1], Handoff::CrossProvider),
+            (&profiles[0], Handoff::CrossProvider),
+            (&profiles[1], Handoff::AfterReset),
+            (&codex, Handoff::AfterReset),
+        ] {
+            assert!(refused(&checkpoint, alternate, handoff).contains("does not match"));
+        }
+        let cross = checkpoint
+            .reserve_handoff(&profiles[0], &workspace, &codex, Handoff::CrossProvider)
+            .unwrap();
+        assert_eq!(cross.handoff, Handoff::CrossProvider);
+        assert!(refused(&checkpoint, &codex, Handoff::CrossProvider).contains("already claimed"));
+        let (index, reopened) = Claim::pending(&profiles, &workspace).unwrap().unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(reopened.handoff, Handoff::CrossProvider);
+        assert_eq!(reopened.alternate, "codex/backup");
+        reopened.abandon(&profiles[0]).unwrap();
+        let after_reset = save()
+            .reserve_handoff(&profiles[0], &workspace, &profiles[0], Handoff::AfterReset)
+            .unwrap();
+        fs::write(workspace.join("completed"), "mutated during snooze\n").unwrap();
+        assert!(after_reset
+            .start(&profiles[0], &workspace, "Fixture continuation")
+            .unwrap_err()
+            .to_string()
+            .contains("Workspace changed since the interruption"));
     }
 
     #[test]

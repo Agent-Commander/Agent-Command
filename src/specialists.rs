@@ -38,6 +38,7 @@ pub enum Status {
     NeedsApproval,
     Done,
     Error,
+    Snoozed,
 }
 
 impl Status {
@@ -48,6 +49,7 @@ impl Status {
             Self::NeedsApproval => "NEEDS_APPROVAL",
             Self::Done => "DONE",
             Self::Error => "ERROR",
+            Self::Snoozed => "SNOOZED",
         }
     }
 
@@ -58,6 +60,7 @@ impl Status {
             Self::NeedsApproval => "needs approval",
             Self::Done => "done",
             Self::Error => "error",
+            Self::Snoozed => "snoozed",
         }
     }
 
@@ -68,7 +71,7 @@ impl Status {
     fn inbox_rank(self) -> u8 {
         match self {
             Self::NeedsApproval | Self::Error => 0,
-            Self::Running => 1,
+            Self::Running | Self::Snoozed => 1,
             Self::Done => 2,
             Self::Idle => 3,
         }
@@ -675,6 +678,13 @@ pub(crate) enum Command {
     SettledDrawer,
     Settings,
     Connect,
+    Side {
+        question: String,
+    },
+    Goal {
+        criteria: String,
+    },
+    GoalCancel,
     Message(String),
 }
 
@@ -686,6 +696,8 @@ const NEXT_REVISION_FLAG: &str = "--next-revision";
 const ASK_USAGE: &str = "Usage: /ask NAME TASK";
 const REMOVE_USAGE: &str = "Usage: /remove NAME";
 const ENTRY_USAGE: &str = "Usage: /entry PROVIDER/PROFILE or /entry auto";
+const SIDE_USAGE: &str = "Usage: /btw QUESTION (alias /side QUESTION)";
+const GOAL_USAGE: &str = "Usage: /goal CRITERIA or /goal cancel";
 const DIFF_USAGE: &str = "Usage: /diff [NAME]";
 const PR_USAGE: &str = "Usage: /pr [NAME] [--commit]";
 const SETTLE_USAGE: &str = "Usage: /settle NAME or /unsettle NAME";
@@ -796,6 +808,17 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
         "/roster" => Ok(Command::Roster),
         "/settings" => Ok(Command::Settings),
         "/connect" => Ok(Command::Connect),
+        "/btw" | "/side" if !rest.is_empty() => Ok(Command::Side {
+            question: rest.into(),
+        }),
+        "/btw" | "/side" => Err(SIDE_USAGE.into()),
+        "/goal" => match rest {
+            "" => Err(GOAL_USAGE.into()),
+            "cancel" | "stop" => Ok(Command::GoalCancel),
+            criteria => Ok(Command::Goal {
+                criteria: criteria.into(),
+            }),
+        },
         "/remove" => match next_word(rest) {
             Some((name, "")) => Ok(Command::Remove { name: name.into() }),
             _ => Err(REMOVE_USAGE.into()),
@@ -1311,6 +1334,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn side_and_goal_commands_parse_with_aliases_and_usage() {
+        for input in ["/btw what changed?", "/side   what changed?"] {
+            assert_eq!(
+                parse_command(input).unwrap(),
+                Command::Side {
+                    question: "what changed?".into()
+                }
+            );
+        }
+        assert_eq!(parse_command("/btw").unwrap_err(), SIDE_USAGE);
+        assert_eq!(parse_command("/side  ").unwrap_err(), SIDE_USAGE);
+        assert_eq!(
+            parse_command("/goal all tests pass").unwrap(),
+            Command::Goal {
+                criteria: "all tests pass".into()
+            }
+        );
+        assert_eq!(parse_command("/goal cancel").unwrap(), Command::GoalCancel);
+        assert_eq!(parse_command("/goal stop").unwrap(), Command::GoalCancel);
+        assert_eq!(parse_command("/goal").unwrap_err(), GOAL_USAGE);
+        assert_eq!(Status::Snoozed.label(), "SNOOZED");
+    }
+
+    #[test]
     fn spawn_takes_an_optional_mode_and_review_takes_focus_and_next_revision() {
         assert_eq!(
             parse_command("/spawn bolt builder --mode worktree-auto Ship @codex it").unwrap(),
@@ -1684,6 +1731,7 @@ pub(crate) mod tests {
             ("idle", Status::Idle, false, 9),
             ("done-old", Status::Done, false, 1),
             ("running", Status::Running, false, 2),
+            ("snoozed", Status::Snoozed, false, 5),
             ("approval", Status::NeedsApproval, false, 3),
             ("done-new", Status::Done, false, 7),
             ("broken", Status::Error, false, 8),
@@ -1696,6 +1744,7 @@ pub(crate) mod tests {
                 "Commander",
                 "broken",
                 "approval",
+                "snoozed",
                 "running",
                 "done-new",
                 "done-old",
@@ -1704,7 +1753,7 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(
-            names(&crew, &inbox_rows(&crew, true))[7..],
+            names(&crew, &inbox_rows(&crew, true))[8..],
             ["settled:2:true", "archived", "shelved"]
         );
         let plain = crew_with(&[("solo", Status::Idle, false, 0)]);

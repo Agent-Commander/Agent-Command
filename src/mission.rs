@@ -1,7 +1,7 @@
 use crate::{
     auth::{Profile, Provider},
     catalog::Catalog,
-    checkpoint::{Checkpoint, Claim, Progress},
+    checkpoint::{Checkpoint, Claim, Handoff, Progress},
     native::Pins,
     permissions::{self, PermissionMode},
     routing::{self, Candidate, Configuration, Request},
@@ -22,6 +22,10 @@ use std::{
     time::Duration,
 };
 
+const SNOOZE_POLL: Duration = Duration::from_millis(200);
+const NO_ALTERNATE: &str =
+    "Usage limit reached; mission stopped without replay. No eligible signed-in alternate.";
+
 pub(crate) enum Event {
     Running {
         profile: usize,
@@ -31,6 +35,10 @@ pub(crate) enum Event {
     Continuing {
         from: usize,
         to: usize,
+    },
+    Snoozed {
+        profile: usize,
+        until: i64,
     },
     Finished(io::Result<()>),
 }
@@ -46,11 +54,18 @@ impl Drop for Mission {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LimitPolicy {
+    pub(crate) auto_resume_on_reset: bool,
+    pub(crate) fallback_profile: Option<String>,
+}
+
 pub(crate) struct Route {
     pub(crate) request: Request,
     pub(crate) preferred: Option<String>,
     pub(crate) catalog: Catalog,
     pub(crate) pins: Pins,
+    pub(crate) limits: LimitPolicy,
     pub(crate) target: Option<Target>,
     pub(crate) mode: PermissionMode,
 }
@@ -66,6 +81,7 @@ impl Route {
             preferred,
             catalog: Catalog::default(),
             pins: Pins::default(),
+            limits: LimitPolicy::default(),
             target: None,
             mode: PermissionMode::Supervised,
         }
@@ -88,6 +104,7 @@ impl Mission {
                 profiles,
                 workspace,
                 clock,
+                limits: route.limits.clone(),
                 mode: route.mode,
             },
             Work::Routed(route),
@@ -106,6 +123,7 @@ impl Mission {
                 profiles,
                 workspace,
                 clock: usage::now,
+                limits: LimitPolicy::default(),
                 mode: PermissionMode::Supervised,
             },
             Work::Resume {
@@ -148,6 +166,7 @@ struct Execution {
     profiles: Vec<Profile>,
     workspace: PathBuf,
     clock: fn() -> usage::Tick,
+    limits: LimitPolicy,
     mode: PermissionMode,
 }
 
@@ -284,23 +303,105 @@ impl Execution {
                     "Usage limit reached; mission stopped without replay. {error}"
                 ))
             })?;
-        let (to, next) = self.alternate(index).ok_or_else(|| {
-            io::Error::other(
-            "Usage limit reached; mission stopped without replay. No eligible signed-in alternate."
-        )
-        })?;
+        let Some((to, next, handoff)) = self.handoff_target(index) else {
+            return self.snooze_until_reset(
+                (index, &checkpoint),
+                &candidate.configuration,
+                prompt,
+                sender,
+                cancel,
+            );
+        };
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let claim = checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
+        let claim =
+            checkpoint.reserve_handoff(profile, &self.workspace, &self.profiles[to], handoff)?;
+        let configuration = match handoff {
+            Handoff::CrossProvider => Configuration::provider_default(self.profiles[to].provider),
+            Handoff::SameProvider | Handoff::AfterReset => candidate.configuration.clone(),
+        };
         self.continue_with(
             (index, to, next),
-            &candidate.configuration,
+            &configuration,
             prompt,
             &claim,
             sender,
             cancel,
         )
+    }
+
+    fn handoff_target(&self, index: usize) -> Option<(usize, std::process::Command, Handoff)> {
+        if let Some((to, command)) = self.alternate(index) {
+            return Some((to, command, Handoff::SameProvider));
+        }
+        let to = usage::cross_provider_fallback(
+            &self.profiles,
+            index,
+            self.limits.fallback_profile.as_deref(),
+            (self.clock)(),
+        )?;
+        let command = self.profiles[to].authenticated_command().ok()?;
+        Some((to, command, Handoff::CrossProvider))
+    }
+
+    fn snooze_until_reset(
+        &self,
+        interrupted: (usize, &Checkpoint),
+        configuration: &Configuration,
+        prompt: &str,
+        sender: &SyncSender<Event>,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        let (index, checkpoint) = interrupted;
+        if !self.limits.auto_resume_on_reset {
+            return Err(io::Error::other(NO_ALTERNATE));
+        }
+        let profile = &self.profiles[index];
+        let until = Usage::read(profile)?
+            .known_reset((self.clock)())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{NO_ALTERNATE} Reset time is unknown, so auto-resume stopped safely."
+                ))
+            })?;
+        let claim =
+            checkpoint.reserve_handoff(profile, &self.workspace, profile, Handoff::AfterReset)?;
+        let _ = sender.send(Event::Snoozed {
+            profile: index,
+            until,
+        });
+        if !self.wait_for_reset(profile, cancel)? {
+            return Ok(());
+        }
+        let command = profile.authenticated_command()?;
+        self.continue_with(
+            (index, index, command),
+            configuration,
+            prompt,
+            &claim,
+            sender,
+            cancel,
+        )
+    }
+
+    fn wait_for_reset(&self, profile: &Profile, cancel: &AtomicBool) -> io::Result<bool> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let now = (self.clock)();
+            let usage = Usage::read(profile)?;
+            if usage.eligible_alternate(now) {
+                return Ok(true);
+            }
+            if usage.blocked(now) && usage.known_reset(now).is_none() {
+                return Err(io::Error::other(
+                    "Reset time became unknown while snoozed; auto-resume stopped safely.",
+                ));
+            }
+            thread::sleep(SNOOZE_POLL);
+        }
     }
 
     fn resume(
@@ -315,10 +416,9 @@ impl Execution {
             .profiles
             .iter()
             .enumerate()
-            .find(|(to, profile)| {
-                *to != index
-                    && profile.provider == self.profiles[index].provider
-                    && profile.to_string() == claim.alternate
+            .find(|(_, profile)| {
+                profile.to_string() == claim.alternate
+                    && claim.handoff.permits(&self.profiles[index], profile)
             })
             .ok_or_else(|| io::Error::other("Claimed alternate profile is unavailable"))?;
         if !Usage::read(profile)?.eligible_alternate((self.clock)()) {
@@ -507,7 +607,7 @@ pub(crate) fn restrict(
     Ok(ranked)
 }
 
-fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
+pub(crate) fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
     match (provider, event["type"].as_str()) {
         (Provider::Claude, Some("assistant")) => event["message"]["content"]
             .as_array()
@@ -783,6 +883,283 @@ printf 'continued\n' >> completed
             std::fs::read_to_string(workspace.join("completed")).unwrap(),
             "done\ncontinued\n"
         );
+    }
+
+    const SNOOZE_SCRIPT: &str = r#"
+home=${CLAUDE_CONFIG_DIR:-$CODEX_HOME}
+profile=${home##*/}
+work="${home%/profiles/*}/work"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+for arg; do
+    if test "$arg" = login; then
+        printf 'Logged in using ChatGPT\n'
+        exit
+    fi
+done
+printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
+prompt=$(cat)
+if ! test -f "$work/.git/limited"; then
+    : > "$work/.git/limited"
+    printf 'done\n' >> completed
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Started"}]}}'
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"%s}}\n' "$(cat "$work/.git/reset" 2>/dev/null)"
+    exit 1
+fi
+case "$prompt" in *"Retained workspace manifest:"*"Keep the finished step"*) ;; *) exit 9 ;; esac
+printf '%s\n' "$profile" >> "$work/.git/resumed-by"
+if test -n "$CODEX_HOME"; then
+    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Codex resumed"}}' '{"type":"turn.completed"}'
+fi
+"#;
+
+    fn snooze_fixture(
+        name: &str,
+        reset: Option<i64>,
+        names: &[(Provider, &str)],
+    ) -> (Fixture, PathBuf, Vec<Profile>) {
+        let fixture = Fixture::new(name, SNOOZE_SCRIPT);
+        let workspace = git_workspace(&fixture);
+        if let Some(reset) = reset {
+            std::fs::write(
+                workspace.join(".git/reset"),
+                format!(",\"resetsAt\":{reset}"),
+            )
+            .unwrap();
+        }
+        let profiles = names
+            .iter()
+            .map(|(provider, name)| fixture.profile(*provider, name))
+            .collect();
+        (fixture, workspace, profiles)
+    }
+
+    fn limited_route(profiles: &[Profile], limits: LimitPolicy) -> Route {
+        Route {
+            limits,
+            ..prefer(profiles, "Keep the finished step")
+        }
+    }
+
+    fn auto_resume() -> LimitPolicy {
+        LimitPolicy {
+            auto_resume_on_reset: true,
+            fallback_profile: None,
+        }
+    }
+
+    fn until_snoozed(mission: &Mission) -> (usize, i64) {
+        loop {
+            match mission.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Snoozed { profile, until } => return (profile, until),
+                Event::Finished(result) => panic!("finished before snoozing: {result:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn resumed_by(workspace: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(workspace.join(".git/resumed-by")).ok()
+    }
+
+    fn claims(profiles: &[Profile]) -> crate::checkpoint::Census {
+        crate::checkpoint::census(profiles[0].root()).unwrap()
+    }
+
+    #[test]
+    fn snoozes_before_reset_and_resumes_once_after_the_fake_clock_passes_it() {
+        static NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(FAKE_NOW);
+        fn clock() -> usage::Tick {
+            let wall = NOW.load(Ordering::SeqCst);
+            usage::tick(wall, (wall - FAKE_NOW) as u64)
+        }
+        let (_fixture, workspace, profiles) = snooze_fixture(
+            "snooze-resume",
+            Some(FAKE_NOW + 60),
+            &[(Provider::Claude, "solo"), (Provider::Codex, "backup")],
+        );
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            limited_route(&profiles, auto_resume()),
+            workspace.clone(),
+            clock,
+        );
+        assert_eq!(until_snoozed(&mission), (0, FAKE_NOW + 60));
+        thread::sleep(SNOOZE_POLL * 3);
+        assert!(matches!(
+            mission.events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(resumed_by(&workspace), None);
+        assert_eq!(claims(&profiles).claimed, 1);
+        NOW.store(FAKE_NOW + 61, Ordering::SeqCst);
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert_eq!(links, [(0, 0)]);
+        assert_eq!(resumed_by(&workspace).as_deref(), Some("solo\n"));
+        let census = claims(&profiles);
+        assert_eq!((census.checkpoints, census.launched), (1, 1));
+    }
+
+    #[test]
+    fn workspace_mutated_during_snooze_refuses_to_resume() {
+        static NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(FAKE_NOW);
+        fn clock() -> usage::Tick {
+            let wall = NOW.load(Ordering::SeqCst);
+            usage::tick(wall, (wall - FAKE_NOW) as u64)
+        }
+        let (_fixture, workspace, profiles) = snooze_fixture(
+            "snooze-mutated",
+            Some(FAKE_NOW + 60),
+            &[(Provider::Claude, "solo")],
+        );
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            limited_route(&profiles, auto_resume()),
+            workspace.clone(),
+            clock,
+        );
+        until_snoozed(&mission);
+        std::fs::write(workspace.join("completed"), "edited while snoozed\n").unwrap();
+        NOW.store(FAKE_NOW + 61, Ordering::SeqCst);
+        let (links, result) = drain(&mission);
+        assert!(links.is_empty());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Workspace changed since the interruption"));
+        assert_eq!(resumed_by(&workspace), None);
+        assert_eq!(claims(&profiles).launched, 0);
+    }
+
+    #[test]
+    fn unknown_reset_or_disabled_auto_resume_stops_without_snoozing() {
+        for (case, reset, limits, expected) in [
+            (
+                "unknown",
+                None,
+                auto_resume(),
+                "Reset time is unknown, so auto-resume stopped safely.",
+            ),
+            (
+                "disabled",
+                Some(FAKE_NOW + 60),
+                LimitPolicy::default(),
+                NO_ALTERNATE,
+            ),
+        ] {
+            let (_fixture, workspace, profiles) = snooze_fixture(
+                &format!("snooze-{case}"),
+                reset,
+                &[(Provider::Claude, "solo")],
+            );
+            let mission = Mission::launch_with_clock(
+                profiles.clone(),
+                limited_route(&profiles, limits),
+                workspace.clone(),
+                || usage::tick(FAKE_NOW, 0),
+            );
+            let mut snoozed = false;
+            let result = loop {
+                match mission.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Event::Snoozed { .. } => snoozed = true,
+                    Event::Finished(result) => break result,
+                    _ => {}
+                }
+            };
+            assert!(!snoozed, "{case}");
+            assert!(
+                result.unwrap_err().to_string().ends_with(expected),
+                "{case}"
+            );
+            assert_eq!(resumed_by(&workspace), None);
+            assert_eq!(claims(&profiles).claimed, 0);
+        }
+    }
+
+    #[test]
+    fn a_reopened_snooze_claim_resumes_after_reset_in_a_new_process() {
+        static NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(FAKE_NOW);
+        fn clock() -> usage::Tick {
+            let wall = NOW.load(Ordering::SeqCst);
+            usage::tick(wall, (wall - FAKE_NOW) as u64)
+        }
+        let (_fixture, workspace, profiles) = snooze_fixture(
+            "snooze-reopen",
+            Some(FAKE_NOW + 60),
+            &[(Provider::Claude, "solo")],
+        );
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            limited_route(&profiles, auto_resume()),
+            workspace.clone(),
+            clock,
+        );
+        until_snoozed(&mission);
+        drop(mission);
+        let (index, claim) = Claim::pending(&profiles, &workspace).unwrap().unwrap();
+        assert_eq!((index, claim.handoff), (0, Handoff::AfterReset));
+        let resumed = Mission::resume(
+            profiles.clone(),
+            index,
+            workspace.clone(),
+            "Keep the finished step".into(),
+            claim,
+        );
+        let (links, result) = drain(&resumed);
+        result.unwrap();
+        assert_eq!(links, [(0, 0)]);
+        assert_eq!(resumed_by(&workspace).as_deref(), Some("solo\n"));
+    }
+
+    #[test]
+    fn cross_provider_fallback_continues_only_when_no_same_provider_alternate_exists() {
+        let fallback = LimitPolicy {
+            auto_resume_on_reset: false,
+            fallback_profile: Some("codex/backup".into()),
+        };
+        let (_fixture, workspace, profiles) = snooze_fixture(
+            "cross-provider",
+            Some(4_102_444_800),
+            &[(Provider::Claude, "solo"), (Provider::Codex, "backup")],
+        );
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            limited_route(&profiles, fallback.clone()),
+            workspace.clone(),
+            || usage::tick(FAKE_NOW, 0),
+        );
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert_eq!(links, [(0, 1)]);
+        assert_eq!(resumed_by(&workspace).as_deref(), Some("backup\n"));
+        let arguments = std::fs::read_to_string(workspace.join(".git/arguments")).unwrap();
+        let codex = arguments
+            .lines()
+            .find(|line| line.starts_with("backup "))
+            .unwrap();
+        assert!(codex.contains("exec --json") && !codex.contains("--model"));
+        let (_fixture, workspace, profiles) = snooze_fixture(
+            "cross-provider-sibling",
+            Some(4_102_444_800),
+            &[
+                (Provider::Claude, "solo"),
+                (Provider::Codex, "backup"),
+                (Provider::Claude, "sibling"),
+            ],
+        );
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            limited_route(&profiles, fallback),
+            workspace.clone(),
+            || usage::tick(FAKE_NOW, 0),
+        );
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert_eq!(links, [(0, 2)]);
+        assert_eq!(resumed_by(&workspace).as_deref(), Some("sibling\n"));
     }
 
     #[test]
@@ -1237,6 +1614,7 @@ rmdir running.lock
             preferred: preferred.map(str::to_owned),
             catalog: synthetic_catalog(rows, contrary_agent_rows()),
             pins: pins(),
+            limits: LimitPolicy::default(),
             target: None,
             mode: PermissionMode::Supervised,
         };
@@ -1307,6 +1685,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 contrary_agent_rows(),
             ),
             pins: pins(),
+            limits: LimitPolicy::default(),
             target: crate::targeting::extract(target).unwrap().target,
             mode: PermissionMode::ReadOnly,
         };
@@ -1355,6 +1734,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 contrary_agent_rows(),
             ),
             pins: pins(),
+            limits: LimitPolicy::default(),
             target: None,
             mode: PermissionMode::Supervised,
         };
@@ -1403,6 +1783,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 preferred: None,
                 catalog: Catalog::default(),
                 pins: Pins::default(),
+                limits: LimitPolicy::default(),
                 target: None,
                 mode: PermissionMode::Supervised,
             },
@@ -1432,6 +1813,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 preferred: None,
                 catalog: Catalog::default(),
                 pins: Pins::default(),
+                limits: LimitPolicy::default(),
                 target: None,
                 mode: PermissionMode::Supervised,
             },

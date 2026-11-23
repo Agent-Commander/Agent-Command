@@ -128,6 +128,7 @@ impl NativeEngine {
             pins,
             target: None,
             mode,
+            limits: mission::LimitPolicy::default(),
         })
     }
 }
@@ -566,6 +567,10 @@ impl Control {
                 Ok(mission::Event::Continuing { .. }) => {
                     self.record_named(name, "SYSTEM  Continuing on another profile".into())
                 }
+                Ok(mission::Event::Snoozed { until, .. }) => self.record_named(
+                    name,
+                    format!("SYSTEM  Snoozed until the limit resets at epoch {until}"),
+                ),
                 Ok(mission::Event::Running { reason: None, .. }) => {}
                 Ok(mission::Event::Finished(result)) => break Outcome::Finished(result),
                 Err(RecvTimeoutError::Timeout) => {}

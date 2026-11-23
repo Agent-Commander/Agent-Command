@@ -126,6 +126,10 @@ pub(crate) enum Action {
     ConnectNew,
     CommanderProfile,
     UpdateCheck,
+    AutoResume,
+    SnoozeMissions,
+    FallbackProfile,
+    TextGenProfile,
     Close,
     Toggle(Provider),
     Name,
@@ -493,6 +497,10 @@ impl App {
                     Action::ConnectNew,
                     Action::CommanderProfile,
                     Action::UpdateCheck,
+                    Action::AutoResume,
+                    Action::SnoozeMissions,
+                    Action::FallbackProfile,
+                    Action::TextGenProfile,
                     Action::Close,
                 ]);
                 actions
@@ -652,6 +660,32 @@ impl App {
                 self.set_panel_status(notice);
             }
             Action::UpdateCheck => self.toggle_update_check(),
+            Action::AutoResume => {
+                self.settings.auto_resume_on_reset = !self.settings.auto_resume_on_reset;
+                let state = on_off(self.settings.auto_resume_on_reset);
+                self.save_setting(format!("Resume after usage limits: {state}"));
+            }
+            Action::SnoozeMissions => {
+                self.settings.snooze_limited_missions = !self.settings.snooze_limited_missions;
+                let state = on_off(self.settings.snooze_limited_missions);
+                self.save_setting(format!("Snooze limited missions: {state}"));
+            }
+            Action::FallbackProfile => {
+                self.settings.fallback_profile = settings::next_profile_slot(
+                    self.settings.fallback_profile.as_deref(),
+                    &self.profile_labels(),
+                );
+                let label = self.slot_label(self.settings.fallback_profile.as_deref());
+                self.save_setting(format!("Cross-provider fallback: {label}"));
+            }
+            Action::TextGenProfile => {
+                self.settings.text_gen_profile = settings::next_profile_slot(
+                    self.settings.text_gen_profile.as_deref(),
+                    &self.profile_labels(),
+                );
+                let label = self.slot_label(self.settings.text_gen_profile.as_deref());
+                self.save_setting(format!("Text generation profile: {label}"));
+            }
             Action::Close => self.panel = None,
             Action::Toggle(provider) => self.toggle_provider(provider),
             Action::Name => {}
@@ -959,16 +993,61 @@ impl App {
     fn toggle_update_check(&mut self) {
         self.settings.check_for_updates = !self.settings.check_for_updates;
         let state = on_off(self.settings.check_for_updates);
+        self.save_setting(format!("Check for updates on launch: {state}"));
+    }
+
+    fn save_setting(&mut self, change: String) {
         let status = match &self.launch.settings_path {
             Some(path) => match self.settings.save(path) {
-                Ok(()) => format!("Check for updates on launch: {state} (saved)."),
+                Ok(()) => format!("{change} (saved)."),
                 Err(error) => format!("Setting not saved: {error}"),
             },
-            None => {
-                format!("Check for updates on launch: {state} (no config directory; not saved).")
-            }
+            None => format!("{change} (no config directory; not saved)."),
         };
         self.set_panel_status(status);
+    }
+
+    fn profile_labels(&self) -> Vec<String> {
+        self.live.as_ref().map_or_else(Vec::new, |live| {
+            live.profiles.iter().map(ToString::to_string).collect()
+        })
+    }
+
+    fn slot_label(&self, slot: Option<&str>) -> String {
+        settings::slot_label(slot, &self.profile_labels())
+    }
+
+    fn limit_rows(&self) -> Vec<Row> {
+        vec![
+            vec![
+                text("Resume after limits  ", Tone::Plain),
+                button(
+                    on_off(self.settings.auto_resume_on_reset),
+                    Action::AutoResume,
+                ),
+            ],
+            vec![
+                text("Snooze limited       ", Tone::Plain),
+                button(
+                    on_off(self.settings.snooze_limited_missions),
+                    Action::SnoozeMissions,
+                ),
+            ],
+            vec![
+                text("Fallback profile     ", Tone::Plain),
+                button(
+                    self.slot_label(self.settings.fallback_profile.as_deref()),
+                    Action::FallbackProfile,
+                ),
+            ],
+            vec![
+                text("Text-gen profile     ", Tone::Plain),
+                button(
+                    self.slot_label(self.settings.text_gen_profile.as_deref()),
+                    Action::TextGenProfile,
+                ),
+            ],
+        ]
     }
 
     fn settings_rows(&self, view: &SettingsView, width: usize) -> Vec<Row> {
@@ -1060,6 +1139,7 @@ impl App {
             ));
         }
         rows.push(updates);
+        rows.extend(self.limit_rows());
         rows.push(vec![]);
         rows.push(vec![text(
             format!("Version   {}", update::CURRENT),
