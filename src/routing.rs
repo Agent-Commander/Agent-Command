@@ -1029,17 +1029,28 @@ exit 3
                 41.0,
             ),
             agent_only("claude/agent", 99.0),
+            candidate(
+                "claude/intelligence",
+                3,
+                Some((Metric::Intelligence, 90.0)),
+                None,
+                Some(9.0),
+            ),
         ];
         assert_eq!(ranking_metric(&candidates), Some(Metric::Coding));
         let hard = rank(candidates.clone(), Policy::Default, Difficulty::Hard).unwrap();
         assert_eq!(order(&hard), ["claude/coding"]);
         assert!(describe(&hard[0]).contains("· AA coding index 70.0 ·"));
         let any = rank(candidates, Policy::Default, Difficulty::Any).unwrap();
-        assert_eq!(order(&any), ["claude/coding", "claude/agent"]);
+        assert_eq!(
+            order(&any),
+            ["claude/coding", "claude/agent", "claude/intelligence"]
+        );
         assert!(any
             .iter()
             .all(|candidate| candidate.metric == Some(Metric::Coding)));
         assert!(describe(&any[1]).contains("· AA coding index n/a ·"));
+        assert!(describe(&any[2]).contains("· AA coding index n/a ·"));
         assert!(any
             .iter()
             .all(|candidate| !describe(candidate).contains("agent index")));
