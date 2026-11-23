@@ -1,0 +1,32 @@
+{
+  "tier": "free",
+  "intelligence_index_version": 4,
+  "pagination": {"page": 1, "page_size": 3, "total_pages": 4, "has_more": true},
+  "data": [
+    {
+      "id": "fixture-model-1",
+      "name": "Synthetic fixture row",
+      "slug": "gpt-6-2-sol-high",
+      "model_creator": {"id": "fixture-creator-1", "name": "OpenAI"},
+      "evaluations": {"artificial_analysis_intelligence_index": 61.5, "artificial_analysis_coding_index": null, "artificial_analysis_agentic_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 88.25},
+      "performance": {"median_output_tokens_per_second": null}
+    },
+    {
+      "id": "fixture-model-2",
+      "name": "Synthetic fixture row",
+      "slug": "gpt-6-2-sol-medium",
+      "model_creator": {"id": "fixture-creator-2", "name": "Fixture Labs"},
+      "evaluations": {"artificial_analysis_intelligence_index": 98.0, "artificial_analysis_coding_index": 98.0},
+      "performance_v3": {"mean_output_tokens_per_second": 998.0}
+    },
+    {
+      "id": "fixture-model-3",
+      "name": "Synthetic fixture row",
+      "slug": "fixture-unlisted-model",
+      "model_creator": {"id": "fixture-creator-2", "name": "Fixture Labs"},
+      "evaluations": {"artificial_analysis_intelligence_index": 99.0},
+      "performance_v3": {"mean_output_tokens_per_second": 999.0}
+    }
+  ]
+}

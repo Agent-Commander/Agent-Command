@@ -1,0 +1,30 @@
+{
+  "tier": "free",
+  "intelligence_index_version": 4,
+  "pagination": {"page": 4, "page_size": 3, "total_pages": 4, "has_more": false},
+  "data": [
+    {
+      "id": "fixture-model-10",
+      "name": "Synthetic fixture row",
+      "slug": "gpt-6-2-sol-minimal",
+      "model_creator": {"id": "fixture-creator-1", "name": "OpenAI"},
+      "evaluations": {"artificial_analysis_intelligence_index": 95.0, "artificial_analysis_coding_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 995.0}
+    },
+    {
+      "id": "fixture-model-11",
+      "name": "Synthetic fixture row",
+      "slug": "gpt-reserve-preview",
+      "model_creator": {"id": "fixture-creator-1", "name": "OpenAI"},
+      "evaluations": {"artificial_analysis_intelligence_index": 94.0, "artificial_analysis_coding_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 994.0}
+    },
+    {
+      "id": "fixture-model-12",
+      "name": "Synthetic fixture row",
+      "slug": "codex-auto-review",
+      "evaluations": {"artificial_analysis_intelligence_index": 93.0},
+      "performance_v3": {"mean_output_tokens_per_second": 993.0}
+    }
+  ]
+}

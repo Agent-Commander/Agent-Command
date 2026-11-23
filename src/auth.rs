@@ -18,9 +18,15 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
-    const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub(crate) const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
-    fn binary(self) -> &'static str {
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.binary() == name)
+    }
+
+    pub(crate) fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -107,6 +113,18 @@ pub(crate) fn root() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn private_state_directory(root: &Path, name: &str) -> io::Result<PathBuf> {
+    privacy::create(root)?;
+    let directory = root.join(name);
+    privacy::create(&directory)?;
+    Ok(directory)
+}
+
+pub(crate) fn existing_private_state(root: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+    let directory = root.join(name);
+    Ok(optional_private(&directory)?.then_some(directory))
+}
+
 fn optional_private(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
@@ -153,14 +171,52 @@ fn inherited_provider_variable(key: &str) -> bool {
 impl Profile {
     #[cfg(all(test, unix))]
     pub(crate) fn fixture(root: &Path, provider: Provider, executable: PathBuf) -> Self {
+        Self::named_fixture(root, provider, "fixture", executable)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn named_fixture(
+        root: &Path,
+        provider: Provider,
+        name: &str,
+        executable: PathBuf,
+    ) -> Self {
         let profile = Self {
             provider,
-            name: "fixture".into(),
+            name: name.into(),
             root: root.into(),
             executable: Some(executable),
         };
         profile.directory(true).unwrap();
         profile
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn usage_directory(&self) -> io::Result<PathBuf> {
+        self.directory(false)?;
+        let usage = self.root.join("agent-command-usage-v1");
+        let provider = usage.join(self.provider.binary());
+        let profile = provider.join(&self.name);
+        for path in [&usage, &provider, &profile] {
+            privacy::create(path)?;
+        }
+        Ok(profile)
+    }
+
+    pub(crate) fn checkpoint_directory(&self) -> io::Result<PathBuf> {
+        self.directory(false)?;
+        let directory = self.root.join("agent-command-checkpoints-v1");
+        privacy::create(&directory)?;
+        Ok(directory)
+    }
+
+    pub(crate) fn isolated_command(&self) -> io::Result<(Command, PathBuf)> {
+        let directory = self.directory(false)?;
+        Ok((self.command(&directory), directory))
     }
 
     fn directory(&self, create: bool) -> io::Result<PathBuf> {
@@ -299,10 +355,8 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let [action, provider, name, rest @ ..] = args else {
         return Err(invalid("Use agent-command auth --help"));
     };
-    let provider = Provider::ALL
-        .into_iter()
-        .find(|p| p.binary() == provider)
-        .ok_or_else(|| invalid("Provider must be claude or codex"))?;
+    let provider =
+        Provider::named(provider).ok_or_else(|| invalid("Provider must be claude or codex"))?;
     if !valid_name(name) {
         return Err(invalid("Use a profile name of 1–64 lowercase letters, digits, _ or -, starting with a letter or digit. Windows device names are reserved."));
     }

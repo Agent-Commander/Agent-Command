@@ -97,8 +97,108 @@ an NTFS directory so Agent Command can enforce user-only access. The
 provider handles browser sign-in and manages its own session in that profile.
 Logout keeps the named profile directory and its settings.
 
-Open `agent-command` from the workspace where the mission should run. Press
-F2 or click the profile row to choose the provider and profile. Enter a
-mission and press Enter or click Send. The status and assistant output appear
+Open `agent-command` from the workspace where the mission should run. By
+default, missions use the highest-ranked eligible profile (Auto). Press F2 or
+click the profile row to cycle Auto and a saved override for each profile.
+Enter a mission and press Enter or click Send. The status and assistant output appear
 in the mission panel and ship's log. One mission runs at a time. Reopen the
 TUI after adding a profile in another terminal.
+
+### Subscription usage in the terminal
+
+Use F2 or click the profile row to inspect each profile. The usage rows show
+used and remaining percentages, time until reset, and observation age. Readings
+become stale after 15 monotonic minutes, at the window reset, after an app
+restart, or when a refreshed reading is unavailable. A wall-clock rollback
+cannot make a future-dated observation fresh.
+
+Agent Command reads Codex usage through its local app server. Readbacks for a
+profile start at least five monotonic minutes apart, even after a failure.
+A reopened app waits a full floor on discovering a previous probe. Probes
+are skipped during a known active latch. Claude readings come from the native CLI's
+structured mission stream when it reports a window. An unreported window is
+unavailable. Agent Command sends no synthetic Claude prompts to collect usage.
+
+A reported subscription limit latches the profile until the provider's reset
+time. When no reliable reset is available, the profile stays latched and shows
+“reset unknown.” After a reported past reset, the display asks for a new reading. Usage metadata lives in the private `agent-command-usage-v1`
+directory under the isolated profile root.
+
+For new missions, a latched preferred profile can be replaced by the first
+eligible signed-in profile from the same provider, ordered by name. Rotation
+and continuation skip profiles with an active latch, unreadable or corrupt
+usage state, or a reported window at or above 100% whose reset is still ahead.
+Unreported windows show as unavailable. Stale readings below 100% still allow
+selection. If the continuation is rejected for a usage limit, Agent Command
+latches that profile and stops.
+If the provider interrupts a mission with a usage limit, Agent Command creates
+a checkpoint for the root of a Git workspace. It checks the workspace again
+before launching one continuation on an eligible alternate. The terminal shows
+the source and destination profiles together with the reason. It stops if there
+is no eligible account, the workspace changed, or a continuation also hits a limit.
+
+A checkpoint stores a mission UUID, interrupted profile, progress counters,
+and a SHA-256 digest covering HEAD, index, and tracked and non-ignored working
+files. The continuation prompt adds a manifest of changed tracked paths,
+untracked paths, and separate SHA-256 hashes of the staged blob and working copy when present. The app does not store
+the task, transcript, file contents, or credentials in checkpoint state.
+The alternate receives instructions to inspect retained work and skip
+completed actions. The app cannot control the provider's decisions or verify
+effects outside the workspace. A nested Git repository, submodule, symlink, or unsupported or unreadable
+worktree entry stops continuation and identifies the path. This includes
+special files Git leaves out of its file listing. Non-Git workspaces also
+prevent continuation. Keep isolated profile state outside the worktree.
+
+If the app closes with a pending claim, reopen the same workspace. Re-enter the
+original task and select Send to resume on the claimed alternate, or use
+F4 or click Abandon. The app checks the retained workspace and the alternate's
+known limit windows before a user-driven resume. It does not automatically
+launch a continuation on startup.
+
+The private `agent-command-checkpoints-v1` directory tracks claimed, launched,
+and abandoned continuations. A launched or abandoned claim cannot be resumed.
+The launch is fenced durably immediately before dispatch. If the app exits
+at that boundary, it rejects a repeat rather than risk starting two processes.
+Pending claims from the previous Stage 2 revision can be abandoned. Their old digest cannot authorize a launch under the current snapshot format.
+
+### Model catalog and routing
+
+```sh
+agent-command catalog show
+ARTIFICIAL_ANALYSIS_API_KEY=… agent-command catalog refresh
+agent-command model pin claude work claude-opus-5-5 high
+agent-command model pin codex work gpt-6.2-sol
+agent-command model show
+agent-command model unpin claude work
+```
+
+Start a mission with `/urgent` or `/ordinary` to choose a scheduling policy.
+Use `/standard` (index ≥ 40) or `/hard` (index ≥ 55) to require a minimum
+published index. Use `/split first ;; second` to send explicit independent
+units to separate eligible profiles.
+
+Benchmarks come only from a refresh with your own Artificial Analysis key;
+the bundled snapshots contain no benchmark values by licensing decision, so
+before a refresh every configuration is unscored and `/standard` and `/hard`
+start nothing and say why. `models/free` is required; `agents/coding` is
+optional (the free plan returns HTTP 403) and never suppresses `models/free`.
+A ranking uses one metric for every candidate: the AA coding index from
+`models/free` if any candidate has one, otherwise the AA intelligence index.
+The AA coding agent index from `agents/coding` never ranks or meets a floor;
+that endpoint only adds seconds-per-task speed. The metric name appears in
+each routing reason.
+
+A configuration is scored only through the exact identity of a pinned model:
+Codex model IDs have dots turned into hyphens (`gpt-6.2-sol` →
+`gpt-6-2-sol`), full Claude names are used verbatim, an explicit `low`,
+`medium`, `high` or `xhigh` effort needs the matching suffixed row, and no
+effort uses the base row (`AA default setting`). Aliases such as `opus`,
+`max` or `minimal` effort, and models with no matching row stay unscored.
+A model name ending in an effort, such as `claude-opus-5-5-high`, is a
+benchmark variant rather than a native model and is refused as a pin. The
+profile panel shows the displayed profile's pin. See
+[docs/routing.md](docs/routing.md) for integrity checks, threshold
+provenance, ranking precedence, split allocation and override behavior.
+
+Reverting the Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the
+Stage 2 state directories.
