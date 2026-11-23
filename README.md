@@ -42,6 +42,8 @@ The command is `agent-command`, so tools already named `agent` are unaffected. I
 
 The installers download the latest published release. Re-running the installer updates the app. Close an existing instance before updating on Windows.
 
+At launch, release builds check once for a newer release in the background and show a one-line banner; press F6 or click it to dismiss. Nothing installs automatically. Run `agent-command update` to install a newer release (on Windows it prints the PowerShell command). Set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip the launch check. Development builds never check.
+
 Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
 
 ### Build from source
@@ -134,6 +136,8 @@ in the mission panel and ship's log. One mission runs at a time. Reopen the
 TUI after adding a profile in another terminal.
 
 ### Subscription usage in the terminal
+
+The Token Burn deck shows each profile's provider, profile, tier pill, five-hour and weekly allowance gauges, reset countdown, and active routing model and metric. Wide terminals show full cards; 80×24 shows a compact strip. Unreported windows, unknown tiers and missing resets render muted, never as zero or full. Deck colors come from `theme.toml`; a theme that does not parse falls back to the built-in palette.
 
 Use F2 or click the profile row to inspect each profile. The usage rows show
 used and remaining percentages, time until reset, and observation age. Readings

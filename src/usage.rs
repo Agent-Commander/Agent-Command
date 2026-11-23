@@ -71,6 +71,14 @@ pub(crate) struct Window {
     stamp: Option<Stamp>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Allowance {
+    pub(crate) five: Option<f64>,
+    pub(crate) week: Option<f64>,
+    pub(crate) reset_in: Option<i64>,
+    pub(crate) latched: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct Usage {
     five: Option<Window>,
@@ -142,6 +150,24 @@ impl Usage {
             None => format!("{name} unavailable"),
         };
         [row("5h", self.five), row("Week", self.week)]
+    }
+
+    pub(crate) fn allowance(self, now: Tick) -> Allowance {
+        let open = |window: Option<Window>| window.filter(|window| window.reset > now.wall);
+        let left = |window: Window| (100.0 - window.used).clamp(0.0, 100.0);
+        let latch = self.latch.filter(|reset| *reset > now.wall);
+        let reset = match latch {
+            Some(reset) => Some(reset).filter(|reset| *reset != i64::MAX),
+            None => open(self.five)
+                .or(open(self.week))
+                .map(|window| window.reset),
+        };
+        Allowance {
+            five: open(self.five).map(left),
+            week: open(self.week).map(left),
+            reset_in: reset.map(|reset| reset - now.wall),
+            latched: latch.is_some(),
+        }
     }
 
     pub(crate) fn latch_label(self, now: Tick) -> String {

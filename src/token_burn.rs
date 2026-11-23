@@ -327,8 +327,9 @@ impl AccountCard {
 
     fn route_badge(&self, palette: &TokenBurnPalette) -> Vec<Span<'static>> {
         let Some(model) = &self.route_model else {
+            let reason = self.route_metric.as_deref().unwrap_or("unrouted");
             return vec![Span::styled(
-                "▸ unrouted",
+                format!("▸ {reason}"),
                 Style::default().fg(palette.muted),
             )];
         };
@@ -424,11 +425,20 @@ pub fn render_deck(
     buf: &mut Buffer,
     palette: &TokenBurnPalette,
 ) {
+    render_deck_as(DeckMode::for_area(area), cards, area, buf, palette);
+}
+
+pub fn render_deck_as(
+    mode: DeckMode,
+    cards: &[AccountCard],
+    area: Rect,
+    buf: &mut Buffer,
+    palette: &TokenBurnPalette,
+) {
     buf.set_style(
         area,
         Style::default().bg(palette.deck).fg(palette.foreground),
     );
-    let mode = DeckMode::for_area(area);
     let row_height = match mode {
         DeckMode::Full => FULL_CARD_HEIGHT,
         DeckMode::Compact => 1,

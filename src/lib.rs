@@ -16,6 +16,7 @@ use std::{
     collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
+    sync::mpsc::{Receiver, TryRecvError},
     time::SystemTime,
 };
 
@@ -86,9 +87,76 @@ pub fn color(hex: &str) -> Color {
     Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
+fn profile_route(
+    label: &str,
+    ranked: &[routing::Candidate],
+    exclusions: &[routing::Exclusion],
+) -> ProfileRoute {
+    if let Some(candidate) = ranked.iter().find(|candidate| candidate.label == label) {
+        return ProfileRoute::Routed {
+            model: candidate.configuration.label(),
+            metric: routing::score_label(candidate),
+        };
+    }
+    let reason = exclusions
+        .iter()
+        .find(|exclusion| exclusion.label == label)
+        .map_or("below routing floor", |exclusion| exclusion.reason);
+    ProfileRoute::Excluded(reason.into())
+}
+
+fn deck_card(
+    label: &str,
+    allowance: usage::Allowance,
+    route: Option<&ProfileRoute>,
+) -> token_burn::AccountCard {
+    let (provider, profile) = label.split_once('/').unwrap_or((label, ""));
+    let (route_model, route_metric) = match route {
+        _ if allowance.latched => (None, Some("latched".to_owned())),
+        Some(ProfileRoute::Routed { model, metric }) => (Some(model.clone()), Some(metric.clone())),
+        Some(ProfileRoute::Excluded(reason)) => (None, Some(reason.clone())),
+        None => (None, None),
+    };
+    token_burn::AccountCard {
+        provider: provider.into(),
+        profile: profile.into(),
+        tier: String::new(),
+        primary_remaining: allowance.five,
+        secondary_remaining: allowance.week,
+        seconds_until_reset: allowance.reset_in,
+        route_model,
+        route_metric,
+    }
+}
+
+fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| token_burn::TokenBurnPalette::from_theme_toml(&text).ok())
+        .unwrap_or_default()
+}
+
+fn deck_mode(area: Rect, compact_layout: bool) -> token_burn::DeckMode {
+    if compact_layout {
+        token_burn::DeckMode::Compact
+    } else {
+        token_burn::DeckMode::for_area(area)
+    }
+}
+
+const COMPACT_DECK_MAX_ROWS: usize = 3;
+const FULL_DECK_MAX_CARDS: usize = 3;
+const UPDATE_DISMISS_HINT: &str = " ✕ F6 ";
+
 fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
     request.units = request.units.iter().map(|unit| frame(unit)).collect();
     request
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ProfileRoute {
+    Routed { model: String, metric: String },
+    Excluded(String),
 }
 
 struct Live {
@@ -111,6 +179,8 @@ struct Live {
     queue: VecDeque<(String, String)>,
     reply: String,
     entry: Option<(String, &'static str)>,
+    routes: Vec<ProfileRoute>,
+    allowances: Vec<usage::Allowance>,
 }
 
 impl Live {
@@ -139,26 +209,65 @@ impl Live {
             queue: VecDeque::new(),
             reply: String::new(),
             entry: None,
+            routes: Vec::new(),
+            allowances: Vec::new(),
         }
     }
 
-    fn choose_entry(&self) -> Option<(String, &'static str)> {
+    fn refresh_routes(&mut self) {
+        let (candidates, exclusions) =
+            routing::candidates(&self.profiles, &self.catalog(), &self.pins, usage::now());
+        let request = routing::Request::default();
+        let ranked = routing::rank(candidates, request.policy, request.difficulty);
+        let ranked = ranked.as_deref().unwrap_or_default();
+        self.routes = self
+            .profiles
+            .iter()
+            .map(|profile| profile_route(&profile.to_string(), ranked, &exclusions))
+            .collect();
+        self.entry = self.choose_entry(ranked);
+    }
+
+    fn choose_entry(&self, ranked: &[routing::Candidate]) -> Option<(String, &'static str)> {
         if let Some(index) = self.preferred {
             return Some((self.profiles[index].to_string(), "override"));
         }
-        let (candidates, _) =
-            routing::candidates(&self.profiles, &self.catalog(), &self.pins, usage::now());
-        let request = routing::Request::default();
-        match routing::rank(candidates, request.policy, request.difficulty) {
-            Ok(ranked) if !ranked.is_empty() => Some((
-                format!("{} {}", ranked[0].label, ranked[0].configuration.label()),
+        match ranked.first() {
+            Some(best) => Some((
+                format!("{} {}", best.label, best.configuration.label()),
                 "auto",
             )),
-            _ => self
+            None => self
                 .profiles
                 .first()
                 .map(|profile| (profile.to_string(), "first signed-in")),
         }
+    }
+
+    fn read_allowances(&mut self, now: usage::Tick) {
+        self.allowances = self
+            .profiles
+            .iter()
+            .map(|profile| {
+                usage::Usage::read(profile)
+                    .map(|usage| usage.allowance(now))
+                    .unwrap_or_default()
+            })
+            .collect();
+    }
+
+    fn deck_cards(&self) -> Vec<token_burn::AccountCard> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| {
+                deck_card(
+                    &profile.to_string(),
+                    self.allowances.get(index).copied().unwrap_or_default(),
+                    self.routes.get(index),
+                )
+            })
+            .collect()
     }
 
     fn entry_label(&self) -> String {
@@ -259,6 +368,7 @@ impl Live {
             return;
         }
         self.usage_checked_at = Some(now.elapsed / 1_000_000_000);
+        self.read_allowances(now);
         let displayed = self.displayed_profile();
         self.usage = self
             .profiles
@@ -310,6 +420,10 @@ pub struct App {
     pub send_area: Rect,
     crew_row_height: u16,
     crew_offset: usize,
+    pub deck_palette: token_burn::TokenBurnPalette,
+    update_receiver: Option<Receiver<String>>,
+    pub update_banner: Option<String>,
+    pub update_area: Rect,
 }
 impl Default for App {
     fn default() -> Self {
@@ -335,6 +449,10 @@ impl Default for App {
             send_area: Rect::default(),
             crew_row_height: 1,
             crew_offset: 0,
+            deck_palette: token_burn::TokenBurnPalette::default(),
+            update_receiver: None,
+            update_banner: None,
+            update_area: Rect::default(),
         }
     }
 }
@@ -388,7 +506,8 @@ impl App {
                 Err(error) => app.notice = format!("Cannot read specialist roster: {error}"),
             }
         }
-        live.entry = live.choose_entry();
+        live.refresh_routes();
+        live.read_allowances(usage::now());
         app.live = Some(live);
         app
     }
@@ -405,7 +524,7 @@ impl App {
         };
         live.usage_checked_at = None;
         live.refresh_usage();
-        live.entry = live.choose_entry();
+        live.refresh_routes();
         self.notice = match live.save_override() {
             Ok(()) => match live.preferred {
                 Some(index) => format!("Override saved: {}", live.profiles[index]),
@@ -661,6 +780,7 @@ impl App {
         let stamp = fs::metadata(path).and_then(|m| m.modified()).ok();
         if stamp != self.theme_stamp {
             self.theme_stamp = stamp;
+            self.deck_palette = deck_palette(path);
             match Theme::load(path) {
                 Ok(theme) => {
                     self.theme = theme;
@@ -670,6 +790,29 @@ impl App {
             }
         }
     }
+    pub fn watch_updates(&mut self, receiver: Option<Receiver<String>>) {
+        self.update_receiver = receiver;
+    }
+
+    pub fn poll_update(&mut self) {
+        let Some(receiver) = &self.update_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(latest) => {
+                self.update_banner = Some(update::one_line_notice(&latest));
+                self.update_receiver = None;
+            }
+            Err(TryRecvError::Disconnected) => self.update_receiver = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    pub fn dismiss_update(&mut self) {
+        self.update_banner = None;
+        self.update_area = Rect::default();
+    }
+
     fn push_log(&mut self, text: String) {
         let entry = Entry::now(text);
         if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
@@ -806,7 +949,7 @@ impl App {
                 }
             }
         };
-        live.entry = live.choose_entry();
+        live.refresh_routes();
         live.usage_checked_at = None;
         self.notice = match live.save_override() {
             Ok(()) => format!("Entry model: {}", live.entry_label()),
@@ -910,6 +1053,7 @@ impl App {
         match key.code {
             KeyCode::F(2) => self.select_profile(),
             KeyCode::F(4) => self.abandon_continuation(),
+            KeyCode::F(6) => self.dismiss_update(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
             KeyCode::Enter if self.editing => self.submit(),
@@ -926,7 +1070,9 @@ impl App {
     }
     pub fn click(&mut self, x: u16, y: u16) {
         let point = ratatui::layout::Position::new(x, y);
-        if self
+        if self.update_area.contains(point) {
+            self.dismiss_update();
+        } else if self
             .live
             .as_ref()
             .is_some_and(|live| live.abandon_area.contains(point))
@@ -1041,7 +1187,38 @@ impl App {
             r(0, 0, a.width, 1),
         );
         let compact = a.height < 36 || a.width < 105;
-        if !compact {
+        let banner_rows = self.draw_update_banner(f, a);
+        let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
+        let mode = deck_mode(a, compact);
+        let deck_rows = match mode {
+            token_burn::DeckMode::Full if !cards.is_empty() => {
+                self.draw_deck(
+                    f,
+                    &cards,
+                    mode,
+                    r(
+                        3,
+                        2,
+                        a.width.saturating_sub(6),
+                        token_burn::FULL_CARD_HEIGHT,
+                    ),
+                );
+                0
+            }
+            token_burn::DeckMode::Full => 0,
+            token_burn::DeckMode::Compact => {
+                let rows = cards.len().min(COMPACT_DECK_MAX_ROWS) as u16;
+                self.draw_deck(
+                    f,
+                    &cards,
+                    mode,
+                    r(1, 1 + banner_rows, a.width.saturating_sub(2), rows),
+                );
+                rows
+            }
+        };
+        let top_shift = (banner_rows + deck_rows).saturating_sub(1);
+        if !compact && cards.is_empty() {
             let banner = if a.width >= 105 {
                 banner()
             } else {
@@ -1069,6 +1246,8 @@ impl App {
                 Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
                 r(3, 6, a.width.saturating_sub(6), 1),
             );
+        }
+        if !compact {
             let ma = r(3, 8, a.width.saturating_sub(6), 3);
             f.render_widget(
                 Block::default().style(Style::default().bg(color("191e25"))),
@@ -1093,9 +1272,9 @@ impl App {
         let main = if compact {
             r(
                 1,
-                2,
+                2 + top_shift,
                 a.width.saturating_sub(2),
-                a.height.saturating_sub(8 + usage_rows),
+                a.height.saturating_sub(8 + usage_rows + top_shift),
             )
         } else {
             r(
@@ -1453,6 +1632,52 @@ impl App {
                     live.abandon_area,
                 );
             }
+        }
+    }
+}
+
+impl App {
+    fn draw_update_banner(&mut self, f: &mut Frame, area: Rect) -> u16 {
+        let Some(text) = &self.update_banner else {
+            self.update_area = Rect::default();
+            return 0;
+        };
+        self.update_area = Rect::new(area.x, area.y + 1, area.width, 1).intersection(area);
+        f.render_widget(
+            Paragraph::new(format!("{UPDATE_DISMISS_HINT} {text}")).style(
+                Style::default()
+                    .fg(color("1b2027"))
+                    .bg(color(&self.theme.amber))
+                    .bold(),
+            ),
+            self.update_area,
+        );
+        1
+    }
+
+    fn draw_deck(
+        &self,
+        f: &mut Frame,
+        cards: &[token_burn::AccountCard],
+        mode: token_burn::DeckMode,
+        area: Rect,
+    ) {
+        if mode == token_burn::DeckMode::Compact {
+            token_burn::render_deck_as(mode, cards, area, f.buffer_mut(), &self.deck_palette);
+            return;
+        }
+        let shown = &cards[..cards.len().min(FULL_DECK_MAX_CARDS)];
+        let columns = Layout::horizontal(vec![Constraint::Fill(1); shown.len()])
+            .spacing(1)
+            .split(area);
+        for (card, column) in shown.iter().zip(columns.iter()) {
+            token_burn::render_deck_as(
+                mode,
+                std::slice::from_ref(card),
+                *column,
+                f.buffer_mut(),
+                &self.deck_palette,
+            );
         }
     }
 }
@@ -2070,7 +2295,6 @@ case "$prompt" in
 esac
 "#;
 
-    #[cfg(unix)]
     fn screen(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
@@ -2078,7 +2302,6 @@ esac
         terminal.backend().buffer().clone()
     }
 
-    #[cfg(unix)]
     fn region(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
         (area.y..area.bottom())
             .map(|y| {
@@ -2294,7 +2517,6 @@ esac
         (120, 40, false),
     ];
 
-    #[cfg(unix)]
     fn click_center(app: &mut App, area: Rect) {
         app.click(area.x + area.width / 2, area.y + area.height / 2);
     }
@@ -2352,5 +2574,202 @@ esac
         assert_eq!(a.theme.accent, "123456");
         assert!(!a.notice.is_empty());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deck_palette_follows_theme_and_falls_back_when_it_does_not_parse() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-command-deck-theme-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "accent = '123456'").unwrap();
+        let mut app = App::default();
+        app.poll_theme(&path);
+        assert_eq!(app.deck_palette.accent, color("123456"));
+        fs::write(&path, "accent = [").unwrap();
+        app.theme_stamp = None;
+        app.poll_theme(&path);
+        assert_eq!(app.deck_palette, token_burn::TokenBurnPalette::default());
+        assert_eq!(app.theme.accent, "123456");
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
+
+    fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        region(buffer, Rect::new(0, y, buffer.area.width, 1))
+    }
+
+    #[cfg(unix)]
+    fn cell_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        (0..buffer.area.height).find_map(|y| {
+            let symbols: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let width = needle.chars().count();
+            (0..symbols.len().saturating_sub(width - 1))
+                .find_map(|x| (symbols[x..x + width].concat() == needle).then_some((x as u16, y)))
+        })
+    }
+
+    #[test]
+    fn update_banner_appears_from_an_injected_receiver_and_dismisses() {
+        for (index, (width, height)) in SIZES.into_iter().enumerate() {
+            let mut app = App::default();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.watch_updates(Some(receiver));
+            app.poll_update();
+            assert!(app.update_banner.is_none());
+            sender.send("9.9.9".to_owned()).unwrap();
+            app.poll_update();
+            let buffer = screen(&mut app, width, height);
+            let banner = row(&buffer, 1);
+            assert!(banner.starts_with(UPDATE_DISMISS_HINT), "{banner}");
+            assert!(
+                banner.contains("Agent Command 9.9.9 is available"),
+                "{banner}"
+            );
+            assert!(app.input_area.bottom() <= height);
+            assert!(region(&buffer, app.crew_area).contains("Commander"));
+            if index == 0 {
+                app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+            } else {
+                let banner = app.update_area;
+                click_center(&mut app, banner);
+            }
+            assert!(app.update_banner.is_none());
+            let buffer = screen(&mut app, width, height);
+            assert!(!row(&buffer, 1).contains("9.9.9"));
+            drop(sender);
+            app.poll_update();
+            assert!(app.update_receiver.is_none());
+        }
+        let mut app = App::default();
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        app.watch_updates(Some(receiver));
+        drop(sender);
+        app.poll_update();
+        assert!(app.update_receiver.is_none() && app.update_banner.is_none());
+    }
+
+    #[cfg(unix)]
+    fn observe(profile: &auth::Profile, status: &str, five: f64, week: f64) {
+        let now = usage::now();
+        usage::Usage::observe_claude(
+            profile,
+            &serde_json::json!({
+                "type":"rate_limit_event",
+                "rate_limit_info":{
+                    "status":status,"resetsAt":now.wall + 7200,
+                    "unifiedWindows":{
+                        "five_hour":{"utilization":five,"resetsAt":now.wall + 7200},
+                        "seven_day":{"utilization":week,"resetsAt":now.wall + 86400}
+                    }
+                }
+            }),
+            now,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_burn_deck_renders_known_unknown_and_latched_usage() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("token-burn-deck", ORCHESTRATOR_PROVIDER);
+        let known = fixture.profile(Provider::Claude, "known");
+        let fresh = fixture.profile(Provider::Claude, "fresh");
+        let held = fixture.profile(Provider::Claude, "held");
+        observe(&known, "allowed", 0.36, 0.88);
+        observe(&held, "rejected", 1.0, 0.5);
+        let mut app = App::from_live(test_live(
+            fixture.root.clone(),
+            vec![known, fresh, held],
+            None,
+        ));
+        let palette = app.deck_palette;
+
+        let compact = screen(&mut app, 80, 24);
+        let [known_row, fresh_row, held_row] = [1, 2, 3].map(|y| row(&compact, y));
+        assert!(known_row.contains("claude · known"), "{known_row}");
+        assert!(
+            known_row.contains("64%") && known_row.contains("12%"),
+            "{known_row}"
+        );
+        assert!(known_row.contains("↻ 2h") || known_row.contains("↻ 1h 59m"));
+        assert!(fresh_row.contains("claude · fresh") && fresh_row.contains("--"));
+        assert!(fresh_row.contains("↻ -"), "{fresh_row}");
+        assert!(held_row.contains("claude · held") && held_row.contains("0%"));
+        let (x, y) = cell_at(&compact, "--").unwrap();
+        assert_eq!((y, compact[(x, y)].fg), (2, palette.unknown));
+        let (x, y) = cell_at(&compact, " - ").unwrap();
+        assert_eq!(compact[(x, y)].bg, palette.unknown);
+        let (x, y) = cell_at(&compact, "↻ -").unwrap();
+        assert_eq!(compact[(x, y)].fg, palette.muted);
+        assert!(app.crew_area.y > 3 && app.input_area.bottom() <= 24);
+
+        let full = screen(&mut app, 120, 40);
+        let deck = region(&full, Rect::new(0, 2, 120, token_burn::FULL_CARD_HEIGHT));
+        for expected in [
+            "claude · known",
+            "claude · fresh",
+            "claude · held",
+            "64%",
+            "12%",
+            "▸ provider default · unscored",
+            "▸ latched",
+        ] {
+            assert!(deck.contains(expected), "{expected}\n{deck}");
+        }
+        assert_eq!(full[(3, 2)].symbol(), "╭");
+        let (x, y) = cell_at(&full, "--").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.unknown);
+        let (x, y) = cell_at(&full, "▸ latched").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.muted);
+        assert!(app.input_area.bottom() <= 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commander_specialist_and_deck_are_visible_together() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("deck-crew", ORCHESTRATOR_PROVIDER);
+        let repository = fixture.root.join("work");
+        specialists::tests::git_repository(&repository);
+        let profile = fixture.profile(Provider::Claude, "alpha");
+        observe(&profile, "allowed", 0.5, 0.25);
+        let mut app = App::from_live(test_live(repository, vec![profile], None));
+        send(&mut app, "/spawn atlas builder");
+        assert_eq!(app.crew.len(), 2, "{}", app.notice);
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            assert!(
+                crew.contains("Commander") && crew.contains("atlas"),
+                "{crew}"
+            );
+            let whole = region(&buffer, buffer.area);
+            assert!(whole.contains("claude · alpha") && whole.contains("50%"));
+            assert!(region(&buffer, app.input_area).contains("Give atlas a task"));
+            app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            let buffer = screen(&mut app, width, height);
+            let whole = region(&buffer, buffer.area);
+            assert!(whole.contains("Spawned atlas"), "{width}x{height}\n{whole}");
+            assert!(whole.contains("claude · alpha"));
+            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.editing = true;
+            app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert_eq!(app.input, "x");
+            app.input.clear();
+        }
     }
 }

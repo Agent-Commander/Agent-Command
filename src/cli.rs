@@ -20,10 +20,11 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         Some(("catalog", rest)) => return crate::catalog::run(rest),
         Some(("model", rest)) => return crate::native::run(rest),
         Some(("specialist", rest)) => return crate::specialists::run(rest),
+        Some(("update", rest)) => return crate::update::run(rest),
         _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n       agent-command update\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto, F6 dismisses the update banner\n\nSet AGENT_COMMAND_NO_UPDATE_CHECK=1 to skip the launch update check.");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -74,6 +75,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     let result = (|| {
         execute!(io::stdout(), EnableMouseCapture)?;
         let mut app = App::live(std::env::current_dir()?);
+        app.watch_updates(crate::update::watch());
         while !app.quit {
             if !app.mission_running()
                 && std::env::var_os("AGENT_COMMAND_DEV").is_some()
@@ -86,6 +88,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
                 app.poll_theme(path);
             }
             app.poll_mission();
+            app.poll_update();
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
                 match event::read()? {

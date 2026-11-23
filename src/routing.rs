@@ -449,7 +449,7 @@ pub(crate) fn rank(
     Ok(candidates)
 }
 
-fn score_label(candidate: &Candidate) -> String {
+pub(crate) fn score_label(candidate: &Candidate) -> String {
     match (candidate.metric, candidate.score()) {
         (None, _) => "unscored".into(),
         (Some(metric), None) => format!("{} n/a", metric.name()),
