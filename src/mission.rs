@@ -50,7 +50,7 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn single(prompt: &str, preferred: Option<String>) -> Self {
         Self {
             request: Request {

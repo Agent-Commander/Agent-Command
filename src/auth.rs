@@ -191,7 +191,7 @@ impl Profile {
         profile
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }

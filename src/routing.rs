@@ -106,7 +106,7 @@ pub(crate) fn by_index_slug(
 }
 
 impl Configuration {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn is_default(&self) -> bool {
         self.model == DEFAULT && self.effort == DEFAULT
     }

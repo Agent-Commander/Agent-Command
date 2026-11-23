@@ -1123,6 +1123,7 @@ pub fn source_stamp(root: &Path) -> SystemTime {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn test_live(
         workspace: PathBuf,
         profiles: Vec<auth::Profile>,
