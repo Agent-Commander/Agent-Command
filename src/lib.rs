@@ -2749,6 +2749,8 @@ esac
         let mut app = App::from_live(test_live(repository, vec![profile], None));
         send(&mut app, "/spawn atlas builder");
         assert_eq!(app.crew.len(), 2, "{}", app.notice);
+        send(&mut app, "/roster");
+        app.selected = 1;
         for (width, height) in SIZES {
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
@@ -2762,7 +2764,7 @@ esac
             app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
             let buffer = screen(&mut app, width, height);
             let whole = region(&buffer, buffer.area);
-            assert!(whole.contains("Spawned atlas"), "{width}x{height}\n{whole}");
+            assert!(whole.contains("Roster:"), "{width}x{height}\n{whole}");
             assert!(whole.contains("claude · alpha"));
             assert!(region(&buffer, app.input_area).contains("Message Commander"));
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
