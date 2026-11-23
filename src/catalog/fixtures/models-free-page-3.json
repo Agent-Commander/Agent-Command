@@ -1,0 +1,31 @@
+{
+  "tier": "free",
+  "intelligence_index_version": 4,
+  "pagination": {"page": 3, "page_size": 3, "total_pages": 4, "has_more": true},
+  "data": [
+    {
+      "id": "fixture-model-7",
+      "name": "Synthetic fixture row",
+      "slug": "claude-opus-5-5",
+      "model_creator": {"id": "fixture-creator-3", "name": "Anthropic"},
+      "evaluations": {"artificial_analysis_intelligence_index": 60.0, "artificial_analysis_coding_index": null},
+      "performance_v3": null
+    },
+    {
+      "id": "fixture-model-8",
+      "name": "Synthetic fixture row",
+      "slug": "claude-opus-5-5-max",
+      "model_creator": {"id": "fixture-creator-3", "name": "Anthropic"},
+      "evaluations": {"artificial_analysis_intelligence_index": 97.0, "artificial_analysis_coding_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 997.0}
+    },
+    {
+      "id": "fixture-model-9",
+      "name": "Synthetic fixture row",
+      "slug": "claude-opus",
+      "model_creator": {"id": "fixture-creator-3", "name": "Anthropic"},
+      "evaluations": {"artificial_analysis_intelligence_index": 96.0, "artificial_analysis_coding_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 996.0}
+    }
+  ]
+}

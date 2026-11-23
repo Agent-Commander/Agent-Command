@@ -2,6 +2,7 @@ use crate::{
     auth::{Profile, Provider},
     catalog::Catalog,
     checkpoint::{Checkpoint, Claim, Progress},
+    native::Pins,
     routing::{self, Candidate, Configuration, Request},
     usage::{self, Usage},
 };
@@ -47,6 +48,7 @@ pub(crate) struct Route {
     pub(crate) request: Request,
     pub(crate) preferred: Option<String>,
     pub(crate) catalog: Catalog,
+    pub(crate) pins: Pins,
 }
 
 impl Route {
@@ -59,6 +61,7 @@ impl Route {
             },
             preferred,
             catalog: Catalog::default(),
+            pins: Pins::default(),
         }
     }
 }
@@ -139,10 +142,6 @@ struct Execution {
     clock: fn() -> usage::Tick,
 }
 
-fn default_configuration(provider: Provider) -> &'static Configuration {
-    routing::supported(provider, "default", "default").expect("provider default configuration")
-}
-
 impl Execution {
     fn route(
         &self,
@@ -151,7 +150,8 @@ impl Execution {
         cancel: &AtomicBool,
     ) -> io::Result<()> {
         let now = (self.clock)();
-        let (candidates, exclusions) = routing::candidates(&self.profiles, &route.catalog, now);
+        let (candidates, exclusions) =
+            routing::candidates(&self.profiles, &route.catalog, &route.pins, now);
         let ranked = routing::rank(candidates, route.request.policy, route.request.difficulty);
         if route.request.split {
             return self.run_split(&route.request.units, ranked, &exclusions, sender, cancel);
@@ -241,7 +241,7 @@ impl Execution {
                 profile: profile.clone(),
                 index,
                 reason,
-                configuration: candidate.configuration,
+                configuration: candidate.configuration.clone(),
             },
             &self.workspace,
             prompt.to_owned(),
@@ -271,7 +271,7 @@ impl Execution {
         let claim = checkpoint.reserve(profile, &self.workspace, &self.profiles[to])?;
         self.continue_with(
             (index, to, next),
-            candidate.configuration,
+            &candidate.configuration,
             prompt,
             &claim,
             sender,
@@ -305,7 +305,7 @@ impl Execution {
         let next = profile.authenticated_command()?;
         self.continue_with(
             (index, to, next),
-            default_configuration(profile.provider),
+            &Configuration::provider_default(profile.provider),
             prompt,
             &claim,
             sender,
@@ -316,7 +316,7 @@ impl Execution {
     fn continue_with(
         &self,
         selection: (usize, usize, std::process::Command),
-        configuration: &'static Configuration,
+        configuration: &Configuration,
         prompt: &str,
         claim: &Claim,
         sender: &SyncSender<Event>,
@@ -332,7 +332,7 @@ impl Execution {
                 profile: self.profiles[to].clone(),
                 index: to,
                 reason: None,
-                configuration,
+                configuration: configuration.clone(),
             },
             &self.workspace,
             prompt.to_owned(),
@@ -373,7 +373,7 @@ struct Launch {
     profile: Profile,
     index: usize,
     reason: Option<String>,
-    configuration: &'static Configuration,
+    configuration: Configuration,
 }
 
 struct Continuation<'a> {
@@ -643,6 +643,7 @@ if test "$1" = auth; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
     exit
 fi
+printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
 prompt=$(cat)
 if test "$profile" = first; then
     test "$prompt" = "Keep the finished step" || exit 7
@@ -1121,14 +1122,25 @@ rmdir running.lock
         }
     }
 
-    fn agent_row(provider: &str, model: &str, effort: &str, index: f64) -> crate::catalog::Row {
+    fn agent_row(provider: &str, slug: &str, effort: &str, index: f64) -> crate::catalog::Row {
         crate::catalog::Row {
             provider: provider.into(),
-            model: model.into(),
-            effort: effort.into(),
+            slug: slug.into(),
+            effort: Some(effort.into()),
             coding_index: Some(index),
+            intelligence_index: None,
             speed: None,
         }
+    }
+
+    fn pins() -> Pins {
+        use crate::routing::tests::pin;
+        Pins::from_pins(vec![
+            pin("claude/alpha", "claude-opus-5-5", Some("high")),
+            pin("claude/first", "claude-opus-5-5", Some("high")),
+            pin("codex/beta", "gpt-6.2-sol", Some("high")),
+        ])
+        .unwrap()
     }
 
     fn finish(mission: &Mission) -> (Vec<String>, io::Result<()>) {
@@ -1154,8 +1166,8 @@ rmdir running.lock
         ];
         let rows = || {
             vec![
-                agent_row("claude", "opus", "default", 60.0),
-                agent_row("codex", "gpt-5-codex", "high", 70.0),
+                agent_row("claude", "claude-opus-5-5", "high", 60.0),
+                agent_row("codex", "gpt-6-2-sol", "high", 70.0),
             ]
         };
         let route = |difficulty, preferred: Option<&str>, rows| Route {
@@ -1166,10 +1178,19 @@ rmdir running.lock
             },
             preferred: preferred.map(str::to_owned),
             catalog: synthetic_catalog(rows),
+            pins: pins(),
         };
-        for (difficulty, preferred) in [
-            (routing::Difficulty::Hard, None),
-            (routing::Difficulty::Hard, Some("claude/alpha")),
+        for (difficulty, preferred, expected) in [
+            (
+                routing::Difficulty::Hard,
+                None,
+                "Auto → codex/beta gpt-6.2-sol high · AA coding agent index 70.0 · speed n/a · headroom unknown",
+            ),
+            (
+                routing::Difficulty::Hard,
+                Some("claude/alpha"),
+                "Override → claude/alpha claude-opus-5-5 high · AA coding agent index 60.0 · speed n/a · headroom unknown",
+            ),
         ] {
             let mission = Mission::launch(
                 profiles.clone(),
@@ -1178,15 +1199,15 @@ rmdir running.lock
             );
             let (reasons, result) = finish(&mission);
             result.unwrap();
-            assert_eq!(reasons.len(), 1);
+            assert_eq!(reasons, [expected]);
         }
         let starts = std::fs::read_to_string(fixture.root.join("starts")).unwrap();
         assert_eq!(
             starts,
-            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-5-codex\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
-alpha|--model opus --print --verbose --output-format stream-json --setting-sources user --|Routed work\n"
+            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
+alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --|Routed work\n"
         );
-        let below = vec![agent_row("claude", "opus", "default", 50.0)];
+        let below = vec![agent_row("claude", "claude-opus-5-5", "high", 50.0)];
         let mission = Mission::launch(
             profiles,
             route(routing::Difficulty::Hard, None, below),
@@ -1196,11 +1217,38 @@ alpha|--model opus --print --verbose --output-format stream-json --setting-sourc
         assert!(reasons.is_empty());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "No eligible model meets the hard floor 55; best published index is 50.0."
+            "No eligible model meets the hard floor 55 on the AA coding agent index; best is 50.0."
         );
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
             starts
+        );
+    }
+
+    #[test]
+    fn pinned_continuation_keeps_the_exact_model_and_effort() {
+        let (_fixture, workspace, profiles) =
+            limit_fixture("pinned-continuation", usage::tick(FAKE_NOW, 0));
+        let route = Route {
+            request: Request {
+                difficulty: routing::Difficulty::Hard,
+                units: vec!["Keep the finished step".into()],
+                ..Request::default()
+            },
+            preferred: Some(profiles[0].to_string()),
+            catalog: synthetic_catalog(vec![agent_row("claude", "claude-opus-5-5", "high", 60.0)]),
+            pins: pins(),
+        };
+        let mission = Mission::launch_with_clock(profiles, route, workspace.clone(), || {
+            usage::tick(FAKE_NOW + 901, 901)
+        });
+        let (links, result) = drain(&mission);
+        result.unwrap();
+        assert_eq!(links, [(0, 1)]);
+        let claude = "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --";
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(".git/arguments")).unwrap(),
+            format!("first {claude}\nstandby {claude}\n")
         );
     }
 
@@ -1235,6 +1283,7 @@ alpha|--model opus --print --verbose --output-format stream-json --setting-sourc
                 request,
                 preferred: None,
                 catalog: Catalog::default(),
+                pins: Pins::default(),
             },
             fixture.root.clone(),
         );
@@ -1261,6 +1310,7 @@ alpha|--model opus --print --verbose --output-format stream-json --setting-sourc
                 request: routing::parse("/split x ;; y").unwrap(),
                 preferred: None,
                 catalog: Catalog::default(),
+                pins: Pins::default(),
             },
             fixture.root.clone(),
         );

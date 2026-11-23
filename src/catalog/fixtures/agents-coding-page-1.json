@@ -6,7 +6,7 @@
     {
       "agent": {"name": "Codex"},
       "agent_creator": {"name": "OpenAI"},
-      "model": {"slug": "gpt-5-codex", "release_slug": "gpt-5-codex", "effort": "high"},
+      "model": {"slug": "gpt-6-2-sol", "release_slug": "gpt-6-2-sol", "effort": "high"},
       "provider": "OpenAI",
       "is_router": false,
       "coding_agent_index": 47.0,
@@ -15,7 +15,7 @@
     {
       "agent": {"name": "Fixture Router"},
       "agent_creator": {"name": "Fixture Labs"},
-      "model": {"slug": "gpt-5-codex", "effort": "high"},
+      "model": {"slug": "gpt-6-2-sol", "effort": "low"},
       "provider": "OpenAI",
       "is_router": true,
       "coding_agent_index": 95.0,
@@ -24,16 +24,16 @@
     {
       "agent": {"name": "Codex"},
       "agent_creator": {"name": "OpenAI"},
-      "model": {"slug": "gpt-5-codex", "effort": null},
+      "model": {"slug": "gpt-6-2-sol", "effort": null},
       "provider": "OpenAI",
       "is_router": false,
-      "coding_agent_index": 94.0,
-      "time_per_task_seconds": 6.0
+      "coding_agent_index": 44.0,
+      "time_per_task_seconds": 330.0
     },
     {
       "agent": {"name": "Codex"},
       "agent_creator": {"name": "OpenAI"},
-      "model": {"slug": "gpt-5-codex", "release_slug": "gpt-5-codex-fixture-release", "effort": "low"},
+      "model": {"slug": "gpt-6-2-sol", "release_slug": "gpt-6-2-sol-fixture-release", "effort": "low"},
       "provider": "OpenAI",
       "is_router": false,
       "coding_agent_index": 93.0,

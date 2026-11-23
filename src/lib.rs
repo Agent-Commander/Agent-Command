@@ -3,6 +3,7 @@ mod catalog;
 mod checkpoint;
 mod cli;
 mod mission;
+mod native;
 mod routing;
 mod usage;
 pub use cli::run_cli;
@@ -93,6 +94,7 @@ struct Live {
     profiles: Vec<auth::Profile>,
     profile_root: Option<PathBuf>,
     preferred: Option<usize>,
+    pins: native::Pins,
     last_routed: Option<usize>,
     profile_area: Rect,
     usage: Option<usage::Usage>,
@@ -117,6 +119,7 @@ impl Live {
             profiles,
             profile_root,
             preferred: None,
+            pins: native::Pins::default(),
             last_routed: None,
             profile_area: Rect::default(),
             usage: None,
@@ -157,6 +160,28 @@ impl Live {
         self.preferred
             .is_none()
             .then(|| format!("Routing override {label} is not an available profile. Using Auto."))
+    }
+
+    fn load_pins(&mut self) -> Option<String> {
+        let root = self.profile_root.as_ref()?;
+        match native::load_existing(root) {
+            Ok(pins) => {
+                self.pins = pins;
+                None
+            }
+            Err(error) => Some(format!(
+                "Cannot read model pins: {error}. Pins ignored; aliases stay unscored."
+            )),
+        }
+    }
+
+    fn pin_label(&self, index: usize) -> String {
+        self.pins
+            .get(&self.profiles[index].to_string())
+            .map_or_else(
+                || "no model pin".into(),
+                |pin| format!("pin {}", pin.label()),
+            )
     }
 
     fn save_override(&self) -> io::Result<()> {
@@ -288,6 +313,9 @@ impl App {
         });
         let mut live = Live::new(workspace, profiles, root.ok());
         live.pending = pending;
+        if let Some(notice) = live.load_pins() {
+            app.notice = notice;
+        }
         if let Some(notice) = live.load_override() {
             app.notice = notice;
         }
@@ -484,6 +512,7 @@ impl App {
                 request,
                 preferred: live.preferred.map(|index| live.profiles[index].to_string()),
                 catalog: live.catalog(),
+                pins: live.pins.clone(),
             };
             live.mission = Some((
                 self.selected,
@@ -927,7 +956,11 @@ impl App {
                     };
                     vec![
                         Line::raw(format!("{control} · {latch} · {}", live.route_mode())),
-                        Line::raw(live.profiles[live.displayed_profile()].to_string()),
+                        Line::raw(format!(
+                            "{} · {}",
+                            live.profiles[live.displayed_profile()],
+                            live.pin_label(live.displayed_profile())
+                        )),
                     ]
                 }
             };
@@ -1495,6 +1528,126 @@ while test ! -f release; do sleep 0.01; done
             assert!(
                 row(&terminal, height - 2).contains("Atlas: No eligible signed-in subscription")
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_model_and_ranking_metric_are_visible_with_keyboard_and_mouse() {
+        use auth::Provider;
+        use catalog::{Endpoint, Row, Snapshot, Speed, SpeedUnit};
+        use usage::tests::Fixture;
+
+        for (width, height, keyboard) in INPUT_MATRIX {
+            let fixture = Fixture::new(
+                &format!("pinned-panel-{width}-{keyboard}"),
+                r#"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+printf '%s\n' "$*" >> arguments
+cat > /dev/null
+while test ! -f release; do sleep 0.01; done
+"#,
+            );
+            let profiles = vec![
+                fixture.profile(Provider::Claude, "alpha"),
+                fixture.profile(Provider::Claude, "beta"),
+            ];
+            let state = routing::state_directory(&fixture.root.join("profiles")).unwrap();
+            native::Pins::from_pins(vec![routing::tests::pin(
+                "claude/alpha",
+                "claude-opus-5-5",
+                Some("high"),
+            )])
+            .unwrap()
+            .save(&state)
+            .unwrap();
+            fs::create_dir_all(catalog::cache_directory(&state)).unwrap();
+            catalog::publish(
+                &state,
+                &Snapshot::sealed(
+                    Endpoint::ModelsFree,
+                    "4".into(),
+                    "synthetic test fixture".into(),
+                    vec![Row {
+                        provider: "claude".into(),
+                        slug: "claude-opus-5-5-high".into(),
+                        effort: None,
+                        coding_index: None,
+                        intelligence_index: Some(63.0),
+                        speed: Some(Speed {
+                            unit: SpeedUnit::TokensPerSecond,
+                            value: 52.5,
+                        }),
+                    }],
+                ),
+            )
+            .unwrap();
+            let mut live = test_live(fixture.root.clone(), profiles, None);
+            assert_eq!(live.load_pins(), None);
+            let mut app = App {
+                live: Some(live),
+                ..App::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| {
+                let buffer = terminal.backend().buffer();
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let area = app.live.as_ref().unwrap().profile_area;
+            let mut press = |app: &mut App| {
+                if keyboard {
+                    app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                } else {
+                    click_center(app, area);
+                }
+                terminal.draw(|f| app.draw(f)).unwrap();
+                row(&terminal, area.y + 1)
+            };
+            assert!(press(&mut app).contains("claude/alpha · pin claude-opus-5-5 high"));
+            assert!(press(&mut app).contains("claude/beta · no model pin"));
+            press(&mut app);
+            assert!(press(&mut app).contains("claude/alpha · pin claude-opus-5-5 high"));
+            app.input = "/hard Do work".into();
+            app.editing = keyboard;
+            if keyboard {
+                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                let send = app.send_area;
+                click_center(&mut app, send);
+            }
+            wait_for(&mut app, |app| app.status(0) == "RUNNING");
+            assert!(app.notice.starts_with(
+                "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
+            ));
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let notice = row(&terminal, height - 2);
+            assert!(notice.contains("AA intelligence index 63.0"), "{notice}");
+            assert!(row(&terminal, area.y + 1).contains("claude/alpha · pin claude-opus-5-5 high"));
+            fs::write(fixture.root.join("release"), "").unwrap();
+            wait_for(&mut app, |app| !app.mission_running());
+            assert_eq!(app.status(0), "DONE", "{}", app.notice);
+            assert_eq!(
+                fs::read_to_string(fixture.root.join("arguments")).unwrap(),
+                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --\n"
+            );
+            fs::write(state.join(native::PINS_FILE), b"{\"schema\":\"agent-command-native-pins-v1\",\"pins\":[{\"profile\":\"claude/alpha\",\"model\":\"opus\",\"effort\":null}]}").unwrap();
+            let mut reopened = test_live(
+                fixture.root.clone(),
+                app.live.take().unwrap().profiles,
+                None,
+            );
+            assert!(reopened
+                .load_pins()
+                .unwrap()
+                .starts_with("Cannot read model pins"));
+            assert_eq!(reopened.pin_label(0), "no model pin");
         }
     }
 

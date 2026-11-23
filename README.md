@@ -166,15 +166,35 @@ Pending claims from the previous Stage 2 revision can be abandoned. Their old di
 ```sh
 agent-command catalog show
 ARTIFICIAL_ANALYSIS_API_KEY=… agent-command catalog refresh
+agent-command model pin claude work claude-opus-5-5 high
+agent-command model pin codex work gpt-6.2-sol
+agent-command model show
+agent-command model unpin claude work
 ```
 
 Start a mission with `/urgent` or `/ordinary` to choose a scheduling policy.
-Use `/standard` or `/hard` to require a minimum published coding index. Use
-`/split first ;; second` to send explicit independent units to separate
-eligible profiles. The bundled catalog snapshots contain no benchmark values,
-so every index reads as missing until a verified refresh. See
-[docs/routing.md](docs/routing.md) for integrity checks, ranking precedence,
-split allocation and override behavior.
+Use `/standard` (index ≥ 40) or `/hard` (index ≥ 55) to require a minimum
+published index. Use `/split first ;; second` to send explicit independent
+units to separate eligible profiles.
+
+Benchmarks come only from a refresh with your own Artificial Analysis key;
+the bundled snapshots contain no benchmark values by licensing decision, so
+before a refresh every configuration is unscored and `/standard` and `/hard`
+start nothing and say why. `models/free` is required; `agents/coding` is
+optional (the free plan returns HTTP 403) and never suppresses `models/free`.
+A ranking uses one metric for every candidate: the AA coding agent index, then
+the AA coding index, then the AA intelligence index, whichever is the first to
+have a value. The metric name appears in each routing reason.
+
+A configuration is scored only through the exact identity of a pinned model:
+Codex model IDs have dots turned into hyphens (`gpt-6.2-sol` →
+`gpt-6-2-sol`), full Claude names are used verbatim, an explicit `low`,
+`medium`, `high` or `xhigh` effort needs the matching suffixed row, and no
+effort uses the base row (`AA default setting`). Aliases such as `opus`,
+`max` or `minimal` effort, and models with no matching row stay unscored. The
+profile panel shows the displayed profile's pin. See
+[docs/routing.md](docs/routing.md) for integrity checks, threshold
+provenance, ranking precedence, split allocation and override behavior.
 
 Reverting the Stage 2 commits restores Stage 1 behavior. Stage 1 ignores the
 Stage 2 state directories.

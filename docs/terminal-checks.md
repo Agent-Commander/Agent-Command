@@ -60,9 +60,11 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 |---|---|
 | Bundled snapshots are dated, sourced, and contain no unverified values | `bundled_snapshots_are_dated_sourced_and_carry_no_unverified_values` |
 | Per-endpoint SHA-256, scope, schema, version, range, unit and size checks fall back independently | `cache_integrity_falls_back_independently_per_endpoint` |
-| Two-page documented-shape fixtures for both endpoints publish only exact dispatchable identities, and refresh requests the published `/api/v2/language/...` paths | `documented_shape_pages_publish_both_endpoints` |
-| Routers, missing or default effort, dated releases, API-gateway providers, other creators and alias rows never borrow a measurement | `identity_and_effort_never_borrow_a_different_measurement`, `measured_identities_name_only_explicit_dispatchable_configurations` |
-| A plan-tier refusal (403) on one endpoint keeps that cache while the other refreshes; 401, 429 and 410 keep both | `each_endpoint_tier_refusal_keeps_only_its_own_cache` |
+| A decimal speed survives seal, serialization, reopening and digest verification for 999 samples (`float_roundtrip`) | `decimal_speeds_survive_seal_serialize_reopen_and_verify` |
+| Four-page free-tier `models/free` and two-page `agents/coding` fixtures publish rows with a null coding index and a present intelligence index, keyed by published identity, from the `/api/v2/language/...` paths | `free_tier_pages_publish_both_endpoints_with_exact_identities` |
+| Exact identities: dots to hyphens for Codex, verbatim Claude names, suffixed explicit efforts, base row for no effort; other versions, efforts, creators, `max`/`minimal`/`ultra`, aliases and absent models never borrow a row | `exact_identities_never_borrow_another_version_effort_or_creator`, `exact_identities_derive_from_native_options_without_a_model_table` |
+| Routers, dated releases, API-gateway providers, other or crossed agent and model authors are skipped; repeated identities are skipped as ambiguous | `agent_identity_requires_exact_harness_creator_and_release`, `ambiguous_identities_are_skipped_instead_of_chosen` |
+| A free-plan 403 on optional `agents/coding` keeps its cache and never suppresses `models/free` or fails the refresh; 401, 429 and 410 keep both | `agents_coding_refusal_never_suppresses_models_free` |
 | Malformed pagination, `tier`, index version, row shape or matched metric rejects only that endpoint and keeps its cache | `malformed_pagination_or_metrics_reject_only_that_endpoint` |
 | A refresh with no supported rows, or an empty result, never erases a valid cache | `empty_supported_refresh_keeps_a_valid_cache` |
 | Deprecated `performance.median_output_tokens_per_second` and the retired field names are never read as measurements | `legacy_and_retired_fields_are_never_read_as_measurements` |
@@ -70,14 +72,18 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | `curl` starts with `-q`, gets the key only on standard input, and does not inherit the key or `CURL_HOME` | `curl_reads_no_implicit_config_and_inherits_no_key` |
 | Without a key, `catalog refresh` refuses and `catalog show` reports bundled provenance | `catalog_entry_point_shows_bundled_provenance_and_refuses_refresh_without_key` |
 | Latched, exhausted, corrupt and sign-in-refused profiles are excluded; stale, unreported and past-reset readings are not | `routing_gate_excludes_latched_exhausted_corrupt_and_refused_profiles` |
-| Hard and standard floors never pick a below-floor or unscored model and give the reason | `difficulty_floor_never_selects_a_below_floor_or_unscored_model` |
+| Hard and standard floors never pick a below-floor or unscored model and name the metric in the reason | `difficulty_floor_never_selects_a_below_floor_or_unscored_model` |
+| Keyless `/standard` and `/hard` fail closed with a visible reason; floors are 40 and 55 | `keyless_standard_and_hard_fail_closed_with_a_visible_reason` |
+| One metric ranks every candidate (coding agent, then coding, then intelligence index) and missing values stay null | `one_metric_ranks_every_candidate_and_missing_values_stay_null` |
 | Ordinary policy ranks by the minimum headroom-to-reset rate, with stable ties and unknown headroom last | `ordinary_policy_ranks_by_soonest_expiring_headroom_with_stable_ties` |
 | Urgent policy ranks the fastest same-unit measurement first, then headroom; input order does not matter | `urgent_policy_puts_fastest_same_unit_first_and_breaks_ties_by_headroom` |
-| Default policy prefers the comparable exact coding index | `default_policy_prefers_comparable_exact_coding_index` |
 | Split allocation by headroom, ties and unknown headroom | `split_units_spread_by_headroom_without_ineligible_or_repeated_profiles` |
 | Split directives require explicit units | `split_requests_need_explicit_independent_units` |
 | Split units run once each, in order, with no concurrent workspace writer and no ineligible profile | `split_mission_sends_each_unit_once_in_sequence_to_allocated_profiles` |
-| Native Claude/Codex arguments carry the routed model and effort; a floor miss starts nothing | `routed_dispatch_passes_selected_model_and_effort_to_native_cli`, `configurations_produce_native_execution_arguments` |
+| Native Claude/Codex arguments carry the pinned model and effort (`--model`/`--effort`, `-c model=…`/`-c model_reasoning_effort=…`), the reason names the metric, and a floor miss starts nothing | `routed_dispatch_passes_selected_model_and_effort_to_native_cli`, `configurations_produce_native_execution_arguments` |
+| A usage-limit continuation keeps the exact pinned model and effort on the alternate | `pinned_continuation_keeps_the_exact_model_and_effort` |
+| Model pins persist in versioned state, accept native efforts and refuse aliases and unknown efforts | `pinned_models_persist_in_versioned_state`, `pins_accept_native_efforts_and_refuse_aliases`, `model_pins_round_trip_through_versioned_state_and_refuse_aliases` |
+| The pinned model and the metric-named routing reason are visible with keyboard and with mouse at both 80×24 and 120×40, the real CLI arguments carry the pin, and an invalid pins file shows a notice | `pinned_model_and_ranking_metric_are_visible_with_keyboard_and_mouse` |
 | Override persistence, rotation and fallback reasons | `override_persists_and_falls_back_with_visible_reason` |
 | The override survives reopening, and the latch fallback and read-error reasons are visible with keyboard and with mouse at both 80×24 and 120×40 | `override_persists_across_reopen_and_shows_fallback_reason_with_keyboard_and_mouse` |
 | The profile panel cycles with keyboard and with mouse at both 80×24 and 120×40 | `usage_panel_shows_selected_allowances_and_latch_with_keyboard_and_mouse` |

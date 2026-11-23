@@ -6,7 +6,7 @@
     {
       "agent": {"name": "Codex"},
       "agent_creator": {"name": "OpenAI"},
-      "model": {"slug": "gpt-5-codex", "effort": "low"},
+      "model": {"slug": "gpt-6-2-sol", "effort": "low"},
       "provider": "Fixture API Gateway",
       "is_router": false,
       "coding_agent_index": 92.0,
@@ -14,7 +14,7 @@
     },
     {
       "agent": {"name": "Codex"},
-      "model": {"slug": "gpt-5-codex", "effort": "medium"},
+      "model": {"slug": "gpt-6-2-sol", "effort": "medium"},
       "provider": "OpenAI",
       "is_router": false,
       "coding_agent_index": 39.0,
@@ -23,11 +23,11 @@
     {
       "agent": {"name": "Claude Code"},
       "agent_creator": {"name": "Anthropic"},
-      "model": {"slug": "claude-opus", "effort": "high"},
+      "model": {"slug": "claude-opus-5-5", "effort": "high"},
       "provider": "Anthropic",
       "is_router": false,
-      "coding_agent_index": 91.0,
-      "time_per_task_seconds": 9.0
+      "coding_agent_index": 52.0,
+      "time_per_task_seconds": 280.0
     },
     {
       "id": "fixture-agent-unidentified",

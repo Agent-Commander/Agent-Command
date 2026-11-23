@@ -1,5 +1,5 @@
 {
-  "schema": "agent-command-catalog-v1",
+  "schema": "agent-command-catalog-v2",
   "scope": "models/free",
   "source": "https://artificialanalysis.ai/api/v2/language/models/free",
   "version": "bundled-2026-11-23",

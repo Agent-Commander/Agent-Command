@@ -1,32 +1,32 @@
 {
   "tier": "free",
   "intelligence_index_version": 4,
-  "pagination": {"page": 2, "page_size": 3, "total_pages": 2, "has_more": false},
+  "pagination": {"page": 2, "page_size": 3, "total_pages": 4, "has_more": true},
   "data": [
     {
       "id": "fixture-model-4",
       "name": "Synthetic fixture row",
-      "slug": "gpt-5-codex-low",
+      "slug": "gpt-6-2-sol",
       "model_creator": {"id": "fixture-creator-1", "name": "OpenAI"},
-      "evaluations": {"artificial_analysis_coding_index": null},
+      "evaluations": {"artificial_analysis_intelligence_index": 58.0, "artificial_analysis_coding_index": null, "artificial_analysis_agentic_index": null},
       "performance_v3": null,
       "performance": {"median_output_tokens_per_second": 120.0}
     },
     {
       "id": "fixture-model-5",
       "name": "Synthetic fixture row",
-      "slug": "gpt-5-codex",
+      "slug": "gpt-6-1-sol-low",
       "model_creator": {"id": "fixture-creator-1", "name": "OpenAI"},
-      "evaluations": {"artificial_analysis_coding_index": 97.0},
-      "performance_v3": {"mean_output_tokens_per_second": 997.0}
+      "evaluations": {"artificial_analysis_intelligence_index": 90.0, "artificial_analysis_coding_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 990.0}
     },
     {
       "id": "fixture-model-6",
       "name": "Synthetic fixture row",
-      "slug": "claude-opus",
+      "slug": "claude-opus-5-5-high",
       "model_creator": {"id": "fixture-creator-3", "name": "Anthropic"},
-      "evaluations": {"artificial_analysis_coding_index": 96.0},
-      "performance_v3": {"mean_output_tokens_per_second": 996.0}
+      "evaluations": {"artificial_analysis_intelligence_index": 63.0, "artificial_analysis_coding_index": null, "artificial_analysis_agentic_index": null},
+      "performance_v3": {"mean_output_tokens_per_second": 52.5}
     }
   ]
 }

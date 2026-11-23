@@ -1,6 +1,7 @@
 use crate::{
     auth::{self, Profile, Provider},
-    catalog::{Catalog, Endpoint, Metrics, SpeedUnit},
+    catalog::{Catalog, Metric, Metrics, SpeedUnit, KEY_VARIABLE},
+    native::{self, Benchmark, Pin, Pins, DEFAULT_SETTING},
     usage::{Tick, Usage},
 };
 use serde::{Deserialize, Serialize};
@@ -14,71 +15,93 @@ pub(crate) const STATE_DIRECTORY: &str = "agent-command-routing-v1";
 const OVERRIDE_FILE: &str = "override.json";
 const SPLIT_DELIMITER: &str = ";;";
 const MAX_SPLIT_UNITS: usize = 16;
-const DEFAULT: &str = "default";
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Model {
+    Default,
+    Alias(&'static str),
+    Pinned(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Configuration {
     pub(crate) provider: Provider,
-    pub(crate) model: &'static str,
-    pub(crate) effort: &'static str,
+    pub(crate) model: Model,
+    pub(crate) effort: Option<String>,
 }
 
-const fn configuration(
-    provider: Provider,
-    model: &'static str,
-    effort: &'static str,
-) -> Configuration {
-    Configuration {
-        provider,
-        model,
-        effort,
+const CLAUDE_DISPATCH_ALIASES: [&str; 2] = ["opus", "sonnet"];
+
+pub(crate) fn configurations(provider: Provider, pin: Option<&Pin>) -> Vec<Configuration> {
+    let mut configurations = vec![Configuration::provider_default(provider)];
+    if provider == Provider::Claude {
+        configurations.extend(CLAUDE_DISPATCH_ALIASES.map(|alias| Configuration {
+            provider,
+            model: Model::Alias(alias),
+            effort: None,
+        }));
     }
-}
-
-pub(crate) const SUPPORTED: [Configuration; 8] = [
-    configuration(Provider::Claude, DEFAULT, DEFAULT),
-    configuration(Provider::Claude, "opus", DEFAULT),
-    configuration(Provider::Claude, "sonnet", DEFAULT),
-    configuration(Provider::Codex, DEFAULT, DEFAULT),
-    configuration(Provider::Codex, "gpt-5-codex", "low"),
-    configuration(Provider::Codex, "gpt-5-codex", "medium"),
-    configuration(Provider::Codex, "gpt-5-codex", "high"),
-    configuration(Provider::Codex, "gpt-5-codex", DEFAULT),
-];
-
-pub(crate) fn supported(
-    provider: Provider,
-    model: &str,
-    effort: &str,
-) -> Option<&'static Configuration> {
-    SUPPORTED.iter().find(|configuration| {
-        configuration.provider == provider
-            && configuration.model == model
-            && configuration.effort == effort
-    })
+    configurations.extend(
+        pin.filter(|pin| pin.provider() == Some(provider))
+            .map(|pin| Configuration {
+                provider,
+                model: Model::Pinned(pin.model.clone()),
+                effort: pin.effort.clone(),
+            }),
+    );
+    configurations
 }
 
 impl Configuration {
+    pub(crate) fn provider_default(provider: Provider) -> Self {
+        Self {
+            provider,
+            model: Model::Default,
+            effort: None,
+        }
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn is_default(&self) -> bool {
-        self.model == DEFAULT && self.effort == DEFAULT
+        self.model == Model::Default && self.effort.is_none()
+    }
+
+    fn native_model(&self) -> Option<&str> {
+        match &self.model {
+            Model::Default => None,
+            Model::Alias(alias) => Some(alias),
+            Model::Pinned(model) => Some(model),
+        }
+    }
+
+    pub(crate) fn benchmark(&self) -> Option<Benchmark> {
+        match &self.model {
+            Model::Pinned(model) => {
+                native::benchmark(self.provider, Some(model), self.effort.as_deref())
+            }
+            Model::Default | Model::Alias(_) => None,
+        }
     }
 
     pub(crate) fn arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
         match self.provider {
-            Provider::Claude if self.model != DEFAULT => {
-                arguments.extend(["--model".to_owned(), self.model.to_owned()]);
-            }
-            Provider::Claude => {}
-            Provider::Codex => {
-                if self.model != DEFAULT {
-                    arguments.extend(["-c".to_owned(), format!("model=\"{}\"", self.model)]);
+            Provider::Claude => {
+                if let Some(model) = self.native_model() {
+                    arguments.extend(["--model".to_owned(), model.to_owned()]);
                 }
-                if self.effort != DEFAULT {
+                if let Some(effort) = &self.effort {
+                    arguments.extend(["--effort".to_owned(), effort.clone()]);
+                }
+            }
+            Provider::Codex => {
+                if let Some(model) = self.native_model() {
+                    arguments.extend(["-c".to_owned(), format!("model=\"{model}\"")]);
+                }
+                if let Some(effort) = &self.effort {
                     arguments.extend([
                         "-c".to_owned(),
-                        format!("model_reasoning_effort=\"{}\"", self.effort),
+                        format!("model_reasoning_effort=\"{effort}\""),
                     ]);
                 }
             }
@@ -86,19 +109,26 @@ impl Configuration {
         arguments
     }
 
-    fn label(&self) -> String {
-        match (self.model, self.effort) {
-            (DEFAULT, DEFAULT) => "provider default".into(),
-            (model, DEFAULT) => model.into(),
-            (model, effort) => format!("{model} {effort}"),
+    pub(crate) fn label(&self) -> String {
+        match (&self.model, &self.effort) {
+            (Model::Default, _) => "provider default".into(),
+            (Model::Alias(alias), _) => format!("{alias} alias"),
+            (Model::Pinned(model), Some(effort)) => format!("{model} {effort}"),
+            (Model::Pinned(model), None) => format!("{model} {DEFAULT_SETTING}"),
         }
     }
 
-    fn order(&self) -> usize {
-        SUPPORTED
-            .iter()
-            .position(|configuration| configuration == self)
-            .unwrap_or(usize::MAX)
+    fn order(&self) -> (u8, &str, &str) {
+        let kind = match self.model {
+            Model::Default => 0,
+            Model::Alias(_) => 1,
+            Model::Pinned(_) => 2,
+        };
+        (
+            kind,
+            self.native_model().unwrap_or_default(),
+            self.effort.as_deref().unwrap_or_default(),
+        )
     }
 }
 
@@ -118,12 +148,15 @@ pub(crate) enum Difficulty {
     Hard,
 }
 
+pub(crate) const STANDARD_FLOOR: f64 = 40.0;
+pub(crate) const HARD_FLOOR: f64 = 55.0;
+
 impl Difficulty {
     pub(crate) fn floor(self) -> Option<f64> {
         match self {
             Self::Any => None,
-            Self::Standard => Some(40.0),
-            Self::Hard => Some(55.0),
+            Self::Standard => Some(STANDARD_FLOOR),
+            Self::Hard => Some(HARD_FLOOR),
         }
     }
 
@@ -244,9 +277,16 @@ pub(crate) struct Headroom {
 pub(crate) struct Candidate {
     pub(crate) profile: usize,
     pub(crate) label: String,
-    pub(crate) configuration: &'static Configuration,
+    pub(crate) configuration: Configuration,
     pub(crate) metrics: Metrics,
+    pub(crate) metric: Option<Metric>,
     pub(crate) headroom: Headroom,
+}
+
+impl Candidate {
+    pub(crate) fn score(&self) -> Option<f64> {
+        self.metric.and_then(|metric| self.metrics.value(metric))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,6 +307,7 @@ pub(crate) fn allowance_refusal(usage: &io::Result<Usage>, now: Tick) -> Option<
 pub(crate) fn candidates(
     profiles: &[Profile],
     catalog: &Catalog,
+    pins: &Pins,
     now: Tick,
 ) -> (Vec<Candidate>, Vec<Exclusion>) {
     let mut candidates = Vec::new();
@@ -290,19 +331,16 @@ pub(crate) fn candidates(
             rate: usage.headroom_rate(now),
             remaining: usage.remaining(now),
         };
-        for configuration in SUPPORTED
-            .iter()
-            .filter(|configuration| configuration.provider == profile.provider)
-        {
+        for configuration in configurations(profile.provider, pins.get(&label)) {
             candidates.push(Candidate {
                 profile: index,
                 label: label.clone(),
+                metrics: configuration
+                    .benchmark()
+                    .map(|benchmark| catalog.metrics(&benchmark))
+                    .unwrap_or_default(),
+                metric: None,
                 configuration,
-                metrics: catalog.metrics(
-                    profile.provider,
-                    configuration.model,
-                    configuration.effort,
-                ),
                 headroom,
             });
         }
@@ -310,18 +348,17 @@ pub(crate) fn candidates(
     (candidates, exclusions)
 }
 
-fn source_rank(endpoint: Endpoint) -> u8 {
-    match endpoint {
-        Endpoint::AgentsCoding => 0,
-        Endpoint::ModelsFree => 1,
-    }
+pub(crate) fn ranking_metric(candidates: &[Candidate]) -> Option<Metric> {
+    Metric::PREFERENCE.into_iter().find(|metric| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.metrics.value(*metric).is_some())
+    })
 }
 
 fn compare_index(left: &Candidate, right: &Candidate) -> Ordering {
-    match (left.metrics.index, right.metrics.index) {
-        (Some(left), Some(right)) => source_rank(left.endpoint)
-            .cmp(&source_rank(right.endpoint))
-            .then_with(|| right.value.total_cmp(&left.value)),
+    match (left.score(), right.score()) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -371,12 +408,23 @@ pub(crate) fn compare(policy: Policy, left: &Candidate, right: &Candidate) -> Or
 }
 
 pub(crate) fn meets_floor(candidate: &Candidate, difficulty: Difficulty) -> bool {
-    difficulty.floor().is_none_or(|floor| {
-        candidate
-            .metrics
-            .index
-            .is_some_and(|index| index.value >= floor)
-    })
+    difficulty
+        .floor()
+        .is_none_or(|floor| candidate.score().is_some_and(|score| score >= floor))
+}
+
+fn floor_refusal(difficulty: Difficulty, metric: Option<Metric>, best: Option<f64>) -> String {
+    let floor = difficulty.floor().unwrap_or_default();
+    let name = difficulty.name();
+    match (metric, best) {
+        (Some(metric), Some(best)) => format!(
+            "No eligible model meets the {name} floor {floor:.0} on the {}; best is {best:.1}.",
+            metric.name()
+        ),
+        _ => format!(
+            "No eligible model meets the {name} floor {floor:.0}: no published coding or intelligence index is available. Run agent-command catalog refresh with your own {KEY_VARIABLE}."
+        ),
+    }
 }
 
 pub(crate) fn rank(
@@ -384,34 +432,32 @@ pub(crate) fn rank(
     policy: Policy,
     difficulty: Difficulty,
 ) -> Result<Vec<Candidate>, String> {
-    let best_below = candidates
+    let metric = ranking_metric(&candidates);
+    for candidate in &mut candidates {
+        candidate.metric = metric;
+    }
+    let best = candidates
         .iter()
-        .filter_map(|candidate| candidate.metrics.index.map(|index| index.value))
+        .filter_map(Candidate::score)
         .max_by(f64::total_cmp);
     let total = candidates.len();
     candidates.retain(|candidate| meets_floor(candidate, difficulty));
     if candidates.is_empty() && total > 0 {
-        let floor = difficulty.floor().unwrap_or_default();
-        return Err(match best_below {
-            Some(best) => format!(
-                "No eligible model meets the {} floor {floor:.0}; best published index is {best:.1}.",
-                difficulty.name()
-            ),
-            None => format!(
-                "No eligible model meets the {} floor {floor:.0}; no published index is available.",
-                difficulty.name()
-            ),
-        });
+        return Err(floor_refusal(difficulty, metric, best));
     }
     candidates.sort_by(|left, right| compare(policy, left, right));
     Ok(candidates)
 }
 
+fn score_label(candidate: &Candidate) -> String {
+    match (candidate.metric, candidate.score()) {
+        (None, _) => "unscored".into(),
+        (Some(metric), None) => format!("{} n/a", metric.name()),
+        (Some(metric), Some(score)) => format!("{} {score:.1}", metric.name()),
+    }
+}
+
 pub(crate) fn describe(candidate: &Candidate) -> String {
-    let index = candidate.metrics.index.map_or_else(
-        || "index n/a".to_owned(),
-        |index| format!("index {:.1} {}", index.value, index.endpoint.scope()),
-    );
     let speed = candidate.metrics.speed.map_or_else(
         || "speed n/a".to_owned(),
         |speed| match speed.unit {
@@ -424,9 +470,10 @@ pub(crate) fn describe(candidate: &Candidate) -> String {
         |remaining| format!("{remaining:.0}% left"),
     );
     format!(
-        "{} {} · {index} · {speed} · {headroom}",
+        "{} {} · {} · {speed} · {headroom}",
         candidate.label,
-        candidate.configuration.label()
+        candidate.configuration.label(),
+        score_label(candidate)
     )
 }
 
@@ -555,7 +602,7 @@ pub(crate) fn allocate(units: usize, ranked: &[Candidate]) -> Vec<Candidate> {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        catalog::{Score, Speed},
+        catalog::Speed,
         usage::{tests::Fixture, tick},
     };
     use serde_json::json;
@@ -578,21 +625,46 @@ fi
 exit 3
 "#;
 
+    pub(crate) fn pin(profile: &str, model: &str, effort: Option<&str>) -> Pin {
+        Pin {
+            profile: profile.into(),
+            model: model.into(),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
+    fn claude_configuration(slot: usize) -> Configuration {
+        let pinned = pin("claude/fixture", "claude-opus-5-5", Some("high"));
+        configurations(Provider::Claude, Some(&pinned)).swap_remove(slot)
+    }
+
+    fn metrics(index: Option<(Metric, f64)>, speed: Option<(SpeedUnit, f64)>) -> Metrics {
+        let value = |metric| {
+            index
+                .filter(|(chosen, _)| *chosen == metric)
+                .map(|(_, value)| value)
+        };
+        Metrics {
+            coding_agent_index: value(Metric::CodingAgent),
+            coding_index: value(Metric::Coding),
+            intelligence_index: value(Metric::Intelligence),
+            speed: speed.map(|(unit, value)| Speed { unit, value }),
+        }
+    }
+
     fn candidate(
         label: &str,
         configuration: usize,
-        index: Option<(Endpoint, f64)>,
+        index: Option<(Metric, f64)>,
         speed: Option<(SpeedUnit, f64)>,
         rate: Option<f64>,
     ) -> Candidate {
         Candidate {
             profile: label.bytes().map(usize::from).sum(),
             label: label.into(),
-            configuration: &SUPPORTED[configuration],
-            metrics: Metrics {
-                index: index.map(|(endpoint, value)| Score { endpoint, value }),
-                speed: speed.map(|(unit, value)| Speed { unit, value }),
-            },
+            configuration: claude_configuration(configuration),
+            metrics: metrics(index, speed),
+            metric: None,
             headroom: Headroom {
                 rate,
                 remaining: rate.map(|rate| rate * 100.0),
@@ -640,7 +712,8 @@ exit 3
         observe(&profiles[4], (0.9, 90_000), None);
         observe(&profiles[6], (1.0, 1), None);
         let later = tick(NOW + 2, 2_000);
-        let (candidates, exclusions) = candidates(&profiles, &Catalog::load(None), later);
+        let (candidates, exclusions) =
+            candidates(&profiles, &Catalog::load(None), &Pins::default(), later);
         assert_eq!(
             exclusions,
             [
@@ -676,8 +749,8 @@ exit 3
             vec![
                 candidate(
                     "claude/a",
-                    1,
-                    Some((Endpoint::ModelsFree, 54.9)),
+                    3,
+                    Some((Metric::Intelligence, 54.9)),
                     None,
                     Some(1.0),
                 ),
@@ -698,21 +771,21 @@ exit 3
         .unwrap_err();
         assert_eq!(
             error,
-            "No eligible model meets the hard floor 55; best published index is 54.9. Skipped: claude/c latched."
+            "No eligible model meets the hard floor 55 on the AA intelligence index; best is 54.9. Skipped: claude/c latched."
         );
         let ranked = rank(
             vec![
                 candidate(
                     "claude/a",
-                    1,
-                    Some((Endpoint::ModelsFree, 54.9)),
+                    3,
+                    Some((Metric::Intelligence, 54.9)),
                     None,
                     Some(9.0),
                 ),
                 candidate(
                     "claude/b",
-                    2,
-                    Some((Endpoint::ModelsFree, 55.0)),
+                    3,
+                    Some((Metric::Intelligence, 55.0)),
                     None,
                     Some(1.0),
                 ),
@@ -723,13 +796,10 @@ exit 3
         .unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].label, "claude/b");
-        let unscored = rank(
-            vec![candidate("claude/b", 0, None, None, None)],
-            Policy::Default,
-            Difficulty::Standard,
-        )
-        .unwrap_err();
-        assert!(unscored.contains("no published index is available"));
+        assert_eq!(
+            describe(&ranked[0]),
+            "claude/b claude-opus-5-5 high · AA intelligence index 55.0 · speed n/a · 100% left"
+        );
         assert_eq!(
             rank(
                 vec![candidate("claude/b", 0, None, None, None)],
@@ -740,6 +810,34 @@ exit 3
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn keyless_standard_and_hard_fail_closed_with_a_visible_reason() {
+        let fixture = Fixture::new("keyless-floor", SIGNED_IN);
+        let profiles = [fixture.profile(Provider::Claude, "work")];
+        let pins =
+            Pins::from_pins(vec![pin("claude/work", "claude-opus-5-5", Some("high"))]).unwrap();
+        for difficulty in [Difficulty::Standard, Difficulty::Hard] {
+            let (candidates, _) = candidates(&profiles, &Catalog::load(None), &pins, tick(NOW, 0));
+            assert_eq!(candidates.len(), 4);
+            let floor = difficulty.floor().unwrap();
+            assert_eq!(
+                rank(candidates, Policy::Default, difficulty).unwrap_err(),
+                format!(
+                    "No eligible model meets the {} floor {floor:.0}: no published coding or intelligence index is available. Run agent-command catalog refresh with your own ARTIFICIAL_ANALYSIS_API_KEY.",
+                    difficulty.name()
+                )
+            );
+        }
+        let (candidates, _) = candidates(&profiles, &Catalog::load(None), &pins, tick(NOW, 0));
+        let ranked = rank(candidates, Policy::Default, Difficulty::Any).unwrap();
+        assert!(ranked.iter().all(|candidate| candidate.metric.is_none()));
+        assert_eq!(
+            describe(&ranked[0]),
+            "claude/work provider default · unscored · speed n/a · headroom unknown"
+        );
+        assert_eq!((STANDARD_FLOOR, HARD_FLOOR), (40.0, 55.0));
     }
 
     #[test]
@@ -756,7 +854,12 @@ exit 3
         observe(&profiles[1], (0.5, 100), Some((0.5, 1_000)));
         observe(&profiles[2], (0.5, 2_000), None);
         observe(&profiles[3], (0.5, 2_000), None);
-        let (candidates, _) = candidates(&profiles, &Catalog::load(None), tick(NOW, 0));
+        let (candidates, _) = candidates(
+            &profiles,
+            &Catalog::load(None),
+            &Pins::default(),
+            tick(NOW, 0),
+        );
         let ranked = rank(candidates, Policy::Ordinary, Difficulty::Any).unwrap();
         let order: Vec<_> = ranked
             .iter()
@@ -832,62 +935,67 @@ exit 3
     }
 
     #[test]
-    fn default_policy_prefers_comparable_exact_coding_index() {
+    fn one_metric_ranks_every_candidate_and_missing_values_stay_null() {
+        let intelligence_only = vec![
+            candidate(
+                "claude/high",
+                3,
+                Some((Metric::Intelligence, 63.0)),
+                None,
+                None,
+            ),
+            candidate(
+                "claude/low",
+                3,
+                Some((Metric::Intelligence, 58.0)),
+                None,
+                Some(9.0),
+            ),
+            candidate("claude/alias", 1, None, None, Some(9.0)),
+        ];
+        assert_eq!(
+            ranking_metric(&intelligence_only),
+            Some(Metric::Intelligence)
+        );
         let ranked = rank(
-            vec![
-                candidate(
-                    "claude/model-high",
-                    1,
-                    Some((Endpoint::ModelsFree, 70.0)),
-                    None,
-                    Some(9.0),
-                ),
-                candidate(
-                    "claude/agent-low",
-                    2,
-                    Some((Endpoint::AgentsCoding, 50.0)),
-                    None,
-                    None,
-                ),
-                candidate(
-                    "claude/agent-high",
-                    1,
-                    Some((Endpoint::AgentsCoding, 60.0)),
-                    None,
-                    None,
-                ),
-                candidate("claude/missing", 0, None, None, Some(9.0)),
-                candidate(
-                    "claude/model-tie-b",
-                    2,
-                    Some((Endpoint::ModelsFree, 65.0)),
-                    Some((SpeedUnit::TokensPerSecond, 90.0)),
-                    None,
-                ),
-                candidate(
-                    "claude/model-tie-a",
-                    2,
-                    Some((Endpoint::ModelsFree, 65.0)),
-                    Some((SpeedUnit::TokensPerSecond, 90.0)),
-                    None,
-                ),
-            ],
+            intelligence_only.clone(),
             Policy::Default,
-            Difficulty::Any,
+            Difficulty::Standard,
         )
         .unwrap();
         assert_eq!(
             ranked.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
-            [
-                "claude/agent-high",
-                "claude/agent-low",
-                "claude/model-high",
-                "claude/model-tie-a",
-                "claude/model-tie-b",
-                "claude/missing"
-            ]
+            ["claude/high", "claude/low"]
         );
-        assert!(describe(&ranked[5]).contains("index n/a"));
+        let mut mixed = intelligence_only;
+        mixed.push(candidate(
+            "claude/agent",
+            3,
+            Some((Metric::CodingAgent, 41.0)),
+            None,
+            None,
+        ));
+        mixed[0].metrics.coding_index = Some(70.0);
+        assert_eq!(ranking_metric(&mixed), Some(Metric::CodingAgent));
+        let ranked = rank(mixed.clone(), Policy::Default, Difficulty::Any).unwrap();
+        assert_eq!(
+            ranked.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            ["claude/agent", "claude/alias", "claude/low", "claude/high"]
+        );
+        assert!(ranked
+            .iter()
+            .all(|candidate| candidate.metric == Some(Metric::CodingAgent)));
+        assert!(describe(&ranked[3]).contains("· AA coding agent index n/a ·"));
+        assert!(describe(&ranked[0]).contains("· AA coding agent index 41.0 ·"));
+        assert_eq!(
+            rank(mixed.clone(), Policy::Default, Difficulty::Hard).unwrap_err(),
+            "No eligible model meets the hard floor 55 on the AA coding agent index; best is 41.0."
+        );
+        mixed.pop();
+        assert_eq!(ranking_metric(&mixed), Some(Metric::Coding));
+        let ranked = rank(mixed, Policy::Default, Difficulty::Standard).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert!(describe(&ranked[0]).contains("AA coding index 70.0"));
     }
 
     #[test]
@@ -993,17 +1101,58 @@ exit 3
 
     #[test]
     fn configurations_produce_native_execution_arguments() {
-        assert!(SUPPORTED[0].arguments().is_empty());
-        assert_eq!(SUPPORTED[1].arguments(), ["--model", "opus"]);
+        let claude = |effort: Option<&str>| {
+            configurations(
+                Provider::Claude,
+                Some(&pin("claude/work", "claude-opus-5-5", effort)),
+            )
+        };
+        let pinned = claude(Some("high"));
+        assert_eq!(pinned.len(), 4);
+        assert!(pinned[0].arguments().is_empty());
+        assert_eq!(pinned[1].arguments(), ["--model", "opus"]);
+        assert_eq!(pinned[1].benchmark(), None);
         assert_eq!(
-            SUPPORTED[6].arguments(),
+            pinned[3].arguments(),
+            ["--model", "claude-opus-5-5", "--effort", "high"]
+        );
+        assert_eq!(
+            pinned[3].benchmark().unwrap().models_free_slug(),
+            "claude-opus-5-5-high"
+        );
+        let max = claude(Some("max")).swap_remove(3);
+        assert_eq!(
+            max.arguments(),
+            ["--model", "claude-opus-5-5", "--effort", "max"]
+        );
+        assert_eq!(max.benchmark(), None);
+        let unset = claude(None).swap_remove(3);
+        assert_eq!(unset.arguments(), ["--model", "claude-opus-5-5"]);
+        assert_eq!(unset.label(), "claude-opus-5-5 AA default setting");
+        let codex = configurations(
+            Provider::Codex,
+            Some(&pin("codex/work", "gpt-6.2-sol", Some("high"))),
+        );
+        assert_eq!(codex.len(), 2);
+        assert!(codex[0].arguments().is_empty());
+        assert_eq!(
+            codex[1].arguments(),
             [
                 "-c",
-                "model=\"gpt-5-codex\"",
+                "model=\"gpt-6.2-sol\"",
                 "-c",
                 "model_reasoning_effort=\"high\""
             ]
         );
-        assert!(supported(Provider::Claude, "opus", "high").is_none());
+        assert_eq!(codex[1].benchmark().unwrap().slug, "gpt-6-2-sol");
+        assert_eq!(
+            configurations(
+                Provider::Codex,
+                Some(&pin("claude/work", "claude-opus-5-5", None))
+            )
+            .len(),
+            1
+        );
+        assert_eq!(configurations(Provider::Claude, None).len(), 3);
     }
 }
