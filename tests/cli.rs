@@ -211,3 +211,90 @@ fn triage_reports_json_without_a_terminal_and_never_prints_secrets() {
     assert!(!usage.status.success());
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn mcp_stdio_binary_answers_initialize_tools_and_refuses_traversal() {
+    use std::io::Write;
+    let root = std::env::temp_dir().join(format!("agent-cli-mcp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let base = root.join("plain");
+    std::fs::create_dir_all(&base).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-command"))
+        .args(["mcp", "--root"])
+        .arg(&base)
+        .env("SUB_AUTH_DIR", root.join("state"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_thread","arguments":{"name":"nova","role":"r","workspace":"../.."}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_thread","arguments":{"name":"echo","role":"writer"}}}"#,
+    ];
+    let mut stdin = child.stdin.take().unwrap();
+    for request in requests {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = |id: u32| {
+        text.lines()
+            .find(|line| {
+                line.contains(&format!("\"id\":{id},")) || line.contains(&format!("\"id\":{id}}}"))
+            })
+            .unwrap_or_else(|| panic!("no response {id} in {text}"))
+            .to_owned()
+    };
+    assert!(line(1).contains("\"protocolVersion\":\"2025-06-18\""));
+    assert!(line(2).contains("delegate_task"));
+    assert!(line(3).contains("-32602"));
+    assert!(line(4).contains("\"isError\":false"));
+    assert!(root
+        .join("state/agent-command-orchestrator-v1/workspaces/echo")
+        .is_dir());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn daemon_prints_service_files_and_refuses_wildcard_binds() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agent-command"))
+            .arg("daemon")
+            .args(args)
+            .current_dir(std::env::temp_dir())
+            .output()
+            .unwrap()
+    };
+    for (os, marker) in [
+        ("linux", "ExecStart="),
+        ("macos", "<key>ProgramArguments</key>"),
+        ("windows", "schtasks /Create"),
+    ] {
+        let printed = run(&["--print-service", os]);
+        assert!(printed.status.success(), "{printed:?}");
+        assert!(
+            String::from_utf8_lossy(&printed.stdout).contains(marker),
+            "{os}"
+        );
+    }
+    let refused = run(&["--bind", "0.0.0.0:47100", "--allow-remote"]);
+    assert!(!refused.status.success());
+    let remote = run(&["--bind", "192.0.2.1:47100"]);
+    assert!(!remote.status.success());
+    assert!(String::from_utf8_lossy(&remote.stderr).contains("--allow-remote"));
+}
+
+#[test]
+fn connect_requires_a_token_for_remote_daemons() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-command"))
+        .args(["connect", "http://192.0.2.1:47100", "--once"])
+        .env_remove("AGENT_COMMAND_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No daemon token"));
+}
