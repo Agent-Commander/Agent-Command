@@ -5,6 +5,8 @@ mod cli;
 mod mission;
 mod native;
 mod routing;
+pub mod token_burn;
+pub mod update;
 mod usage;
 pub use cli::run_cli;
 
