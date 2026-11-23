@@ -1,5 +1,7 @@
 use crate::{
-    auth, catalog, mission, native, routing,
+    auth, catalog, mission, native,
+    permissions::PermissionMode,
+    routing,
     specialists::{self, Entry, Member, Status, Store},
 };
 use serde::{Deserialize, Serialize};
@@ -111,7 +113,11 @@ impl NativeEngine {
         Self { profile_root }
     }
 
-    fn route(&self, request: routing::Request) -> Result<mission::Route, String> {
+    fn route(
+        &self,
+        request: routing::Request,
+        mode: PermissionMode,
+    ) -> Result<mission::Route, String> {
         let state = auth::existing_private_state(&self.profile_root, routing::STATE_DIRECTORY)
             .map_err(|error| error.to_string())?;
         let pins = native::load_existing(&self.profile_root).map_err(|error| error.to_string())?;
@@ -120,7 +126,18 @@ impl NativeEngine {
             preferred: None,
             catalog: catalog::Catalog::load(state.as_deref()),
             pins,
+            target: None,
+            mode,
         })
+    }
+}
+
+pub(crate) fn external_mode(requested: PermissionMode) -> PermissionMode {
+    match requested {
+        PermissionMode::ReadOnly => PermissionMode::ReadOnly,
+        PermissionMode::Supervised
+        | PermissionMode::AutoAcceptEdits
+        | PermissionMode::WorktreeAuto => PermissionMode::Supervised,
     }
 }
 
@@ -133,7 +150,7 @@ impl Engine for NativeEngine {
         let request = crate::framed(routing::parse(task)?, |unit| {
             specialists::specialist_prompt(member, unit)
         });
-        let route = self.route(request)?;
+        let route = self.route(request, external_mode(member.permission))?;
         Ok(Box::new(mission::Mission::launch(
             profiles,
             route,
@@ -368,6 +385,8 @@ impl Control {
             .isolate(&base, name)
             .map_err(|error| refused(format!("Cannot isolate {name}: {error}")))?;
         let member = Member::new(name, role.trim(), task.map(str::trim), Some(isolated));
+        let permission = external_mode(member.permission);
+        let member = member.with_permission(Some(permission));
         threads.push(Thread {
             member,
             sequence: 0,
@@ -816,6 +835,25 @@ pub(crate) mod tests {
         assert!(Scope::parse("full-access").unwrap_err().contains("never"));
         assert!(Scope::parse("root").is_err());
         assert!(!Scope::ReadOnly.allows_changes());
+    }
+
+    #[test]
+    fn outside_threads_never_run_above_supervised() {
+        for (requested, granted) in [
+            (PermissionMode::ReadOnly, PermissionMode::ReadOnly),
+            (PermissionMode::Supervised, PermissionMode::Supervised),
+            (PermissionMode::AutoAcceptEdits, PermissionMode::Supervised),
+            (PermissionMode::WorktreeAuto, PermissionMode::Supervised),
+        ] {
+            assert_eq!(external_mode(requested), granted);
+        }
+        let scratch = Scratch::new("modes");
+        let control = control(&scratch, false);
+        control.create("quill", "doc writer", None, None).unwrap();
+        control.create("audit", "qa reviewer", None, None).unwrap();
+        let crew = scratch.store().load_roster().unwrap();
+        assert_eq!(crew[0].permission, PermissionMode::Supervised);
+        assert_eq!(crew[1].permission, PermissionMode::ReadOnly);
     }
 
     #[test]

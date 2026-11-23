@@ -132,7 +132,8 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     };
     let spawned = run(&["spawn", "echo", "writer", "Draft", "notes"]);
     assert!(spawned.status.success(), "{spawned:?}");
-    assert!(String::from_utf8_lossy(&spawned.stdout).contains("Spawned echo (writer) in directory"));
+    assert!(String::from_utf8_lossy(&spawned.stdout)
+        .contains("Spawned echo (writer, auto-edits) in directory"));
     let listed = String::from_utf8_lossy(&run(&["list"]).stdout).into_owned();
     assert!(
         listed.starts_with("echo\twriter\tIDLE\tdirectory"),
@@ -140,6 +141,31 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     );
     let status = String::from_utf8_lossy(&run(&["status", "echo"]).stdout).into_owned();
     assert!(status.contains("task: Draft notes"), "{status}");
+    assert!(status.contains("mode: auto-edits"), "{status}");
+    assert!(
+        status.contains("review: revision 0 · round 0/3 · author unknown"),
+        "{status}"
+    );
+    let refused = run(&[
+        "spawn",
+        "bolt",
+        "builder",
+        "--mode",
+        "worktree-auto",
+        "Ship",
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not an isolated git worktree"));
+    assert!(!root
+        .join("state/agent-command-orchestrator-v1/workspaces/bolt")
+        .exists());
+    let bypass = run(&["spawn", "rogue", "builder", "--mode", "full-access"]);
+    assert!(!bypass.status.success());
+    let reviewed = run(&["review", "echo", "edge cases"]);
+    assert!(!reviewed.status.success());
+    assert!(String::from_utf8_lossy(&reviewed.stderr).contains("no recorded changes"));
+    let playtester = run(&["spawn", "quinn", "playtester"]);
+    assert!(String::from_utf8_lossy(&playtester.stdout).contains("(playtester, read-only)"));
     assert!(root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
         .is_dir());

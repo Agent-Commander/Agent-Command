@@ -11,9 +11,12 @@ mod mcp;
 mod mission;
 mod native;
 mod panel;
+mod permissions;
+mod review;
 mod routing;
 mod settings;
 mod specialists;
+mod targeting;
 pub mod token_burn;
 pub mod update;
 mod usage;
@@ -162,6 +165,13 @@ fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> rout
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct Delegation {
+    name: String,
+    task: String,
+    target: Option<targeting::Target>,
+    review: bool,
+}
+
 enum ProfileRoute {
     Routed { model: String, metric: String },
     Excluded(String),
@@ -184,7 +194,8 @@ struct Live {
     abandon_area: Rect,
     mission: Option<(String, mission::Mission)>,
     store: Option<specialists::Store>,
-    queue: VecDeque<(String, String)>,
+    queue: VecDeque<Delegation>,
+    reviewing: bool,
     reply: String,
     entry: Option<(String, &'static str)>,
     routes: Vec<ProfileRoute>,
@@ -216,6 +227,7 @@ impl Live {
             abandon_area: Rect::default(),
             mission: None,
             queue: VecDeque::new(),
+            reviewing: false,
             reply: String::new(),
             entry: None,
             routes: Vec::new(),
@@ -302,12 +314,19 @@ impl Live {
         )
     }
 
-    fn route(&self, request: routing::Request) -> mission::Route {
+    fn route(
+        &self,
+        request: routing::Request,
+        target: Option<targeting::Target>,
+        mode: permissions::PermissionMode,
+    ) -> mission::Route {
         mission::Route {
             request,
             preferred: self.preferred.map(|index| self.profiles[index].to_string()),
             catalog: self.catalog(),
             pins: self.pins.clone(),
+            target,
+            mode,
         }
     }
 
@@ -632,6 +651,11 @@ impl App {
         match event {
             mission::Event::Running { profile, reason } => {
                 self.crew[index].status = Status::Running;
+                if !live.reviewing && !self.crew[index].is_commander() {
+                    self.crew[index]
+                        .review
+                        .record_author(live.profiles[profile].provider);
+                }
                 live.running_profile = Some(profile);
                 live.last_routed = Some(profile);
                 live.usage_checked_at = None;
@@ -651,8 +675,13 @@ impl App {
             mission::Event::Output(text) => {
                 live.reply.push_str(&text);
                 live.reply.push('\n');
+                let speaker = if live.reviewing {
+                    format!("{name} review")
+                } else {
+                    name.to_owned()
+                };
                 for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    self.record(index, format!("{name}  {line}"));
+                    self.record(index, format!("{speaker}  {line}"));
                 }
             }
             mission::Event::Finished(result) => self.finish_mission(index, result),
@@ -671,6 +700,7 @@ impl App {
         live.usage_checked_at = None;
         live.refresh_usage();
         let reply = std::mem::take(&mut live.reply);
+        let reviewing = std::mem::take(&mut live.reviewing);
         let continuation = live.continuation.clone();
         let member = &mut self.crew[index];
         member.status = if result.is_ok() {
@@ -696,7 +726,8 @@ impl App {
                 Ok(()) => specialists::summary(&reply),
                 Err(error) => error.to_string(),
             };
-            self.push_log(format!("{name}  {label} · {outcome}"));
+            let kind = if reviewing { " review" } else { "" };
+            self.push_log(format!("{name}{kind}  {label} · {outcome}"));
             self.notice = format!("{name} {label}");
             self.save_roster();
         }
@@ -707,7 +738,7 @@ impl App {
         for directive in specialists::directives(reply) {
             match directive {
                 specialists::Directive::Spawn { name, role, task } => {
-                    if let (Some(index), Some(task)) = (self.spawn(&name, &role), task) {
+                    if let (Some(index), Some(task)) = (self.spawn(&name, &role, None), task) {
                         self.delegate(index, task);
                     }
                 }
@@ -738,29 +769,43 @@ impl App {
         self.crew[index].remember(entry);
     }
 
-    fn spawn(&mut self, name: &str, role: &str) -> Option<usize> {
+    fn spawn(
+        &mut self,
+        name: &str,
+        role: &str,
+        mode: Option<permissions::PermissionMode>,
+    ) -> Option<usize> {
         if let Err(error) = specialists::validate_name(name, &self.crew) {
             self.notice = error;
             return None;
         }
+        let mode = mode.unwrap_or_else(|| permissions::PermissionMode::default_for_role(role));
         let workspace = match self
             .live
             .as_ref()
             .and_then(|live| Some((live.store.as_ref()?, &live.workspace)))
         {
-            Some((store, base)) => match store.isolate(base, name) {
+            Some((store, base)) => match store.isolate_for(base, name, mode) {
                 Ok(workspace) => Some(workspace),
                 Err(error) => {
-                    self.notice = format!("Cannot isolate {name}: {error}");
+                    self.notice = error;
                     return None;
                 }
             },
-            None => None,
+            None => match mode.require_isolation(None) {
+                Ok(()) => None,
+                Err(refusal) => {
+                    self.notice = refusal;
+                    return None;
+                }
+            },
         };
-        self.crew.push(Member::new(name, role, None, workspace));
+        self.crew
+            .push(Member::new(name, role, None, workspace).with_permission(Some(mode)));
         let index = self.crew.len() - 1;
         self.push_log(format!(
-            "SYSTEM  Spawned {name} ({role}) · {}",
+            "SYSTEM  Spawned {name} ({role}, {}) · {}",
+            mode.flag(),
             specialists::workspace_label(&self.crew[index])
         ));
         self.save_roster();
@@ -781,14 +826,79 @@ impl App {
             self.notice = format!("Resume {name} before delegating.");
             return;
         }
-        self.crew[index].mission = task.clone();
+        let targeted = match targeting::extract(&task) {
+            Ok(targeted) if targeted.text.is_empty() => {
+                self.notice = "Enter a task after the @model target.".into();
+                return;
+            }
+            Ok(targeted) => targeted,
+            Err(error) => {
+                self.notice = error;
+                return;
+            }
+        };
+        self.crew[index].mission = targeted.text.clone();
         self.record(index, format!("TASK  {task}"));
         let Some(live) = &mut self.live else {
             self.notice = PREVIEW_NOTICE.into();
             return;
         };
-        live.queue.push_back((name.clone(), task.clone()));
+        live.queue.push_back(Delegation {
+            name: name.clone(),
+            task: targeted.text,
+            target: targeted.target,
+            review: false,
+        });
         self.push_log(format!("SYSTEM  Delegated to {name}: {task}"));
+        self.save_roster();
+        self.start_next();
+    }
+
+    fn review(&mut self, name: &str, focus: Option<String>, next_revision: bool) {
+        let Some(index) = specialists::find(&self.crew, name) else {
+            self.notice = format!("No specialist named {name}.");
+            return;
+        };
+        let Some(live) = &mut self.live else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        let signed_in = review::signed_in_providers(&live.profiles);
+        let reviewed = self.crew[index].workspace.as_ref().map(|w| w.path.clone());
+        let base = live.workspace.clone();
+        let mut roots: Vec<&Path> = reviewed.iter().map(PathBuf::as_path).collect();
+        roots.push(&base);
+        let planned = review::plan(
+            &mut self.crew[index],
+            &review::ReviewRequest {
+                focus: focus.as_deref(),
+                next_revision,
+                signed_in: &signed_in,
+                rule_roots: &roots,
+            },
+        );
+        let plan = match planned {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                self.push_log(format!("SYSTEM  {refusal}"));
+                self.notice = refusal;
+                self.save_roster();
+                return;
+            }
+        };
+        let name = self.crew[index].name.clone();
+        live.queue.push_back(Delegation {
+            name: name.clone(),
+            task: plan.prompt,
+            target: Some(plan.target),
+            review: true,
+        });
+        self.push_log(format!(
+            "SYSTEM  Review {name} round {}/{} · {} · read-only",
+            plan.round,
+            review::MAX_REVIEW_ROUNDS,
+            plan.note
+        ));
         self.save_roster();
         self.start_next();
     }
@@ -798,15 +908,16 @@ impl App {
         if live.mission.is_some() {
             return;
         }
-        let Some((name, task)) = live.queue.pop_front() else {
+        let Some(delegation) = live.queue.pop_front() else {
             return;
         };
-        let Some(index) = specialists::find(&self.crew, &name) else {
+        let Some(index) = specialists::find(&self.crew, &delegation.name) else {
             return self.start_next();
         };
-        match self.launch_specialist(index, &task) {
+        match self.launch_specialist(index, delegation) {
             Ok(()) => {}
             Err(reason) => {
+                let name = self.crew[index].name.clone();
                 self.crew[index].status = Status::Error;
                 self.push_log(format!("{name}  ERROR · {reason}"));
                 self.notice = reason;
@@ -816,7 +927,7 @@ impl App {
         }
     }
 
-    fn launch_specialist(&mut self, index: usize, task: &str) -> Result<(), String> {
+    fn launch_specialist(&mut self, index: usize, delegation: Delegation) -> Result<(), String> {
         let live = self.live.as_mut().expect("live delegation");
         let member = &self.crew[index];
         let workspace = member
@@ -826,14 +937,27 @@ impl App {
         if live.profiles.is_empty() {
             return Err(format!("{}.", panel::NO_PROVIDER_HINT));
         }
-        let request = framed(routing::parse(task)?, |unit| {
-            specialists::specialist_prompt(member, unit)
-        });
+        let (request, mode) = if delegation.review {
+            let request = routing::Request {
+                units: vec![delegation.task],
+                ..routing::Request::default()
+            };
+            (request, permissions::PermissionMode::ReadOnly)
+        } else {
+            member
+                .permission
+                .require_isolation(Some(&workspace.isolation))?;
+            let request = framed(routing::parse(&delegation.task)?, |unit| {
+                specialists::specialist_prompt(member, unit)
+            });
+            (request, member.permission)
+        };
         live.reply.clear();
         live.continuation = None;
+        live.reviewing = delegation.review;
         let mission = mission::Mission::launch(
             live.profiles.clone(),
-            live.route(request),
+            live.route(request, delegation.target, mode),
             workspace.path.clone(),
         );
         live.mission = Some((member.name.clone(), mission));
@@ -935,8 +1059,13 @@ impl App {
 
     fn orchestrate(&mut self, command: specialists::Command) {
         match command {
-            specialists::Command::Spawn { name, role, task } => {
-                if let Some(index) = self.spawn(&name, &role) {
+            specialists::Command::Spawn {
+                name,
+                role,
+                mode,
+                task,
+            } => {
+                if let Some(index) = self.spawn(&name, &role, mode) {
                     self.selected = index;
                     if let Some(task) = task {
                         self.delegate(index, task);
@@ -944,6 +1073,11 @@ impl App {
                 }
             }
             specialists::Command::Ask { name, task } => self.ask(&name, task),
+            specialists::Command::Review {
+                name,
+                focus,
+                next_revision,
+            } => self.review(&name, focus, next_revision),
             specialists::Command::Roster => {
                 let entry = self
                     .live
@@ -979,7 +1113,7 @@ impl App {
                 self.notice = format!("{} is running; remove it after it finishes.", member.name);
                 return;
             }
-            live.queue.retain(|(queued, _)| *queued != member.name);
+            live.queue.retain(|queued| queued.name != member.name);
             if let Some(Err(error)) = live.store.as_ref().map(|store| store.release(member)) {
                 self.notice = format!("Cannot remove {}: {error}", member.name);
                 return;
@@ -1058,7 +1192,14 @@ impl App {
             self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
             return;
         }
-        let request = match routing::parse(&command) {
+        let targeted = match targeting::extract(&command) {
+            Ok(targeted) => targeted,
+            Err(error) => {
+                self.notice = error;
+                return;
+            }
+        };
+        let request = match routing::parse(&targeted.text) {
             Ok(request) => framed(request, |unit| {
                 specialists::commander_prompt(self.log.iter().map(String::as_str), &self.crew, unit)
             }),
@@ -1070,9 +1211,14 @@ impl App {
         self.notice = format!("Routing in {}", live.workspace.display());
         live.continuation = None;
         live.reply.clear();
+        live.reviewing = false;
         let mission = mission::Mission::launch(
             live.profiles.clone(),
-            live.route(request),
+            live.route(
+                request,
+                targeted.target,
+                permissions::PermissionMode::Supervised,
+            ),
             live.workspace.clone(),
         );
         live.mission = Some((COMMANDER.into(), mission));
@@ -2365,7 +2511,7 @@ while test ! -f release; do sleep 0.01; done
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
             assert_eq!(
                 fs::read_to_string(fixture.root.join("arguments")).unwrap(),
-                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --\n"
+                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --\n"
             );
             fs::write(state.join(native::PINS_FILE), b"{\"schema\":\"agent-command-native-pins-v1\",\"pins\":[{\"profile\":\"claude/alpha\",\"model\":\"opus\",\"effort\":null}]}").unwrap();
             let mut reopened = test_live(
@@ -2400,6 +2546,107 @@ case "$prompt" in
   *) exit 9 ;;
 esac
 "#;
+
+    #[cfg(unix)]
+    fn cross_review_provider(argv_log: &Path) -> String {
+        format!(
+            r#"
+case "$1" in
+    auth) printf '%s\n' '{{"loggedIn":true,"authMethod":"claude.ai"}}'; exit ;;
+    -c)
+        shift 4
+        if test "$1" = login; then printf '%s\n' 'Logged in using ChatGPT' >&2; exit; fi
+        ;;
+esac
+printf '%s\n' "$*" >> '{}'
+prompt=$(cat)
+case "$prompt" in
+  "You are bolt"*"Task: Build it")
+    printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Built it"}}]}}}}' ;;
+  "You are an adversarial read-only reviewer"*"Focus: edge cases"*"SEVERITY:"*)
+    printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"VERDICT: APPROVE"}}}}' ;;
+  *) exit 9 ;;
+esac
+"#,
+            argv_log.display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_routes_to_the_opposite_family_read_only_and_caps_at_three_rounds() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let argv_log = std::env::temp_dir().join(format!("ac-cross-argv-{}", std::process::id()));
+        let _ = fs::remove_file(&argv_log);
+        let fixture = Fixture::new("cross-review", &cross_review_provider(&argv_log));
+        let repository = fixture.root.join("work");
+        specialists::tests::git_repository(&repository);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "alpha"),
+            fixture.profile(Provider::Codex, "beta"),
+        ];
+        let mut app = App::from_live(test_live(repository, profiles, None));
+        send(&mut app, "/spawn bolt builder --mode auto-edits");
+        assert_eq!(
+            app.crew[1].permission,
+            permissions::PermissionMode::AutoAcceptEdits
+        );
+        send(&mut app, "/ask bolt @claude Build it");
+        wait_for(&mut app, |app| app.crew[1].status == Status::Done);
+        assert_eq!(app.crew[1].review.author, Some(Provider::Claude));
+        assert_eq!(app.crew[1].mission, "Build it");
+        send(&mut app, "/review bolt edge cases");
+        assert!(
+            app.log.contains(
+                &"SYSTEM  Review bolt round 1/3 · Cross-family review: claude wrote it, codex reviews it · read-only"
+                    .to_owned()
+            ),
+            "{:?}",
+            app.log
+        );
+        wait_for(&mut app, |app| {
+            app.crew[1].status == Status::Done && !app.mission_running()
+        });
+        assert_eq!(
+            app.log.back().unwrap(),
+            "bolt review  DONE · VERDICT: APPROVE",
+            "{:?}",
+            app.log
+        );
+        assert_eq!(app.crew[1].review.author, Some(Provider::Claude));
+        assert_eq!(app.crew[1].review.rounds, 1);
+        assert!(app.live.as_ref().unwrap().preferred.is_none());
+        let argv = fs::read_to_string(&argv_log).unwrap();
+        let runs: Vec<&str> = argv
+            .lines()
+            .filter(|run| !run.starts_with("app-server"))
+            .collect();
+        assert_eq!(runs.len(), 2, "{argv}");
+        assert!(runs[0].starts_with("--print"), "{argv}");
+        assert!(
+            runs[0].ends_with("--permission-mode acceptEdits --"),
+            "{argv}"
+        );
+        assert!(runs[1].ends_with("--sandbox read-only -"), "{argv}");
+        assert!(!argv.contains("dangerously"));
+        app.crew[1].review.rounds = review::MAX_REVIEW_ROUNDS;
+        send(&mut app, "/review bolt edge cases");
+        assert!(
+            app.notice.starts_with("Review cap reached"),
+            "{}",
+            app.notice
+        );
+        assert!(!app.mission_running());
+        send(&mut app, "/review bolt --next-revision edge cases");
+        assert_eq!(
+            (app.crew[1].review.revision, app.crew[1].review.rounds),
+            (1, 1)
+        );
+        wait_for(&mut app, |app| !app.mission_running());
+        let _ = fs::remove_file(&argv_log);
+    }
 
     fn screen(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =

@@ -152,13 +152,61 @@ routing ranking (Auto), falling back to the first signed-in profile; override
 it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 
 ```text
-/spawn NAME ROLE [TASK]   create a specialist, optionally delegating TASK
-/ask NAME TASK            delegate TASK to a specialist
-/roster                   list the crew in Commander's feed
-/remove NAME              remove a specialist and its workspace
-/settings                 open Settings (also F3 or the top-bar item)
-/connect                  connect a provider profile
+/spawn NAME ROLE [--mode MODE] [TASK]   create a specialist, optionally delegating TASK
+/ask NAME TASK                          delegate TASK to a specialist
+/review NAME [--next-revision] [FOCUS]  cross-family read-only review of NAME's changes
+/roster                                 list the crew in Commander's feed
+/remove NAME                            remove a specialist and its workspace
+/settings                               open Settings (also F3 or the top-bar item)
+/connect                                connect a provider profile
 ```
+
+### Permission modes
+
+Every specialist carries a persisted permission mode. It is enforced in the
+provider CLI's argv, never by prompt text alone, and no mode ever passes
+`--dangerously-skip-permissions` or `--dangerously-bypass-approvals-and-sandbox`
+(a launch that would carry either is refused).
+
+| Mode | Default for roles | Claude Code argv | Codex argv |
+| --- | --- | --- | --- |
+| `read-only` | Playtester, Reviewer, QA, Audit | `--permission-mode default --disallowedTools Edit,Write,NotebookEdit` | `--sandbox read-only` |
+| `supervised` | Lead, Commander, Builder, everything else | `--permission-mode default` | `--sandbox workspace-write` |
+| `auto-edits` | Copywriter, Docs, Writer, Editor | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
+| `worktree-auto` | none (explicit only) | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `--sandbox workspace-write` |
+
+`worktree-auto` is refused unless the specialist's workspace is an isolated
+`git worktree`, both at spawn and again at every launch. Commander always runs
+`supervised`.
+
+### Cross-family review
+
+`/review NAME [FOCUS]` (or `agent-command specialist review NAME [FOCUS]`)
+reviews the latest changes of a specialist with the highest-ranked eligible
+profile from the opposite provider family: Claude work is reviewed by Codex and
+Codex work by Claude. The provider that produced each specialist's latest work
+is recorded on the roster. When only one family is signed in, the review falls
+back to that family and says so in the feed. Reviews always run `read-only` in
+the specialist's workspace and receive `REVIEW.md` plus every
+`.review-rules/*.md` (sorted, at most 32 files of 64 KiB each) from the
+specialist's workspace, or from the launch workspace when the specialist's has
+none, followed by an adversarial Playtester checklist (empty and huge input,
+concurrency, slow network, Unicode, expired auth, missing permissions) that
+asks for `FINDING` / `REPRO` / `EXPECTED` / `ACTUAL` / `SEVERITY 1-3` reports.
+
+Each revision gets at most 3 review rounds. A fourth `/review` is refused and
+asks the operator to decide: accept the work, or start a new revision with
+`--next-revision`.
+
+### Inline model targeting
+
+Put `@opus`, `@fable`, `@claude` (Claude) or `@astra`, `@sol`, `@codex` (Codex)
+anywhere in a `/spawn` task, an `/ask` task or a Commander message to route that
+single delegation to the highest-ranked signed-in profile of that provider, or
+to a configuration whose model name (alias or `agent-command model pin`) has
+that family segment. The token is removed from the prompt, Commander's entry
+profile is not changed, and a target with no matching profile fails with a
+visible reason. Two different targets in one delegation are refused.
 
 Commander can also reply with `SPAWN_SPECIALIST: NAME | ROLE | TASK` or
 `DELEGATE: NAME | TASK` lines. Each specialist runs in its own `git worktree`
@@ -169,6 +217,8 @@ and each result is posted back to Commander's feed. Select a specialist with
 
 ```sh
 agent-command specialist spawn nova reviewer Review the patch
+agent-command specialist spawn bolt builder --mode worktree-auto Ship the parser
+agent-command specialist review bolt edge cases
 agent-command specialist list
 agent-command specialist status nova
 agent-command specialist remove nova

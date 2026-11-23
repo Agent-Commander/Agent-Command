@@ -3,7 +3,9 @@ use crate::{
     catalog::Catalog,
     checkpoint::{Checkpoint, Claim, Progress},
     native::Pins,
+    permissions::{self, PermissionMode},
     routing::{self, Candidate, Configuration, Request},
+    targeting::Target,
     usage::{self, Usage},
 };
 use serde_json::Value;
@@ -49,6 +51,8 @@ pub(crate) struct Route {
     pub(crate) preferred: Option<String>,
     pub(crate) catalog: Catalog,
     pub(crate) pins: Pins,
+    pub(crate) target: Option<Target>,
+    pub(crate) mode: PermissionMode,
 }
 
 impl Route {
@@ -62,6 +66,8 @@ impl Route {
             preferred,
             catalog: Catalog::default(),
             pins: Pins::default(),
+            target: None,
+            mode: PermissionMode::Supervised,
         }
     }
 }
@@ -82,6 +88,7 @@ impl Mission {
                 profiles,
                 workspace,
                 clock,
+                mode: route.mode,
             },
             Work::Routed(route),
         )
@@ -99,6 +106,7 @@ impl Mission {
                 profiles,
                 workspace,
                 clock: usage::now,
+                mode: PermissionMode::Supervised,
             },
             Work::Resume {
                 interrupted,
@@ -140,6 +148,7 @@ struct Execution {
     profiles: Vec<Profile>,
     workspace: PathBuf,
     clock: fn() -> usage::Tick,
+    mode: PermissionMode,
 }
 
 impl Execution {
@@ -152,13 +161,27 @@ impl Execution {
         let now = (self.clock)();
         let (candidates, exclusions) =
             routing::candidates(&self.profiles, &route.catalog, &route.pins, now);
-        let ranked = routing::rank(candidates, route.request.policy, route.request.difficulty);
+        let ranked = restrict(
+            routing::rank(candidates, route.request.policy, route.request.difficulty),
+            route.target,
+        );
         if route.request.split {
             return self.run_split(&route.request.units, ranked, &exclusions, sender, cancel);
         }
-        let rotation = self.rotation(route.preferred.as_deref(), now);
-        let choice = routing::choose(ranked, &exclusions, route.preferred.as_deref(), &rotation)
-            .map_err(io::Error::other)?;
+        let preferred = route
+            .preferred
+            .as_deref()
+            .filter(|_| route.target.is_none());
+        let rotation = self.rotation(preferred, now);
+        let mut choice =
+            routing::choose(ranked, &exclusions, preferred, &rotation).map_err(io::Error::other)?;
+        if let Some(target) = route.target {
+            choice.reason = format!(
+                "{} → {}",
+                target.token(),
+                routing::describe(&choice.candidate)
+            );
+        }
         self.dispatch(
             &choice.candidate,
             &route.request.units[0],
@@ -242,6 +265,7 @@ impl Execution {
                 index,
                 reason,
                 configuration: candidate.configuration.clone(),
+                mode: self.mode,
             },
             &self.workspace,
             prompt.to_owned(),
@@ -333,6 +357,7 @@ impl Execution {
                 index: to,
                 reason: None,
                 configuration: configuration.clone(),
+                mode: self.mode,
             },
             &self.workspace,
             prompt.to_owned(),
@@ -374,6 +399,7 @@ struct Launch {
     index: usize,
     reason: Option<String>,
     configuration: Configuration,
+    mode: PermissionMode,
 }
 
 struct Continuation<'a> {
@@ -397,32 +423,14 @@ fn run(
         index,
         reason,
         configuration,
+        mode,
     } = launch;
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
     }
     command.args(configuration.arguments());
-    match profile.provider {
-        Provider::Claude => command.args([
-            "--print",
-            "--verbose",
-            "--output-format",
-            "stream-json",
-            "--setting-sources",
-            "user",
-            "--",
-        ]),
-        Provider::Codex => command.args([
-            "-a",
-            "never",
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write",
-            "-",
-        ]),
-    };
+    command.args(permissions::dispatch_arguments(profile.provider, mode));
+    permissions::refuse_bypass(command.get_args()).map_err(io::Error::other)?;
     command
         .current_dir(workspace)
         .stdin(Stdio::piped())
@@ -479,6 +487,24 @@ fn run(
         .join()
         .map_err(|_| io::Error::other("Mission input writer stopped"))??;
     Ok(None)
+}
+
+pub(crate) fn restrict(
+    ranked: Result<Vec<Candidate>, String>,
+    target: Option<Target>,
+) -> Result<Vec<Candidate>, String> {
+    let Some(target) = target else { return ranked };
+    let total = ranked.as_ref().map_or(0, Vec::len);
+    let mut ranked = ranked?;
+    ranked.retain(|candidate| target.matches(&candidate.configuration));
+    if ranked.is_empty() && total > 0 {
+        return Err(format!(
+            "No eligible signed-in profile or pinned model matches {}. Sign in to {} or pin a matching model with agent-command model pin.",
+            target.token(),
+            target.provider().binary()
+        ));
+    }
+    Ok(ranked)
 }
 
 fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
@@ -1211,6 +1237,8 @@ rmdir running.lock
             preferred: preferred.map(str::to_owned),
             catalog: synthetic_catalog(rows, contrary_agent_rows()),
             pins: pins(),
+            target: None,
+            mode: PermissionMode::Supervised,
         };
         for (difficulty, preferred, expected) in [
             (
@@ -1237,7 +1265,7 @@ rmdir running.lock
         assert_eq!(
             starts,
             "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
-alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --|Routed work\n"
+alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --|Routed work\n"
         );
         let below = vec![coding_row("claude", "claude-opus-5-5-high", 50.0)];
         let mission = Mission::launch(
@@ -1258,6 +1286,60 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
     }
 
     #[test]
+    fn inline_target_overrides_the_entry_profile_and_read_only_reaches_the_cli() {
+        let fixture = Fixture::new("targeted-arguments", ROUTED_PROVIDER);
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "alpha"),
+            fixture.profile(Provider::Codex, "beta"),
+        ];
+        let route = |target: &str| Route {
+            request: Request {
+                difficulty: routing::Difficulty::Hard,
+                units: vec!["Routed work".into()],
+                ..Request::default()
+            },
+            preferred: Some("claude/alpha".into()),
+            catalog: synthetic_catalog(
+                vec![
+                    coding_row("claude", "claude-opus-5-5-high", 60.0),
+                    coding_row("codex", "gpt-6-2-sol-high", 70.0),
+                ],
+                contrary_agent_rows(),
+            ),
+            pins: pins(),
+            target: crate::targeting::extract(target).unwrap().target,
+            mode: PermissionMode::ReadOnly,
+        };
+        for (token, expected) in [
+            (
+                "@codex",
+                "@codex → codex/beta gpt-6.2-sol high · AA coding index 70.0 · speed n/a · headroom unknown",
+            ),
+            (
+                "@opus",
+                "@opus → claude/alpha claude-opus-5-5 high · AA coding index 60.0 · speed n/a · headroom unknown",
+            ),
+        ] {
+            let mission = Mission::launch(profiles.clone(), route(token), fixture.root.clone());
+            let (reasons, result) = finish(&mission);
+            result.unwrap();
+            assert_eq!(reasons, [expected]);
+        }
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
+            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox read-only -|Routed work\n\
+alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --disallowedTools Edit,Write,NotebookEdit --|Routed work\n"
+        );
+        let mission = Mission::launch(profiles, route("@astra"), fixture.root.clone());
+        let (reasons, result) = finish(&mission);
+        assert!(reasons.is_empty());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("No eligible signed-in profile or pinned model matches @astra."));
+    }
+
+    #[test]
     fn pinned_continuation_keeps_the_exact_model_and_effort() {
         let (_fixture, workspace, profiles) =
             limit_fixture("pinned-continuation", usage::tick(FAKE_NOW, 0));
@@ -1273,6 +1355,8 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 contrary_agent_rows(),
             ),
             pins: pins(),
+            target: None,
+            mode: PermissionMode::Supervised,
         };
         let mission = Mission::launch_with_clock(profiles, route, workspace.clone(), || {
             usage::tick(FAKE_NOW + 901, 901)
@@ -1280,7 +1364,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
         let (links, result) = drain(&mission);
         result.unwrap();
         assert_eq!(links, [(0, 1)]);
-        let claude = "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --";
+        let claude = "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --";
         assert_eq!(
             std::fs::read_to_string(workspace.join(".git/arguments")).unwrap(),
             format!("first {claude}\nstandby {claude}\n")
@@ -1319,6 +1403,8 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 preferred: None,
                 catalog: Catalog::default(),
                 pins: Pins::default(),
+                target: None,
+                mode: PermissionMode::Supervised,
             },
             fixture.root.clone(),
         );
@@ -1346,6 +1432,8 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 preferred: None,
                 catalog: Catalog::default(),
                 pins: Pins::default(),
+                target: None,
+                mode: PermissionMode::Supervised,
             },
             fixture.root.clone(),
         );
