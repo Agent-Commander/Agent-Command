@@ -1335,7 +1335,7 @@ while test ! -f release-mission; do sleep 0.01; done
         )
         .unwrap();
 
-        for (width, height, key) in [(80, 24, true), (120, 40, false)] {
+        for (width, height, key) in INPUT_MATRIX {
             let mut app = App {
                 live: Some(test_live(
                     fixture.root.clone(),
@@ -1390,9 +1390,9 @@ while test ! -f release-mission; do sleep 0.01; done
         use serde_json::json;
         use usage::{tests::Fixture, Usage};
 
-        for (width, height, keyboard) in [(80, 24, true), (120, 40, false)] {
+        for (width, height, keyboard) in INPUT_MATRIX {
             let fixture = Fixture::new(
-                &format!("override-panel-{width}"),
+                &format!("override-panel-{width}-{keyboard}"),
                 r#"
 if test "$1" = auth; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
@@ -1497,6 +1497,14 @@ while test ! -f release; do sleep 0.01; done
             );
         }
     }
+
+    #[cfg(unix)]
+    const INPUT_MATRIX: [(u16, u16, bool); 4] = [
+        (80, 24, true),
+        (80, 24, false),
+        (120, 40, true),
+        (120, 40, false),
+    ];
 
     #[cfg(unix)]
     fn click_center(app: &mut App, area: Rect) {

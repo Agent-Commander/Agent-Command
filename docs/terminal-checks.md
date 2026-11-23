@@ -61,6 +61,10 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | Bundled snapshots are dated, sourced, and contain no unverified values | `bundled_snapshots_are_dated_sourced_and_carry_no_unverified_values` |
 | Per-endpoint SHA-256, scope, schema, version, range, unit and size checks fall back independently | `cache_integrity_falls_back_independently_per_endpoint` |
 | Refresh uses an injected fetcher, enforces the same HTTPS origin, pagination and version, redacts the key, and publishes only validated endpoints | `refresh_publishes_only_fully_validated_same_origin_pages` |
+| Refresh requests the published `/api/v2/language/...` paths and does not require a body `status` | `refresh_uses_published_language_paths_without_requiring_a_body_status` |
+| A key or plan-tier refusal (401/403), 429 or 410 keeps the previously valid cache | `tier_refusal_keeps_previously_valid_data` |
+| The unverified `agents/coding` schema is never requested and its cache is kept | `unverified_agent_schema_is_never_requested_or_published` |
+| `curl` starts with `-q`, gets the key only on standard input, and does not inherit the key or `CURL_HOME` | `curl_reads_no_implicit_config_and_inherits_no_key` |
 | Without a key, `catalog refresh` refuses and `catalog show` reports bundled provenance | `catalog_entry_point_shows_bundled_provenance_and_refuses_refresh_without_key` |
 | Latched, exhausted, corrupt and sign-in-refused profiles are excluded; stale, unreported and past-reset readings are not | `routing_gate_excludes_latched_exhausted_corrupt_and_refused_profiles` |
 | Hard and standard floors never pick a below-floor or unscored model and give the reason | `difficulty_floor_never_selects_a_below_floor_or_unscored_model` |
@@ -72,5 +76,6 @@ These checks do not establish physical keyboard/IME delivery, terminal font cove
 | Split units run once each, in order, with no concurrent workspace writer and no ineligible profile | `split_mission_sends_each_unit_once_in_sequence_to_allocated_profiles` |
 | Native Claude/Codex arguments carry the routed model and effort; a floor miss starts nothing | `routed_dispatch_passes_selected_model_and_effort_to_native_cli`, `configurations_produce_native_execution_arguments` |
 | Override persistence, rotation and fallback reasons | `override_persists_and_falls_back_with_visible_reason` |
-| The override survives reopening, and the latch fallback and read-error reasons are visible with keyboard at 80×24 and mouse at 120×40 | `override_persists_across_reopen_and_shows_fallback_reason_with_keyboard_and_mouse` |
-| Real terminal: Auto, then the override with F2 at 80×24, persisted across a new process, then mouse cycling at 120×40 | `sh tests/terminal_full_profile.sh` |
+| The override survives reopening, and the latch fallback and read-error reasons are visible with keyboard and with mouse at both 80×24 and 120×40 | `override_persists_across_reopen_and_shows_fallback_reason_with_keyboard_and_mouse` |
+| The profile panel cycles with keyboard and with mouse at both 80×24 and 120×40 | `usage_panel_shows_selected_allowances_and_latch_with_keyboard_and_mouse` |
+| Real terminal: at 80×24, then again at 120×40 in a new process that restores the saved override, F2 cycling and then mouse cycling | `sh tests/terminal_full_profile.sh` |

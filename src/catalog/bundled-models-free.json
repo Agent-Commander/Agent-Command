@@ -1,9 +1,9 @@
 {
   "schema": "agent-command-catalog-v1",
   "scope": "models/free",
-  "source": "https://artificialanalysis.ai/api/v2/data/llms/models",
+  "source": "https://artificialanalysis.ai/api/v2/language/models/free",
   "version": "bundled-2026-11-23",
-  "provenance": "Dated 2026-11-23. No published values are bundled because the public source could not be reached and verified when this snapshot was prepared. Every metric reads as missing until a verified refresh.",
+  "provenance": "Dated 2026-11-23. No published values are bundled. The leaderboard https://artificialanalysis.ai/agents/coding-agents and the Data API reference could not be reached from the authoring environment, so neither the values nor permission to redistribute them could be verified. Every metric reads as missing until a verified refresh.",
   "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "rows": []
 }

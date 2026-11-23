@@ -11,8 +11,10 @@ their format and behavior.
 
 | Endpoint scope | Source | Speed unit |
 |---|---|---|
-| `agents/coding` | `https://artificialanalysis.ai/api/v2/data/agents/coding` | seconds per task |
-| `models/free` | `https://artificialanalysis.ai/api/v2/data/llms/models` | output tokens per second |
+| `agents/coding` | `https://artificialanalysis.ai/api/v2/language/agents/coding` | seconds per task |
+| `models/free` | `https://artificialanalysis.ai/api/v2/language/models/free` | output tokens per second |
+
+The retired `/api/v2/data/...` paths are refused, and a cache that names them falls back to the bundled snapshot.
 
 Each endpoint has its own cache file in `agent-command-routing-v1/catalog/`.
 A cache is used only if all of these checks pass:
@@ -32,21 +34,40 @@ the bundled snapshot for that endpoint only. The other endpoint is unaffected.
 any fallback, the version, the row count and the provenance.
 
 **Bundled snapshot provenance.** The bundled snapshots are dated 2026-11-23
-and contain no rows. The public source could not be reached from the
-authoring environment, so no benchmark values could be verified. None were
-invented. Until a verified refresh, every index and speed shows as missing
-(`index n/a`, `speed n/a`). Test rows are labeled `synthetic test fixture`.
+and contain no rows. The coding-agent leaderboard
+(`https://artificialanalysis.ai/agents/coding-agents`) and the Data API
+reference could not be reached from the authoring environment. The network
+proxy refused the connection. So neither the values nor permission to
+redistribute them could be verified, and none were invented. Until a verified
+refresh, every index and speed shows as missing (`index n/a`, `speed n/a`).
+Test rows are labeled `synthetic test fixture` or use `fixture-` identifiers.
 
-**Refresh.** `agent-command catalog refresh` runs only when the user starts it
-and only if `ARTIFICIAL_ANALYSIS_API_KEY` is set. Keys may contain only
-letters, digits, `-`, `_` and `.`. The key goes to `curl` on standard input,
-never as a command-line argument. Agent Command never writes the key to state
-and redacts it from errors. A refresh:
+**Refresh.** Agent Command needs no key by default and makes no network
+request unless the user runs `agent-command catalog refresh` with
+`ARTIFICIAL_ANALYSIS_API_KEY` set. Keys may contain only letters, digits,
+`-`, `_` and `.`. The key goes to `curl` on standard input as the `x-api-key`
+header, never as a command-line argument. Agent Command never writes the key
+to state and redacts it from errors. A refresh:
 
-- requests only the two fixed HTTPS URLs and their `?page=N` forms;
+- starts `curl` with `-q`, so no `.curlrc` or other implicit configuration is read;
+- removes `ARTIFICIAL_ANALYSIS_API_KEY` and `CURL_HOME` from the `curl` environment;
+- requests only the fixed HTTPS URLs and their `?page=N` forms;
 - disables redirects, so requests stay on the same origin;
 - limits responses to 4 MiB and 20 pages;
-- checks `status` 200, the `data` array, the page number, a constant page total, and a constant version across pages.
+- reads the HTTP status itself and does not depend on a `status` field in the body;
+- treats HTTP 401 or 403 (key or plan tier refused), 429 and any other non-200 status as a failure for that endpoint and keeps its previous data;
+- checks the `data` array, the page number, a constant page total, and a constant version across pages.
+
+`models/free` rows are read from `slug`, `model_creator.slug`,
+`evaluations.artificial_analysis_coding_index` and
+`median_output_tokens_per_second`. These names follow the earlier public
+free-tier shape. They were not checked against the current reference because
+it could not be reached.
+
+`agents/coding` is never requested. Its response fields could not be checked
+against the published reference, so refresh reports
+`agents/coding response fields are not verified against the published reference; previous data kept`
+and keeps the previous cache or bundled snapshot.
 
 Rows are normalized through the supported-configuration table. Unknown models
 are skipped. A row with a malformed metric rejects the whole endpoint. Each

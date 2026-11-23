@@ -41,8 +41,8 @@ impl Endpoint {
 
     fn path(self) -> &'static str {
         match self {
-            Self::ModelsFree => "/api/v2/data/llms/models",
-            Self::AgentsCoding => "/api/v2/data/agents/coding",
+            Self::ModelsFree => "/api/v2/language/models/free",
+            Self::AgentsCoding => "/api/v2/language/agents/coding",
         }
     }
 
@@ -61,6 +61,16 @@ impl Endpoint {
         match self {
             Self::ModelsFree => SpeedUnit::TokensPerSecond,
             Self::AgentsCoding => SpeedUnit::SecondsPerTask,
+        }
+    }
+
+    fn refresh_gate(self) -> Result<(), String> {
+        match self {
+            Self::ModelsFree => Ok(()),
+            Self::AgentsCoding => Err(format!(
+                "{} response fields are not verified against the published reference; previous data kept",
+                self.scope()
+            )),
         }
     }
 
@@ -377,50 +387,103 @@ impl ApiKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+}
+
 pub(crate) trait Fetcher {
-    fn fetch(&self, url: &str, key: &ApiKey) -> io::Result<Vec<u8>>;
+    fn fetch(&self, url: &str, key: &ApiKey) -> io::Result<Response>;
 }
 
 pub(crate) struct CurlFetcher;
 
+const STATUS_MARKER: &[u8] = b"\nagent-command-http-status:";
+const CURL_ENVIRONMENT_DENYLIST: [&str; 2] = [KEY_VARIABLE, "CURL_HOME"];
+
+fn curl_command() -> Command {
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "-q",
+            "--config",
+            "-",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            FETCH_SECONDS,
+            "--max-filesize",
+            &MAX_RESPONSE_BYTES.to_string(),
+            "--write-out",
+            "\nagent-command-http-status:%{http_code}",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for variable in CURL_ENVIRONMENT_DENYLIST {
+        command.env_remove(variable);
+    }
+    command
+}
+
+fn curl_config(url: &str, key: &ApiKey) -> String {
+    format!("url = \"{url}\"\nheader = \"x-api-key: {}\"\n", key.0)
+}
+
+fn split_status(mut output: Vec<u8>) -> io::Result<Response> {
+    let position = output
+        .windows(STATUS_MARKER.len())
+        .rposition(|window| window == STATUS_MARKER)
+        .ok_or_else(|| io::Error::other("response carried no HTTP status"))?;
+    let status = std::str::from_utf8(&output[position + STATUS_MARKER.len()..])
+        .ok()
+        .and_then(|code| code.trim().parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(|| io::Error::other("response carried a malformed HTTP status"))?;
+    output.truncate(position);
+    Ok(Response {
+        status,
+        body: output,
+    })
+}
+
 impl Fetcher for CurlFetcher {
-    fn fetch(&self, url: &str, key: &ApiKey) -> io::Result<Vec<u8>> {
+    fn fetch(&self, url: &str, key: &ApiKey) -> io::Result<Response> {
         require_same_origin(url)?;
-        let mut child = Command::new("curl")
-            .args([
-                "--config",
-                "-",
-                "--proto",
-                "=https",
-                "--max-redirs",
-                "0",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                FETCH_SECONDS,
-                "--max-filesize",
-                &MAX_RESPONSE_BYTES.to_string(),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = curl_command().spawn()?;
         let mut input = child.stdin.take().expect("piped curl input");
-        writeln!(input, "url = \"{url}\"\nheader = \"x-api-key: {}\"", key.0)?;
+        input.write_all(curl_config(url, key).as_bytes())?;
         drop(input);
-        let mut body = Vec::new();
+        let mut output = Vec::new();
         child
             .stdout
             .take()
             .expect("piped curl output")
-            .take(MAX_RESPONSE_BYTES as u64 + 1)
-            .read_to_end(&mut body)?;
+            .take((MAX_RESPONSE_BYTES + STATUS_MARKER.len() + 8) as u64)
+            .read_to_end(&mut output)?;
         let status = child.wait()?;
         if !status.success() {
             return Err(io::Error::other(format!("request failed with {status}")));
         }
-        Ok(body)
+        split_status(output)
+    }
+}
+
+fn check_status(status: u16) -> Result<(), String> {
+    match status {
+        200 => Ok(()),
+        401 | 403 => Err(format!(
+            "access refused for this key or plan tier (HTTP {status}); previous data kept"
+        )),
+        429 => Err("rate limited (HTTP 429); previous data kept".into()),
+        _ => Err(format!("unexpected HTTP {status}; previous data kept")),
     }
 }
 
@@ -455,9 +518,6 @@ fn parse_page(bytes: &[u8], requested: u64) -> Result<Page, String> {
         return Err("response exceeds the size bound".into());
     }
     let value: Value = serde_json::from_slice(bytes).map_err(|_| "response is not JSON")?;
-    if value["status"] != 200 {
-        return Err("response status is not 200".into());
-    }
     let data = value["data"]
         .as_array()
         .ok_or("response has no data array")?
@@ -499,10 +559,11 @@ fn fetch_all(
     loop {
         let url = page_url(endpoint, page);
         require_same_origin(&url).map_err(|error| error.to_string())?;
-        let bytes = fetcher
+        let response = fetcher
             .fetch(&url, key)
             .map_err(|error| error.to_string())?;
-        let parsed = parse_page(&bytes, page)?;
+        check_status(response.status)?;
+        let parsed = parse_page(&response.body, page)?;
         if *expected_total.get_or_insert(parsed.total_pages) != parsed.total_pages {
             return Err("pagination total changed between pages".into());
         }
@@ -613,7 +674,9 @@ pub(crate) fn refresh(
     Endpoint::ALL
         .into_iter()
         .map(|endpoint| {
-            let outcome = fetch_all(endpoint, key, fetcher)
+            let outcome = endpoint
+                .refresh_gate()
+                .and_then(|()| fetch_all(endpoint, key, fetcher))
                 .and_then(|(raw, version)| build_snapshot(endpoint, &raw, version, retrieved))
                 .and_then(|snapshot| {
                     publish(state, &snapshot)
@@ -672,6 +735,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{cell::RefCell, collections::HashMap};
+
+    const DEFAULT_EFFORT: &str = "default";
 
     const SYNTHETIC_KEY: &str = "synthetic-key-0123";
 
@@ -832,39 +897,42 @@ mod tests {
         pages: HashMap<String, Value>,
         requested: RefCell<Vec<String>>,
         failure: Option<String>,
+        status: u16,
     }
 
     impl Fetcher for FixtureFetcher {
-        fn fetch(&self, url: &str, _key: &ApiKey) -> io::Result<Vec<u8>> {
+        fn fetch(&self, url: &str, _key: &ApiKey) -> io::Result<Response> {
             self.requested.borrow_mut().push(url.into());
             if let Some(failure) = &self.failure {
                 return Err(io::Error::other(failure.clone()));
             }
-            Ok(serde_json::to_vec(&self.pages[url]).unwrap())
+            Ok(Response {
+                status: self.status,
+                body: serde_json::to_vec(&self.pages[url]).unwrap(),
+            })
         }
     }
 
+    fn sanitized_model(slug: &str, creator: &str, index: Value, speed: Value) -> Value {
+        json!({"id": format!("fixture-{slug}"), "name": format!("Fixture {slug}"), "slug": slug,
+               "model_creator": {"id": format!("fixture-{creator}"), "name": creator, "slug": creator},
+               "evaluations": {"artificial_analysis_coding_index": index},
+               "median_output_tokens_per_second": speed})
+    }
+
     fn pages() -> HashMap<String, Value> {
-        let agents = Endpoint::AgentsCoding.source();
         let models = Endpoint::ModelsFree.source();
         HashMap::from([
             (
-                agents.clone(),
-                json!({"status": 200, "version": "synthetic-v2", "pagination": {"page": 1, "total_pages": 2},
-                       "data": [{"agent": {"slug": "codex"}, "model": {"slug": "gpt-5-codex-high"},
-                                 "coding_index": 58.5, "median_seconds_per_task": 240.0}]}),
+                models.clone(),
+                json!({"version": "fixture-v2", "pagination": {"page": 1, "total_pages": 2},
+                       "data": [sanitized_model("claude-sonnet", "anthropic", json!(49.0), json!(75.0))]}),
             ),
             (
-                format!("{agents}?page=2"),
-                json!({"status": 200, "version": "synthetic-v2", "pagination": {"page": 2, "total_pages": 2},
-                       "data": [{"agent": {"slug": "unlisted"}, "model": {"slug": "other"}}]}),
-            ),
-            (
-                models,
-                json!({"status": 200, "data": [
-                    {"slug": "claude-sonnet", "model_creator": {"slug": "anthropic"},
-                     "evaluations": {"artificial_analysis_coding_index": 49.0},
-                     "median_output_tokens_per_second": 75.0}]}),
+                format!("{models}?page=2"),
+                json!({"version": "fixture-v2", "pagination": {"page": 2, "total_pages": 2},
+                       "data": [sanitized_model("gpt-5-codex", "openai", json!(52.5), json!(null)),
+                                sanitized_model("unlisted-model", "unlisted", json!(10.0), json!(1.0))]}),
             ),
         ])
     }
@@ -874,114 +942,254 @@ mod tests {
             pages,
             requested: RefCell::default(),
             failure: None,
+            status: 200,
         }
+    }
+
+    fn outcome_for(
+        outcomes: &[(Endpoint, Result<usize, String>)],
+        endpoint: Endpoint,
+    ) -> Result<usize, String> {
+        outcomes
+            .iter()
+            .find(|(candidate, _)| *candidate == endpoint)
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    fn models_source(state: &Path) -> Source {
+        Catalog::load(Some(state))
+            .sources
+            .into_iter()
+            .find(|source| source.endpoint == Endpoint::ModelsFree)
+            .unwrap()
+    }
+
+    #[test]
+    fn refresh_uses_published_language_paths_without_requiring_a_body_status() {
+        assert_eq!(
+            Endpoint::ModelsFree.source(),
+            "https://artificialanalysis.ai/api/v2/language/models/free"
+        );
+        assert_eq!(
+            Endpoint::AgentsCoding.source(),
+            "https://artificialanalysis.ai/api/v2/language/agents/coding"
+        );
+        let state = state("paths");
+        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
+        let fixture = fetcher(pages());
+        let outcomes = refresh(&state, &key, &fixture, "2026-11-23T00:00:00Z");
+        assert_eq!(outcome_for(&outcomes, Endpoint::ModelsFree), Ok(2));
+        assert_eq!(
+            fixture.requested.borrow().as_slice(),
+            [
+                "https://artificialanalysis.ai/api/v2/language/models/free",
+                "https://artificialanalysis.ai/api/v2/language/models/free?page=2"
+            ]
+        );
+        let catalog = Catalog::load(Some(&state));
+        let sonnet = catalog.metrics(Provider::Claude, "sonnet", DEFAULT_EFFORT);
+        assert_eq!(
+            sonnet.index,
+            Some(Score {
+                endpoint: Endpoint::ModelsFree,
+                value: 49.0
+            })
+        );
+        assert_eq!(
+            sonnet.speed,
+            Some(Speed {
+                unit: SpeedUnit::TokensPerSecond,
+                value: 75.0
+            })
+        );
+        let codex = catalog.metrics(Provider::Codex, "gpt-5-codex", DEFAULT_EFFORT);
+        assert_eq!(codex.index.unwrap().value, 52.5);
+        assert_eq!(codex.speed, None);
+        assert_eq!(models_source(&state).snapshot.version, "fixture-v2");
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn unverified_agent_schema_is_never_requested_or_published() {
+        let state = state("agents-gate");
+        write(&state, Endpoint::AgentsCoding, &agents_snapshot());
+        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
+        let fixture = fetcher(pages());
+        let outcomes = refresh(&state, &key, &fixture, "2026-11-23T00:00:00Z");
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::AgentsCoding).unwrap_err(),
+            "agents/coding response fields are not verified against the published reference; previous data kept"
+        );
+        assert!(fixture
+            .requested
+            .borrow()
+            .iter()
+            .all(|url| !url.contains("agents")));
+        let kept = &Catalog::load(Some(&state)).sources[0];
+        assert_eq!(kept.origin, Origin::Cache);
+        assert_eq!(kept.snapshot, agents_snapshot());
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn tier_refusal_keeps_previously_valid_data() {
+        let state = state("tier");
+        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
+        refresh(&state, &key, &fetcher(pages()), "2026-11-23T00:00:00Z");
+        let before = models_source(&state).snapshot;
+        for (status, expected) in [
+            (
+                403,
+                "access refused for this key or plan tier (HTTP 403); previous data kept",
+            ),
+            (
+                401,
+                "access refused for this key or plan tier (HTTP 401); previous data kept",
+            ),
+            (429, "rate limited (HTTP 429); previous data kept"),
+            (410, "unexpected HTTP 410; previous data kept"),
+        ] {
+            let refusal = FixtureFetcher {
+                status,
+                ..fetcher(pages())
+            };
+            let outcomes = refresh(&state, &key, &refusal, "2026-11-24T00:00:00Z");
+            assert_eq!(
+                outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
+                expected
+            );
+            assert_eq!(refusal.requested.borrow().len(), 1, "{status}");
+            let after = models_source(&state);
+            assert_eq!(after.origin, Origin::Cache, "{status}");
+            assert_eq!(after.snapshot, before, "{status}");
+        }
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn curl_reads_no_implicit_config_and_inherits_no_key() {
+        let command = curl_command();
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(arguments[0], "-q");
+        assert_eq!(&arguments[1..3], ["--config", "-"]);
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("api-key")));
+        assert!(!arguments.iter().any(|argument| argument == "--fail"));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&KEY_VARIABLE.to_owned()));
+        assert!(removed.contains(&"CURL_HOME".to_owned()));
+        let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
+        assert_eq!(
+            curl_config(&Endpoint::ModelsFree.source(), &key),
+            format!(
+                "url = \"https://artificialanalysis.ai/api/v2/language/models/free\"\nheader = \"x-api-key: {SYNTHETIC_KEY}\"\n"
+            )
+        );
+        let mut output = br#"{"data":[]}"#.to_vec();
+        output.extend_from_slice(b"\nagent-command-http-status:403");
+        assert_eq!(
+            split_status(output).unwrap(),
+            Response {
+                status: 403,
+                body: br#"{"data":[]}"#.to_vec()
+            }
+        );
+        assert!(split_status(b"{}".to_vec()).is_err());
+        assert!(split_status(b"{}\nagent-command-http-status:000".to_vec()).is_err());
     }
 
     #[test]
     fn refresh_publishes_only_fully_validated_same_origin_pages() {
         let state = state("refresh");
         let key = ApiKey::new(SYNTHETIC_KEY.into()).unwrap();
-        let fixture = fetcher(pages());
-        let outcomes = refresh(&state, &key, &fixture, "2026-11-23T00:00:00Z");
+        let models = Endpoint::ModelsFree.source();
+        let second = format!("{models}?page=2");
         assert_eq!(
-            outcomes,
-            [
-                (Endpoint::AgentsCoding, Ok(1)),
-                (Endpoint::ModelsFree, Ok(1))
-            ]
-        );
-        assert!(fixture
-            .requested
-            .borrow()
-            .iter()
-            .all(|url| url.starts_with("https://artificialanalysis.ai/api/v2/")));
-        let catalog = Catalog::load(Some(&state));
-        assert!(catalog.sources.iter().all(|s| s.origin == Origin::Cache));
-        assert_eq!(catalog.sources[0].snapshot.version, "synthetic-v2");
-        assert_eq!(catalog.sources[1].snapshot.version, "2026-11-23T00:00:00Z");
-        let codex = catalog.metrics(Provider::Codex, "gpt-5-codex", "high");
-        assert_eq!(codex.index.unwrap().value, 58.5);
-        assert_eq!(
-            codex.speed.unwrap(),
-            Speed {
-                unit: SpeedUnit::SecondsPerTask,
-                value: 240.0
-            }
+            outcome_for(
+                &refresh(&state, &key, &fetcher(pages()), "2026-11-23T00:00:00Z"),
+                Endpoint::ModelsFree
+            ),
+            Ok(2)
         );
 
         let mut broken = pages();
-        broken
-            .get_mut(&format!("{}?page=2", Endpoint::AgentsCoding.source()))
-            .unwrap()["pagination"]["page"] = json!(3);
+        broken.get_mut(&second).unwrap()["pagination"]["page"] = json!(3);
         let mut changed = pages();
-        changed
-            .get_mut(&format!("{}?page=2", Endpoint::AgentsCoding.source()))
-            .unwrap()["version"] = json!("synthetic-v3");
+        changed.get_mut(&second).unwrap()["version"] = json!("fixture-v3");
         let mut out_of_range = pages();
-        out_of_range
-            .get_mut(&Endpoint::ModelsFree.source())
-            .unwrap()["data"][0]["evaluations"]["artificial_analysis_coding_index"] = json!(250);
+        out_of_range.get_mut(&models).unwrap()["data"][0]["evaluations"]
+            ["artificial_analysis_coding_index"] = json!(250);
         let mut runaway = pages();
-        runaway.get_mut(&Endpoint::AgentsCoding.source()).unwrap()["pagination"]["total_pages"] =
-            json!(MAX_PAGES + 1);
-        for (attempt, (case, pages, endpoint, expected)) in [
-            ("page", broken, Endpoint::AgentsCoding, "expected page 2"),
-            (
-                "version",
-                changed,
-                Endpoint::AgentsCoding,
-                "version changed between pages",
-            ),
+        runaway.get_mut(&models).unwrap()["pagination"]["total_pages"] = json!(MAX_PAGES + 1);
+        let mut shifting = pages();
+        shifting.get_mut(&second).unwrap()["pagination"]["total_pages"] = json!(3);
+        let mut textual = pages();
+        textual.get_mut(&models).unwrap()["data"][0]["median_output_tokens_per_second"] =
+            json!("75");
+        for (attempt, (case, pages, expected)) in [
+            ("page", broken, "expected page 2"),
+            ("version", changed, "version changed between pages"),
             (
                 "range",
                 out_of_range,
-                Endpoint::ModelsFree,
                 "coding index out of range for sonnet",
             ),
-            (
-                "bound",
-                runaway,
-                Endpoint::AgentsCoding,
-                "pagination total is out of bounds",
-            ),
+            ("bound", runaway, "pagination total is out of bounds"),
+            ("total", shifting, "pagination total changed between pages"),
+            ("numeric", textual, "metric is not numeric"),
         ]
         .into_iter()
         .enumerate()
         {
             let retrieved = format!("2026-11-24T00:00:0{attempt}Z");
             let outcomes = refresh(&state, &key, &fetcher(pages), &retrieved);
-            let (_, outcome) = outcomes.iter().find(|(e, _)| *e == endpoint).unwrap();
-            assert_eq!(outcome.as_ref().unwrap_err(), expected, "{case}");
-            let kept = Catalog::load(Some(&state));
-            let source = kept
-                .sources
-                .iter()
-                .find(|s| s.endpoint == endpoint)
-                .unwrap();
+            assert_eq!(
+                outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
+                expected,
+                "{case}"
+            );
+            let source = models_source(&state);
             assert_eq!(source.origin, Origin::Cache, "{case}");
-            assert_ne!(source.snapshot.version, retrieved, "{case}");
+            assert_eq!(source.snapshot.version, "fixture-v2", "{case}");
         }
 
         let leaking = FixtureFetcher {
             failure: Some(format!("denied for {SYNTHETIC_KEY}")),
             ..fetcher(pages())
         };
-        for (_, outcome) in refresh(&state, &key, &leaking, "2026-11-25T00:00:00Z") {
-            assert_eq!(outcome.unwrap_err(), "denied for [redacted]");
-        }
+        let outcomes = refresh(&state, &key, &leaking, "2026-11-25T00:00:00Z");
+        assert_eq!(
+            outcome_for(&outcomes, Endpoint::ModelsFree).unwrap_err(),
+            "denied for [redacted]"
+        );
         for entry in fs::read_dir(cache_directory(&state)).unwrap() {
             let text = fs::read_to_string(entry.unwrap().path()).unwrap();
             assert!(!text.contains(SYNTHETIC_KEY));
         }
         assert_eq!(format!("{key:?}"), "ApiKey(redacted)");
         assert!(ApiKey::new("key with\nnewline".into()).is_err());
+        assert!(ApiKey::new("key\"quote".into()).is_err());
         assert!(
-            require_same_origin("http://artificialanalysis.ai/api/v2/data/llms/models").is_err()
+            require_same_origin("http://artificialanalysis.ai/api/v2/language/models/free")
+                .is_err()
         );
         assert!(require_same_origin(
-            "https://artificialanalysis.ai.example/api/v2/data/llms/models"
+            "https://artificialanalysis.ai.example/api/v2/language/models/free"
         )
         .is_err());
+        assert!(
+            require_same_origin("https://artificialanalysis.ai/api/v2/data/llms/models").is_err()
+        );
         assert!(require_same_origin(&page_url(Endpoint::ModelsFree, 2)).is_ok());
         fs::remove_dir_all(state).unwrap();
     }

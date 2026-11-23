@@ -40,23 +40,29 @@ for dimensions in 80x24 120x40; do
     if test "$width" = 80; then
         await_capture "$dimensions" 'claude/0'
         await_capture "$dimensions" '· Auto'
-        for expected in 'Override saved: claude/0' 'Override saved: claude/1234567890abc'; do
-            t send-keys -t "$dimensions:0.0" F2
-            await_capture "$dimensions" "$expected"
-        done
-        await_capture "$dimensions" "claude/$long"
-        grep -Fq '5h unavailable' "$fixture/screen"
-        grep -Fq '· Override' "$fixture/screen"
+        cycle='Override saved: claude/0|Override saved: claude/1234567890abc'
     else
         await_capture "$dimensions" "claude/$long"
         grep -Fq '· Override' "$fixture/screen"
-        grep -Fq '5h unavailable' "$fixture/screen"
-        mouse=$(printf '\033[<0;8;%sM' "$((height - 8))" | od -An -v -tx1)
-        for expected in 'Auto routing' 'Override saved: claude/0' 'Override saved: claude/1234567890abc'; do
-            t send-keys -H -t "$dimensions:0.0" $mouse
-            await_capture "$dimensions" "$expected"
-        done
+        cycle='Auto routing|Override saved: claude/0|Override saved: claude/1234567890abc'
     fi
+    old_ifs=$IFS
+    IFS='|'
+    for expected in $cycle; do
+        t send-keys -t "$dimensions:0.0" F2
+        await_capture "$dimensions" "$expected"
+    done
+    IFS=$old_ifs
+    await_capture "$dimensions" "claude/$long"
+    grep -Fq '5h unavailable' "$fixture/screen"
+    grep -Fq '· Override' "$fixture/screen"
+    printf '%s keyboard override cycle visible\n' "$dimensions"
+    mouse=$(printf '\033[<0;8;%sM' "$((height - 8))" | od -An -v -tx1)
+    for expected in 'Auto routing' 'Override saved: claude/0' 'Override saved: claude/1234567890abc'; do
+        t send-keys -H -t "$dimensions:0.0" $mouse
+        await_capture "$dimensions" "$expected"
+    done
+    printf '%s mouse override cycle visible\n' "$dimensions"
     await_capture "$dimensions" "stale age unknown"
     grep -Eq "Week 97% used / 3% left.*stale" "$fixture/screen"
     grep -Fq 'No latch' "$fixture/screen"
