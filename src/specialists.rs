@@ -394,6 +394,8 @@ pub(crate) enum Command {
     Entry {
         profile: String,
     },
+    Settings,
+    Connect,
     Message(String),
 }
 
@@ -438,6 +440,8 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
             _ => Err(ASK_USAGE.into()),
         },
         "/roster" => Ok(Command::Roster),
+        "/settings" => Ok(Command::Settings),
+        "/connect" => Ok(Command::Connect),
         "/remove" => match next_word(rest) {
             Some((name, "")) => Ok(Command::Remove { name: name.into() }),
             _ => Err(REMOVE_USAGE.into()),

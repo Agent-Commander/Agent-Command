@@ -37,10 +37,8 @@ fn tag(headers: &str) -> Option<&str> {
     })
 }
 
-pub fn watch() -> Option<Receiver<String>> {
-    if cfg!(debug_assertions)
-        || env::var_os("AGENT_COMMAND_NO_UPDATE_CHECK").is_some_and(|value| value == "1")
-    {
+pub fn watch(enabled: bool) -> Option<Receiver<String>> {
+    if cfg!(debug_assertions) || !enabled {
         return None;
     }
     let (found, results) = mpsc::channel();
@@ -222,7 +220,7 @@ mod tests {
         assert!(apply(Some("v0.0.1")).is_ok());
         assert!(apply(Some("nightly")).is_ok());
         assert!(apply(None).is_err());
-        assert!(watch().is_none());
+        assert!(watch(true).is_none());
     }
 
     #[test]

@@ -4,7 +4,9 @@ mod checkpoint;
 mod cli;
 mod mission;
 mod native;
+mod panel;
 mod routing;
+mod settings;
 mod specialists;
 pub mod token_burn;
 pub mod update;
@@ -181,6 +183,7 @@ struct Live {
     entry: Option<(String, &'static str)>,
     routes: Vec<ProfileRoute>,
     allowances: Vec<usage::Allowance>,
+    signed_in: Vec<bool>,
 }
 
 impl Live {
@@ -211,7 +214,23 @@ impl Live {
             entry: None,
             routes: Vec::new(),
             allowances: Vec::new(),
+            signed_in: Vec::new(),
         }
+    }
+
+    fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
+        self.profiles = profiles;
+        self.preferred = None;
+        self.last_routed = None;
+        self.running_profile = None;
+        self.usage = None;
+        self.usage_checked_at = None;
+        self.load_override();
+        self.pending = checkpoint::Claim::pending(&self.profiles, &self.workspace)
+            .ok()
+            .flatten();
+        self.refresh_routes();
+        self.read_allowances(usage::now());
     }
 
     fn refresh_routes(&mut self) {
@@ -424,6 +443,13 @@ pub struct App {
     update_receiver: Option<Receiver<String>>,
     pub update_banner: Option<String>,
     pub update_area: Rect,
+    pub settings_area: Rect,
+    pub full_redraw: bool,
+    panel: Option<panel::Panel>,
+    panel_hits: Vec<(panel::Action, Rect)>,
+    host: Option<Box<dyn panel::Host>>,
+    settings: settings::Settings,
+    launch: settings::LaunchConfig,
 }
 impl Default for App {
     fn default() -> Self {
@@ -453,6 +479,13 @@ impl Default for App {
             update_receiver: None,
             update_banner: None,
             update_area: Rect::default(),
+            settings_area: Rect::default(),
+            full_redraw: false,
+            panel: None,
+            panel_hits: Vec::new(),
+            host: None,
+            settings: settings::Settings::default(),
+            launch: settings::LaunchConfig::default(),
         }
     }
 }
@@ -485,6 +518,31 @@ impl App {
             app.notice = notice;
         }
         app
+    }
+
+    fn attach(&mut self, host: Box<dyn panel::Host>, launch: settings::LaunchConfig) {
+        if let Some(path) = &launch.settings_path {
+            match settings::Settings::load(path) {
+                Ok(loaded) => self.settings = loaded,
+                Err(error) => {
+                    self.notice = format!("Settings unreadable: {error}. Using defaults.")
+                }
+            }
+        }
+        self.launch = launch;
+        self.host = Some(host);
+        self.refresh_sign_in();
+        if self.no_provider_connected() {
+            self.open_connect(panel::Origin::Onboarding);
+        }
+    }
+
+    pub fn launch_update_check(&self) -> bool {
+        settings::launch_update_check(&self.settings, self.launch.no_update_check.as_ref())
+    }
+
+    pub fn panel_open(&self) -> bool {
+        self.panel.is_some()
     }
 
     fn from_live(mut live: Live) -> Self {
@@ -760,7 +818,7 @@ impl App {
             .as_ref()
             .ok_or_else(|| format!("{} has no isolated workspace.", member.name))?;
         if live.profiles.is_empty() {
-            return Err("Sign in with agent-command auth login PROVIDER PROFILE.".into());
+            return Err(format!("{}.", panel::NO_PROVIDER_HINT));
         }
         let request = framed(routing::parse(task)?, |unit| {
             specialists::specialist_prompt(member, unit)
@@ -890,6 +948,8 @@ impl App {
             }
             specialists::Command::Remove { name } => self.remove(&name),
             specialists::Command::Entry { profile } => self.set_entry(&profile),
+            specialists::Command::Settings => self.open_settings(),
+            specialists::Command::Connect => self.open_connect(panel::Origin::Direct),
             specialists::Command::Message(text) => self.message_commander(text),
         }
     }
@@ -989,7 +1049,7 @@ impl App {
             return;
         }
         if live.profiles.is_empty() {
-            self.notice = "Sign in with agent-command auth login PROVIDER PROFILE.".into();
+            self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
             return;
         }
         let request = match routing::parse(&command) {
@@ -1034,7 +1094,11 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.panel.is_some() && !(control && matches!(key.code, KeyCode::Char('q' | 'c'))) {
+            return self.panel_key(key);
+        }
+        if control {
             match key.code {
                 KeyCode::Char('q' | 'c') if self.mission_running() => {
                     self.notice = "Wait for the running mission before quitting.".into();
@@ -1052,6 +1116,7 @@ impl App {
         }
         match key.code {
             KeyCode::F(2) => self.select_profile(),
+            KeyCode::F(3) => self.open_settings(),
             KeyCode::F(4) => self.abandon_continuation(),
             KeyCode::F(6) => self.dismiss_update(),
             KeyCode::Tab => self.editing = !self.editing,
@@ -1070,7 +1135,11 @@ impl App {
     }
     pub fn click(&mut self, x: u16, y: u16) {
         let point = ratatui::layout::Position::new(x, y);
-        if self.update_area.contains(point) {
+        if self.panel.is_some() {
+            self.panel_click(x, y);
+        } else if self.settings_area.contains(point) {
+            self.open_settings();
+        } else if self.update_area.contains(point) {
             self.dismiss_update();
         } else if self
             .live
@@ -1174,18 +1243,7 @@ impl App {
                 h.min(a.height.saturating_sub(y)),
             )
         };
-        f.render_widget(
-            Paragraph::new(
-                "  ▣  AGENT COMMAND     File   Crew   Missions   Radio    |    PRIVATEER / 01",
-            )
-            .style(
-                Style::default()
-                    .fg(color("272c32"))
-                    .bg(color(&t.ivory))
-                    .bold(),
-            ),
-            r(0, 0, a.width, 1),
-        );
+        self.draw_menu_bar(f, a);
         let compact = a.height < 36 || a.width < 105;
         let banner_rows = self.draw_update_banner(f, a);
         let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
@@ -1515,9 +1573,7 @@ impl App {
             live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
             let now = usage::now();
             let label = if live.profiles.is_empty() {
-                vec![Line::raw(
-                    "No profiles · agent-command auth login PROVIDER PROFILE",
-                )]
+                vec![Line::raw(panel::NO_PROVIDER_HINT)]
             } else {
                 {
                     let latch = live.usage.map_or_else(
@@ -1601,6 +1657,8 @@ impl App {
         f.render_widget(
             Paragraph::new(if pending && self.notice.is_empty() {
                 "Interrupted continuation pending · re-enter task, then Send"
+            } else if self.notice.is_empty() && self.no_provider_connected() {
+                panel::NO_PROVIDER_HINT
             } else if self.notice.is_empty() {
                 if self.live.is_some() {
                     "   Ready"
@@ -1633,10 +1691,53 @@ impl App {
                 );
             }
         }
+        self.draw_panel(f, a);
     }
 }
 
+const MENU_BRAND: &str = "  ▣  AGENT COMMAND";
+const MENU_ITEMS: &str = "File   Crew   Missions   Radio    |    PRIVATEER";
+const MENU_SHIP_NUMBER: &str = " / 01";
+const MENU_SETTINGS: &str = " Settings ";
+
 impl App {
+    fn draw_menu_bar(&mut self, f: &mut Frame, area: Rect) {
+        let bar = Rect::new(area.x, area.y, area.width, 1).intersection(area);
+        let settings_width = MENU_SETTINGS.chars().count() as u16;
+        let wide = format!("{MENU_BRAND}     {MENU_ITEMS}{MENU_SHIP_NUMBER}");
+        let labels = if wide.chars().count() + usize::from(settings_width) < usize::from(bar.width)
+        {
+            wide
+        } else {
+            format!("{MENU_BRAND}   {MENU_ITEMS}")
+        };
+        f.render_widget(
+            Paragraph::new(labels).style(
+                Style::default()
+                    .fg(color("272c32"))
+                    .bg(color(&self.theme.ivory))
+                    .bold(),
+            ),
+            bar,
+        );
+        self.settings_area = Rect::new(
+            bar.right().saturating_sub(settings_width),
+            bar.y,
+            settings_width,
+            1,
+        )
+        .intersection(bar);
+        f.render_widget(
+            Paragraph::new(MENU_SETTINGS).style(
+                Style::default()
+                    .fg(color(&self.theme.ivory))
+                    .bg(color("272c32"))
+                    .bold(),
+            ),
+            self.settings_area,
+        );
+    }
+
     fn draw_update_banner(&mut self, f: &mut Frame, area: Rect) -> u16 {
         let Some(text) = &self.update_banner else {
             self.update_area = Rect::default();
@@ -1747,7 +1848,6 @@ pub fn snapshot(path: &Path) -> io::Result<()> {
     fs::write(path, svg)
 }
 
-/// Latest source modification time, used to exit cleanly before a development rebuild.
 pub fn source_stamp(root: &Path) -> SystemTime {
     fn walk(path: &Path) -> SystemTime {
         if path.is_dir() {

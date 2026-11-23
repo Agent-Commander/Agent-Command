@@ -24,7 +24,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n       agent-command update\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto, F6 dismisses the update banner\n\nSet AGENT_COMMAND_NO_UPDATE_CHECK=1 to skip the launch update check.");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n       agent-command update\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto, /settings, /connect\nKeys: F2 cycles the Commander profile, F3 opens Settings, F6 dismisses the update banner\nFirst run with no signed-in profile opens Connect providers.\n\nThe launch update check can be turned off in Settings (settings.toml); AGENT_COMMAND_NO_UPDATE_CHECK=1 always skips it.");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -46,27 +46,8 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         eprintln!("Run Agent Command in an interactive terminal.");
         std::process::exit(2);
     }
-    let path = std::env::var_os("AGENT_COMMAND_THEME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("AGENT_COMMAND_DEV")
-                .map(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("theme.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .map(|p| p.join("agent-command/theme.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .map(|p| p.join("agent-command/theme.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|p| p.join(".config/agent-command/theme.toml"))
-        });
+    let launch = crate::settings::LaunchConfig::from_env();
+    let path = launch.theme_path.clone();
 
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_stamp = crate::source_stamp(&source_root);
@@ -75,7 +56,8 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     let result = (|| {
         execute!(io::stdout(), EnableMouseCapture)?;
         let mut app = App::live(std::env::current_dir()?);
-        app.watch_updates(crate::update::watch());
+        app.attach(Box::new(crate::panel::TerminalHost), launch);
+        app.watch_updates(crate::update::watch(app.launch_update_check()));
         while !app.quit {
             if !app.mission_running()
                 && std::env::var_os("AGENT_COMMAND_DEV").is_some()
@@ -89,6 +71,9 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             }
             app.poll_mission();
             app.poll_update();
+            if std::mem::take(&mut app.full_redraw) {
+                terminal.clear()?;
+            }
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
                 match event::read()? {

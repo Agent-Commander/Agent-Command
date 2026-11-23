@@ -42,9 +42,37 @@ The command is `agent-command`, so tools already named `agent` are unaffected. I
 
 The installers download the latest published release. Re-running the installer updates the app. Close an existing instance before updating on Windows.
 
-At launch, release builds check once for a newer release in the background and show a one-line banner; press F6 or click it to dismiss. Nothing installs automatically. Run `agent-command update` to install a newer release (on Windows it prints the PowerShell command). Set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip the launch check. Development builds never check.
+At launch, release builds check once for a newer release in the background and show a one-line banner; press F6 or click it to dismiss. Nothing installs automatically. Run `agent-command update` to install a newer release (on Windows it prints the PowerShell command). Turn the launch check off in Settings, or set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip it regardless of Settings. Development builds never check.
 
-Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
+Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`. Settings are saved in `settings.toml` in that same `agent-command` directory.
+
+### First run: connect a provider
+
+When no profile is signed in, the TUI opens **Connect providers** instead of an
+empty Commander. It shows whether `claude` (Claude Code) and `codex` (Codex
+CLI) are on PATH. If one is missing, install it from the provider's own docs
+([Claude Code](https://code.claude.com/docs/en/setup),
+[Codex CLI](https://github.com/openai/codex)) and press R to recheck.
+
+Pick Claude, Codex or both, keep or change the profile name (`main` by
+default), and choose Connect. The TUI steps aside, the provider's sign-in runs
+in the same terminal, and the TUI returns with the new profile loaded and its
+signed-in status or failure reason. One provider is enough. Skip keeps the app
+usable and shows a hint to connect later from Settings.
+
+### Settings
+
+Click `Settings` at the right of the top bar, press F3, or type `/settings`.
+`/connect` opens the connect flow directly. Esc closes; mouse and keyboard
+(↑ ↓ Tab, Enter) both work. Settings lists:
+
+- **Providers**: every profile with its signed-in status, Connect new profile,
+  Reconnect, and Sign out (asks for confirmation; keeps the profile folder).
+- **Commander profile**: Auto or a specific profile, the same setting as
+  `/entry` and F2.
+- **Check for updates on launch**: on or off, saved in `settings.toml`;
+  `AGENT_COMMAND_NO_UPDATE_CHECK=1` still forces it off.
+- The app version and where profiles, theme and settings live.
 
 ### Build from source
 
@@ -66,7 +94,7 @@ cargo run --locked --bin dev
 
 Save `theme.toml` to refresh colors in place. Invalid theme edits keep the last working palette. Save Rust source to rebuild and restart automatically; demo state resets after a rebuild. The development supervisor and application are both Rust.
 
-Controls: arrows select an agent, Tab changes focus, Ctrl+N focuses command input, Enter sends a local demo command, Ctrl+P pauses/resumes, Ctrl+L clears the feed, and Ctrl+Q exits. The roster and action buttons also accept mouse clicks. Menu-bar labels remain decorative.
+Controls: arrows select an agent, Tab changes focus, Ctrl+N focuses command input, Enter sends a local demo command, Ctrl+P pauses/resumes, Ctrl+L clears the feed, F3 opens Settings, and Ctrl+Q exits. The roster, action buttons and the `Settings` menu item also accept mouse clicks. The other menu-bar labels remain decorative.
 
 ## Validation
 
@@ -91,6 +119,8 @@ it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 /ask NAME TASK            delegate TASK to a specialist
 /roster                   list the crew in Commander's feed
 /remove NAME              remove a specialist and its workspace
+/settings                 open Settings (also F3 or the top-bar item)
+/connect                  connect a provider profile
 ```
 
 Commander can also reply with `SPAWN_SPECIALIST: NAME | ROLE | TASK` or
@@ -132,8 +162,9 @@ Open `agent-command` from the workspace where the mission should run. By
 default, missions use the highest-ranked eligible profile (Auto). Press F2 or
 click the profile row to cycle Auto and a saved override for each profile.
 Enter a mission and press Enter or click Send. The status and assistant output appear
-in the mission panel and ship's log. One mission runs at a time. Reopen the
-TUI after adding a profile in another terminal.
+in the mission panel and ship's log. One mission runs at a time. Add, reconnect
+or sign out profiles from Settings (F3) or `/connect` without restarting; the
+CLI `auth login` and `auth logout` run the same sign-in and sign-out code.
 
 ### Subscription usage in the terminal
 
