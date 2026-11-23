@@ -18,13 +18,16 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     {
         Some(("auth", rest)) => return crate::auth::run(rest),
         Some(("catalog", rest)) => return crate::catalog::run(rest),
+        Some(("connect", rest)) => return crate::connect::run(rest),
+        Some(("daemon", rest)) => return crate::daemon::run(rest),
+        Some(("mcp", rest)) => return crate::mcp::run(rest),
         Some(("model", rest)) => return crate::native::run(rest),
         Some(("specialist", rest)) => return crate::specialists::run(rest),
         Some(("update", rest)) => return crate::update::run(rest),
         _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n       agent-command update\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto, /settings, /connect\nKeys: F2 cycles the Commander profile, F3 opens Settings, F6 dismisses the update banner\nFirst run with no signed-in profile opens Connect providers.\n\nThe launch update check can be turned off in Settings (settings.toml); AGENT_COMMAND_NO_UPDATE_CHECK=1 always skips it.");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command daemon [--bind 127.0.0.1:47100] [--allow-remote] [--print-service [OS]|--install-service]\n       agent-command connect http://HOST:PORT [--token-env VAR] [--thread NAME] [--once]\n       agent-command mcp [--root PATH] [--scope supervised|read-only]\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n       agent-command update\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto, /settings, /connect\nKeys: F2 cycles the Commander profile, F3 opens Settings, F6 dismisses the update banner\nFirst run with no signed-in profile opens Connect providers.\n\nThe launch update check can be turned off in Settings (settings.toml); AGENT_COMMAND_NO_UPDATE_CHECK=1 always skips it.");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
