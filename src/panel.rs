@@ -746,7 +746,7 @@ impl App {
         }
         self.live
             .as_ref()
-            .filter(|live| live.mission.is_some())
+            .filter(|live| live.busy())
             .map(|_| "Finish the running mission before installing.")
     }
 
@@ -852,9 +852,7 @@ impl App {
             Some(live) if live.profile_root.is_none() => {
                 Some("No profile directory. Set an absolute SUB_AUTH_DIR.")
             }
-            Some(live) if live.mission.is_some() => {
-                Some("Finish the running mission before connecting.")
-            }
+            Some(live) if live.busy() => Some("Finish the running mission before connecting."),
             Some(_) => None,
         }
     }

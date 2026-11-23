@@ -1,5 +1,7 @@
 use crate::{
-    auth, catalog, native,
+    auth,
+    branches::{self, Branch, DiffStat},
+    catalog, native,
     permissions::PermissionMode,
     review::{self, ReviewLedger},
     routing,
@@ -10,7 +12,6 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command as Process, Stdio},
 };
 
 pub(crate) const STATE_DIRECTORY: &str = "agent-command-orchestrator-v1";
@@ -33,6 +34,8 @@ pub enum Status {
     #[default]
     Idle,
     Running,
+    #[serde(rename = "NEEDS_APPROVAL")]
+    NeedsApproval,
     Done,
     Error,
     Snoozed,
@@ -43,9 +46,34 @@ impl Status {
         match self {
             Self::Idle => "IDLE",
             Self::Running => "RUNNING",
+            Self::NeedsApproval => "NEEDS_APPROVAL",
             Self::Done => "DONE",
             Self::Error => "ERROR",
             Self::Snoozed => "SNOOZED",
+        }
+    }
+
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::NeedsApproval => "needs approval",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Snoozed => "snoozed",
+        }
+    }
+
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::NeedsApproval | Self::Error)
+    }
+
+    fn inbox_rank(self) -> u8 {
+        match self {
+            Self::NeedsApproval | Self::Error => 0,
+            Self::Running | Self::Snoozed => 1,
+            Self::Done => 2,
+            Self::Idle => 3,
         }
     }
 }
@@ -62,6 +90,24 @@ pub enum Isolation {
 pub struct Workspace {
     pub path: PathBuf,
     pub isolation: Isolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<Branch>,
+}
+
+const NO_WORKSPACE: &str = "it has no isolated workspace";
+const DETACHED_WORKTREE: &str = "its worktree is detached (created before named branches)";
+const PLAIN_DIRECTORY: &str = "it works in a plain directory outside any Git repository";
+const APPROVAL_MARKER: &str = "NEEDS_APPROVAL:";
+const DIFF_FILES_SHOWN: usize = 6;
+
+impl Workspace {
+    fn named_branch(&self) -> Result<&Branch, &'static str> {
+        match (&self.isolation, &self.branch) {
+            (Isolation::Worktree { .. }, Some(branch)) => Ok(branch),
+            (Isolation::Worktree { .. }, None) => Err(DETACHED_WORKTREE),
+            (Isolation::Directory, _) => Err(PLAIN_DIRECTORY),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,7 +133,10 @@ pub struct Member {
     pub status: Status,
     pub mission: String,
     pub paused: bool,
+    pub settled: bool,
+    pub touched: u64,
     pub workspace: Option<Workspace>,
+    pub changes: Option<DiffStat>,
     pub history: VecDeque<Entry>,
     pub(crate) permission: PermissionMode,
     pub(crate) review: ReviewLedger,
@@ -110,7 +159,10 @@ impl Member {
             status: Status::Idle,
             mission: task.unwrap_or("Standing by").into(),
             paused: false,
+            settled: false,
+            touched: 0,
             workspace,
+            changes: None,
             history: VecDeque::new(),
             permission: PermissionMode::default_for_role(role),
             review: ReviewLedger::default(),
@@ -126,6 +178,26 @@ impl Member {
 
     pub fn is_commander(&self) -> bool {
         self.name == COMMANDER
+    }
+
+    fn named_branch(&self) -> Result<(&Workspace, &Branch), &'static str> {
+        let workspace = self.workspace.as_ref().ok_or(NO_WORKSPACE)?;
+        Ok((workspace, workspace.named_branch()?))
+    }
+
+    pub(crate) fn diff(&self) -> Result<DiffStat, String> {
+        let (workspace, branch) = self
+            .named_branch()
+            .map_err(|reason| format!("No diff for {}: {reason}.", self.name))?;
+        branches::diff_stat(&workspace.path, branch).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn refresh_changes(&mut self) {
+        self.changes = self.diff().ok();
+    }
+
+    pub fn branch(&self) -> Option<&Branch> {
+        self.workspace.as_ref()?.branch.as_ref()
     }
 
     pub(crate) fn remember(&mut self, entry: Entry) {
@@ -150,6 +222,8 @@ struct Record {
     role: String,
     task: String,
     status: Status,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    settled: bool,
     workspace: Option<Workspace>,
     #[serde(default)]
     permission: Option<PermissionMode>,
@@ -213,6 +287,8 @@ impl Store {
             Status::Running => Status::Error,
             status => status,
         };
+        member.settled = record.settled;
+        member.refresh_changes();
         member.permission = record.permission.unwrap_or(member.permission);
         member.review = record.review;
         member.history = read_entries(&history_path(directory, &record.name))?.into();
@@ -230,6 +306,7 @@ impl Store {
                     role: member.role.clone(),
                     task: member.mission.clone(),
                     status: member.status,
+                    settled: member.settled,
                     workspace: member.workspace.clone(),
                     permission: Some(member.permission),
                     review: member.review.clone(),
@@ -261,18 +338,16 @@ impl Store {
         append_entry(&history_path(&self.directory()?, name), entry)
     }
 
-    pub(crate) fn isolate(&self, base: &Path, name: &str) -> io::Result<Workspace> {
+    pub(crate) fn isolate(&self, base: &Path, name: &str, topic: &str) -> io::Result<Workspace> {
         let key = name.to_ascii_lowercase();
         match repository_root(base) {
             Some(repository) => {
                 let path = self.subdirectory(WORKTREE_DIRECTORY)?.join(&key);
-                git(
-                    &repository,
-                    &["worktree", "add", "--detach", path_text(&path)?, "HEAD"],
-                )?;
+                let branch = branches::add_worktree(&repository, &path, name, topic)?;
                 Ok(Workspace {
                     path,
                     isolation: Isolation::Worktree { repository },
+                    branch: Some(branch),
                 })
             }
             None => {
@@ -281,6 +356,7 @@ impl Store {
                 Ok(Workspace {
                     path,
                     isolation: Isolation::Directory,
+                    branch: None,
                 })
             }
         }
@@ -290,10 +366,11 @@ impl Store {
         &self,
         base: &Path,
         name: &str,
+        topic: &str,
         mode: PermissionMode,
     ) -> Result<Workspace, String> {
         let workspace = self
-            .isolate(base, name)
+            .isolate(base, name, topic)
             .map_err(|error| format!("Cannot isolate {name}: {error}"))?;
         if let Err(refusal) = mode.require_isolation(Some(&workspace.isolation)) {
             let _ = release_workspace(&workspace);
@@ -313,29 +390,49 @@ impl Store {
         native::load_existing(&self.root).unwrap_or_default()
     }
 
-    pub(crate) fn release(&self, member: &Member) -> io::Result<()> {
+    pub(crate) fn release(&self, member: &Member) -> io::Result<Option<String>> {
+        let mut retained = None;
         if let Some(workspace) = &member.workspace {
-            release_workspace(workspace)?;
+            retained = release_workspace(workspace)?;
         }
         if let Some(directory) = self.existing()? {
             remove_if_present(&history_path(&directory, &member.name), |path| {
                 fs::remove_file(path)
             })?;
         }
-        Ok(())
+        Ok(retained)
     }
 }
 
-fn release_workspace(workspace: &Workspace) -> io::Result<()> {
+pub(crate) fn removal_note(name: &str, retained: Option<&str>) -> String {
+    match retained {
+        Some(branch) => format!("Removed {name}; kept unmerged branch {branch}."),
+        None => format!("Removed {name}."),
+    }
+}
+
+fn release_workspace(workspace: &Workspace) -> io::Result<Option<String>> {
     match &workspace.isolation {
         Isolation::Worktree { repository } => {
-            git(
+            branches::git(
                 repository,
-                &["worktree", "remove", "--force", path_text(&workspace.path)?],
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    branches::path_text(&workspace.path)?,
+                ],
             )?;
-            Ok(())
+            Ok(workspace
+                .branch
+                .as_ref()
+                .filter(|branch| !branches::delete_if_merged(repository, &branch.name))
+                .map(|branch| branch.name.clone()))
         }
-        Isolation::Directory => remove_if_present(&workspace.path, |path| fs::remove_dir_all(path)),
+        Isolation::Directory => {
+            remove_if_present(&workspace.path, |path| fs::remove_dir_all(path))?;
+            Ok(None)
+        }
     }
 }
 
@@ -380,32 +477,8 @@ fn append_entry(path: &Path, entry: &Entry) -> io::Result<()> {
     file.write_all(&line)
 }
 
-fn path_text(path: &Path) -> io::Result<&str> {
-    path.to_str()
-        .ok_or_else(|| io::Error::other("Workspace path must be valid UTF-8"))
-}
-
-fn git(directory: &Path, args: &[&str]) -> io::Result<String> {
-    let output = Process::new("git")
-        .current_dir(directory)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "git {} failed: {}",
-            args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
 fn repository_root(base: &Path) -> Option<PathBuf> {
-    git(base, &["rev-parse", "--show-toplevel"])
+    branches::git(base, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(PathBuf::from)
 }
@@ -413,6 +486,141 @@ fn repository_root(base: &Path) -> Option<PathBuf> {
 pub(crate) fn find(crew: &[Member], name: &str) -> Option<usize> {
     crew.iter()
         .position(|member| member.name.eq_ignore_ascii_case(name))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RosterRow {
+    Member(usize),
+    Settled { count: usize, open: bool },
+}
+
+impl RosterRow {
+    pub(crate) fn member(self) -> Option<usize> {
+        match self {
+            Self::Member(index) => Some(index),
+            Self::Settled { .. } => None,
+        }
+    }
+}
+
+fn inbox_key(member: &Member) -> (u8, std::cmp::Reverse<u64>) {
+    (
+        member.status.inbox_rank(),
+        std::cmp::Reverse(member.touched),
+    )
+}
+
+fn sorted_by_inbox(crew: &[Member], settled: bool) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..crew.len())
+        .filter(|index| !crew[*index].is_commander() && crew[*index].settled == settled)
+        .collect();
+    indices.sort_by_key(|index| inbox_key(&crew[*index]));
+    indices
+}
+
+pub(crate) fn inbox_rows(crew: &[Member], open: bool) -> Vec<RosterRow> {
+    let mut rows: Vec<RosterRow> = (0..crew.len())
+        .filter(|index| crew[*index].is_commander())
+        .map(RosterRow::Member)
+        .collect();
+    rows.extend(
+        sorted_by_inbox(crew, false)
+            .into_iter()
+            .map(RosterRow::Member),
+    );
+    let settled = sorted_by_inbox(crew, true);
+    if !settled.is_empty() {
+        rows.push(RosterRow::Settled {
+            count: settled.len(),
+            open,
+        });
+        if open {
+            rows.extend(settled.into_iter().map(RosterRow::Member));
+        }
+    }
+    rows
+}
+
+pub(crate) fn settle(member: &mut Member, settled: bool) -> Result<String, String> {
+    if member.is_commander() {
+        return Err("Commander is always active and cannot be settled.".into());
+    }
+    if settled && member.status == Status::Running {
+        return Err(format!(
+            "{} is running; settle it after it finishes.",
+            member.name
+        ));
+    }
+    if member.settled == settled {
+        let state = if settled { "already" } else { "not" };
+        return Err(format!("{} is {state} settled.", member.name));
+    }
+    member.settled = settled;
+    Ok(if settled {
+        format!(
+            "Settled {}; history kept in the Settled drawer.",
+            member.name
+        )
+    } else {
+        format!("{} is back in the active queue.", member.name)
+    })
+}
+
+pub(crate) fn approval_request(reply: &str) -> Option<String> {
+    reply.lines().rev().find_map(|line| {
+        let question = line.trim().strip_prefix(APPROVAL_MARKER)?.trim();
+        Some(if question.is_empty() {
+            "approval requested".to_owned()
+        } else {
+            question.to_owned()
+        })
+    })
+}
+
+pub(crate) fn diff_report(member: &Member, stat: &DiffStat) -> String {
+    let branch = member.branch().map_or_else(String::new, |branch| {
+        format!(" · {} vs {}", branch.name, branch.base)
+    });
+    let files: Vec<String> = stat
+        .files
+        .iter()
+        .take(DIFF_FILES_SHOWN)
+        .map(|file| format!("{} +{} −{}", file.path, file.added, file.removed))
+        .collect();
+    let more = stat.files.len().saturating_sub(DIFF_FILES_SHOWN);
+    let tail = match (files.is_empty(), more) {
+        (true, _) => " · no changes".to_owned(),
+        (false, 0) => format!(" · {}", files.join(", ")),
+        (false, more) => format!(" · {} and {more} more", files.join(", ")),
+    };
+    format!("{}{branch} · {}{tail}", member.name, stat.label())
+}
+
+pub(crate) fn publish(
+    member: &Member,
+    commit: bool,
+    tools: &branches::Tools,
+) -> Result<branches::Published, String> {
+    if member.status == Status::Running {
+        return Err(format!(
+            "{} is running; open the PR after it finishes.",
+            member.name
+        ));
+    }
+    let (workspace, branch) = member
+        .named_branch()
+        .map_err(|reason| format!("No PR for {}: {reason}.", member.name))?;
+    branches::publish(
+        &branches::PullRequest {
+            specialist: &member.name,
+            role: &member.role,
+            mission: &member.mission,
+            worktree: &workspace.path,
+            branch,
+            commit,
+        },
+        tools,
+    )
 }
 
 pub(crate) fn validate_name(name: &str, crew: &[Member]) -> Result<(), String> {
@@ -456,6 +664,18 @@ pub(crate) enum Command {
     Entry {
         profile: String,
     },
+    Diff {
+        name: Option<String>,
+    },
+    Pr {
+        name: Option<String>,
+        commit: bool,
+    },
+    Settle {
+        name: String,
+        settled: bool,
+    },
+    SettledDrawer,
     Settings,
     Connect,
     Side {
@@ -478,6 +698,45 @@ const REMOVE_USAGE: &str = "Usage: /remove NAME";
 const ENTRY_USAGE: &str = "Usage: /entry PROVIDER/PROFILE or /entry auto";
 const SIDE_USAGE: &str = "Usage: /btw QUESTION (alias /side QUESTION)";
 const GOAL_USAGE: &str = "Usage: /goal CRITERIA or /goal cancel";
+const DIFF_USAGE: &str = "Usage: /diff [NAME]";
+const PR_USAGE: &str = "Usage: /pr [NAME] [--commit]";
+const SETTLE_USAGE: &str = "Usage: /settle NAME or /unsettle NAME";
+pub(crate) const COMMIT_FLAG: &str = "--commit";
+
+fn optional_name(rest: &str, usage: &str) -> Result<Option<String>, String> {
+    match next_word(rest) {
+        None => Ok(None),
+        Some((name, "")) => Ok(Some(name.into())),
+        Some(_) => Err(usage.into()),
+    }
+}
+
+fn parse_pr(rest: &str) -> Result<Command, String> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let commit = words.contains(&COMMIT_FLAG);
+    let names: Vec<&str> = words
+        .into_iter()
+        .filter(|word| *word != COMMIT_FLAG)
+        .collect();
+    match names[..] {
+        [] => Ok(Command::Pr { name: None, commit }),
+        [name] if !name.starts_with('-') => Ok(Command::Pr {
+            name: Some(name.into()),
+            commit,
+        }),
+        _ => Err(PR_USAGE.into()),
+    }
+}
+
+fn parse_settle(rest: &str, settled: bool) -> Result<Command, String> {
+    match next_word(rest) {
+        Some((name, "")) => Ok(Command::Settle {
+            name: name.into(),
+            settled,
+        }),
+        _ => Err(SETTLE_USAGE.into()),
+    }
+}
 
 fn next_word(text: &str) -> Option<(&str, &str)> {
     let text = text.trim_start();
@@ -570,6 +829,13 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
             }),
             _ => Err(ENTRY_USAGE.into()),
         },
+        "/diff" => Ok(Command::Diff {
+            name: optional_name(rest, DIFF_USAGE)?,
+        }),
+        "/pr" => parse_pr(rest),
+        "/settle" => parse_settle(rest, true),
+        "/unsettle" => parse_settle(rest, false),
+        "/settled" if rest.is_empty() => Ok(Command::SettledDrawer),
         _ => Ok(Command::Message(input.into())),
     }
 }
@@ -695,7 +961,7 @@ pub(crate) fn specialist_prompt(member: &Member, task: &str) -> String {
         .map(|entry| entry.text.as_str())
         .collect();
     format!(
-        "You are {}, an Agent Command specialist with the role: {}. Work only inside the current directory, your isolated workspace. Finish with a one-line result summary.\n\
+        "You are {}, an Agent Command specialist with the role: {}. Work only inside the current directory, your isolated workspace on its own Git branch. Finish with a one-line result summary. If you need the operator's approval before going further, finish instead with a line: {APPROVAL_MARKER} <question>\n\
          Your previous work:\n{}\n\
          Task: {task}",
         member.name,
@@ -725,7 +991,7 @@ pub(crate) fn summary(text: &str) -> String {
     }
 }
 
-const CLI_USAGE: &str = "Usage: agent-command specialist {list|spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto] [TASK]|review NAME [--next-revision] [FOCUS]|status NAME|remove NAME}";
+const CLI_USAGE: &str = "Usage: agent-command specialist {list|spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto] [TASK]|review NAME [--next-revision] [FOCUS]|status NAME|diff NAME|pr NAME [--commit]|settle NAME|unsettle NAME|remove NAME}";
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -733,36 +999,118 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let store = Store::new(auth::root()?);
-    run_with(&store, &std::env::current_dir()?, args, &mut io::stdout())
+    run_with(
+        &store,
+        &std::env::current_dir()?,
+        args,
+        &mut io::stdout(),
+        &branches::Tools::default(),
+    )
 }
 
-fn run_with(store: &Store, base: &Path, args: &[String], out: &mut impl Write) -> io::Result<()> {
+pub(crate) fn branch_label(member: &Member) -> String {
+    match (member.branch(), &member.changes) {
+        (Some(branch), Some(changes)) => {
+            format!("{} vs {} {}", branch.name, branch.base, changes.totals())
+        }
+        (Some(branch), None) => format!("{} vs {}", branch.name, branch.base),
+        (None, _) => "no branch".into(),
+    }
+}
+
+fn settled_label(member: &Member) -> &'static str {
+    if member.settled {
+        "settled"
+    } else {
+        "active"
+    }
+}
+
+fn write_list(crew: &[Member], out: &mut impl Write) -> io::Result<()> {
+    if crew.is_empty() {
+        writeln!(out, "No specialists. {CLI_USAGE}")?;
+    }
+    for row in inbox_rows(crew, true) {
+        let Some(index) = row.member() else { continue };
+        let member = &crew[index];
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            member.name,
+            member.role,
+            member.status.label(),
+            workspace_label(member),
+            member.permission.flag(),
+            branch_label(member),
+            settled_label(member)
+        )?;
+    }
+    Ok(())
+}
+
+fn write_diff(member: &Member, out: &mut impl Write) -> io::Result<()> {
+    let stat = member.diff().map_err(invalid)?;
+    if let Some(branch) = member.branch() {
+        writeln!(
+            out,
+            "{} · {} vs {} ({})",
+            member.name,
+            branch.name,
+            branch.base,
+            short_commit(&branch.base_commit)
+        )?;
+    }
+    for file in &stat.files {
+        writeln!(out, "+{}\t-{}\t{}", file.added, file.removed, file.path)?;
+    }
+    writeln!(out, "{}", stat.label())
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..SHORT_COMMIT).unwrap_or(commit)
+}
+
+const SHORT_COMMIT: usize = 8;
+
+fn run_with(
+    store: &Store,
+    base: &Path,
+    args: &[String],
+    out: &mut impl Write,
+    tools: &branches::Tools,
+) -> io::Result<()> {
     let mut crew = store.load_roster()?;
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let position = |crew: &[Member], name: &str| find(crew, name).ok_or_else(|| unknown(name));
     match words[..] {
-        ["list"] => {
-            if crew.is_empty() {
-                writeln!(out, "No specialists. {CLI_USAGE}")?;
+        ["list"] => write_list(&crew, out),
+        ["diff", name] => write_diff(&crew[position(&crew, name)?], out),
+        ["pr", name] | ["pr", name, COMMIT_FLAG] | ["pr", COMMIT_FLAG, name] => {
+            let index = position(&crew, name)?;
+            let published =
+                publish(&crew[index], words.contains(&COMMIT_FLAG), tools).map_err(invalid)?;
+            crew[index].refresh_changes();
+            writeln!(out, "{}: {}", crew[index].name, published.describe())?;
+            match published.link {
+                branches::Link::Opened(_) => Ok(()),
+                branches::Link::Missing(reason) => Err(io::Error::other(reason)),
             }
-            for member in &crew {
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}\t{}",
-                    member.name,
-                    member.role,
-                    member.status.label(),
-                    workspace_label(member),
-                    member.permission.flag()
-                )?;
-            }
-            Ok(())
+        }
+        [verb @ ("settle" | "unsettle"), name] => {
+            let index = position(&crew, name)?;
+            let note = settle(&mut crew[index], verb == "settle").map_err(invalid)?;
+            store.save_roster(&crew)?;
+            writeln!(out, "{note}")
         }
         ["spawn", name, role, ref rest @ ..] => {
             validate_name(name, &crew).map_err(invalid)?;
             let rest = rest.join(" ");
             let (mode, task) = mode_option(&rest).map_err(invalid)?;
             let mode = mode.unwrap_or_else(|| PermissionMode::default_for_role(role));
-            let workspace = store.isolate_for(base, name, mode).map_err(invalid)?;
+            let topic = if task.is_empty() { role } else { task };
+            let workspace = store
+                .isolate_for(base, name, topic, mode)
+                .map_err(invalid)?;
             let member = Member::new(name, role, optional(task).as_deref(), Some(workspace))
                 .with_permission(Some(mode));
             writeln!(
@@ -775,10 +1123,10 @@ fn run_with(store: &Store, base: &Path, args: &[String], out: &mut impl Write) -
             store.save_roster(&crew)
         }
         ["status", name] => {
-            let member = &crew[find(&crew, name).ok_or_else(|| unknown(name))?];
+            let member = &crew[position(&crew, name)?];
             writeln!(
                 out,
-                "{}\nrole: {}\nmode: {}\nreview: {}\nstatus: {}\ntask: {}\nworkspace: {}\nhistory: {} entries",
+                "{}\nrole: {}\nmode: {}\nreview: {}\nstatus: {}\ntask: {}\nworkspace: {}\nbranch: {}\nqueue: {}\nhistory: {} entries",
                 member.name,
                 member.role,
                 member.permission.flag(),
@@ -786,6 +1134,8 @@ fn run_with(store: &Store, base: &Path, args: &[String], out: &mut impl Write) -
                 member.status.label(),
                 member.mission,
                 workspace_label(member),
+                branch_label(member),
+                settled_label(member),
                 member.history.len()
             )?;
             for entry in member.history.iter().rev().take(3).rev() {
@@ -798,10 +1148,10 @@ fn run_with(store: &Store, base: &Path, args: &[String], out: &mut impl Write) -
             review_from_cli(store, base, &mut crew, index, &rest.join(" "), out)
         }
         ["remove", name] => {
-            let member = crew.remove(find(&crew, name).ok_or_else(|| unknown(name))?);
-            store.release(&member)?;
+            let member = crew.remove(position(&crew, name)?);
+            let retained = store.release(&member)?;
             store.save_roster(&crew)?;
-            writeln!(out, "Removed {}", member.name)
+            writeln!(out, "{}", removal_note(&member.name, retained.as_deref()))
         }
         _ => Err(invalid(CLI_USAGE)),
     }
@@ -866,10 +1216,12 @@ pub(crate) fn workspace_label(member: &Member) -> String {
         Some(Workspace {
             path,
             isolation: Isolation::Worktree { .. },
+            ..
         }) => format!("git worktree {}", path.display()),
         Some(Workspace {
             path,
             isolation: Isolation::Directory,
+            ..
         }) => format!("directory {}", path.display()),
         None => "preview only".into(),
     }
@@ -878,6 +1230,16 @@ pub(crate) fn workspace_label(member: &Member) -> String {
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
+    use crate::branches::git;
+
+    fn run_with(
+        store: &Store,
+        base: &Path,
+        args: &[String],
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        super::run_with(store, base, args, out, &branches::Tools::default())
+    }
 
     pub(crate) struct Scratch(pub(crate) PathBuf);
 
@@ -1290,5 +1652,283 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!workspace.path.exists());
         assert!(run_with(&store, &base, &strings(&["bogus"]), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn parses_diff_pr_and_settle_commands() {
+        assert_eq!(
+            parse_command("/diff").unwrap(),
+            Command::Diff { name: None }
+        );
+        assert_eq!(
+            parse_command("/diff nova").unwrap(),
+            Command::Diff {
+                name: Some("nova".into())
+            }
+        );
+        assert_eq!(parse_command("/diff a b").unwrap_err(), DIFF_USAGE);
+        assert_eq!(
+            parse_command("/pr").unwrap(),
+            Command::Pr {
+                name: None,
+                commit: false
+            }
+        );
+        for input in ["/pr nova --commit", "/pr --commit nova"] {
+            assert_eq!(
+                parse_command(input).unwrap(),
+                Command::Pr {
+                    name: Some("nova".into()),
+                    commit: true
+                }
+            );
+        }
+        for bad in ["/pr a b", "/pr --force", "/pr nova --force"] {
+            assert_eq!(parse_command(bad).unwrap_err(), PR_USAGE, "{bad}");
+        }
+        assert_eq!(
+            parse_command("/settle nova").unwrap(),
+            Command::Settle {
+                name: "nova".into(),
+                settled: true
+            }
+        );
+        assert_eq!(
+            parse_command("/unsettle nova").unwrap(),
+            Command::Settle {
+                name: "nova".into(),
+                settled: false
+            }
+        );
+        assert_eq!(parse_command("/settle").unwrap_err(), SETTLE_USAGE);
+        assert_eq!(parse_command("/settled").unwrap(), Command::SettledDrawer);
+    }
+
+    fn crew_with(statuses: &[(&str, Status, bool, u64)]) -> Vec<Member> {
+        let mut crew = vec![Member::commander()];
+        for (name, status, settled, touched) in statuses {
+            let mut member = Member::new(name, "r", None, None);
+            member.status = *status;
+            member.settled = *settled;
+            member.touched = *touched;
+            crew.push(member);
+        }
+        crew
+    }
+
+    fn names(crew: &[Member], rows: &[RosterRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                RosterRow::Member(index) => crew[*index].name.clone(),
+                RosterRow::Settled { count, open } => format!("settled:{count}:{open}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inbox_puts_action_needed_first_and_settled_work_in_a_drawer() {
+        let crew = crew_with(&[
+            ("idle", Status::Idle, false, 9),
+            ("done-old", Status::Done, false, 1),
+            ("running", Status::Running, false, 2),
+            ("snoozed", Status::Snoozed, false, 5),
+            ("approval", Status::NeedsApproval, false, 3),
+            ("done-new", Status::Done, false, 7),
+            ("broken", Status::Error, false, 8),
+            ("archived", Status::Done, true, 10),
+            ("shelved", Status::Idle, true, 4),
+        ]);
+        assert_eq!(
+            names(&crew, &inbox_rows(&crew, false)),
+            [
+                "Commander",
+                "broken",
+                "approval",
+                "snoozed",
+                "running",
+                "done-new",
+                "done-old",
+                "idle",
+                "settled:2:false"
+            ]
+        );
+        assert_eq!(
+            names(&crew, &inbox_rows(&crew, true))[8..],
+            ["settled:2:true", "archived", "shelved"]
+        );
+        let plain = crew_with(&[("solo", Status::Idle, false, 0)]);
+        assert_eq!(
+            names(&plain, &inbox_rows(&plain, true)),
+            ["Commander", "solo"]
+        );
+        assert!(Status::NeedsApproval.needs_attention() && Status::Error.needs_attention());
+        assert!(!Status::Done.needs_attention());
+    }
+
+    #[test]
+    fn settling_keeps_history_and_refuses_running_or_commander() {
+        let mut crew = crew_with(&[("nova", Status::Done, false, 0)]);
+        crew[1].remember(Entry::now("nova  kept".into()));
+        assert!(settle(&mut crew[0], true).is_err());
+        assert!(settle(&mut crew[1], true)
+            .unwrap()
+            .starts_with("Settled nova"));
+        assert!(crew[1].settled && crew[1].history.len() == 1);
+        assert_eq!(
+            settle(&mut crew[1], true).unwrap_err(),
+            "nova is already settled."
+        );
+        assert!(settle(&mut crew[1], false)
+            .unwrap()
+            .contains("active queue"));
+        assert_eq!(
+            settle(&mut crew[1], false).unwrap_err(),
+            "nova is not settled."
+        );
+        crew[1].status = Status::Running;
+        assert!(settle(&mut crew[1], true)
+            .unwrap_err()
+            .contains("is running"));
+    }
+
+    #[test]
+    fn approval_requests_are_read_from_the_last_marker() {
+        assert_eq!(approval_request("Done\nall good"), None);
+        assert_eq!(
+            approval_request("NEEDS_APPROVAL: old\nwork\n  NEEDS_APPROVAL: Delete λ.txt?  "),
+            Some("Delete λ.txt?".into())
+        );
+        assert_eq!(
+            approval_request("NEEDS_APPROVAL:"),
+            Some("approval requested".into())
+        );
+        let prompt = specialist_prompt(&Member::new("nova", "r", None, None), "x");
+        assert!(prompt.contains("NEEDS_APPROVAL: <question>"));
+    }
+
+    #[test]
+    fn settled_flag_and_branch_persist_and_legacy_rosters_still_load() {
+        let scratch = Scratch::new("roster-v03");
+        let store = Store::new(scratch.0.join("profiles"));
+        let mut nova = Member::new("nova", "reviewer", Some("Review"), None);
+        nova.status = Status::NeedsApproval;
+        nova.settled = true;
+        nova.workspace = Some(Workspace {
+            path: scratch.0.join("missing"),
+            isolation: Isolation::Worktree {
+                repository: scratch.0.clone(),
+            },
+            branch: Some(Branch {
+                name: "ac/nova-review".into(),
+                base: "main".into(),
+                base_commit: "0".repeat(40),
+            }),
+        });
+        store
+            .save_roster(&[Member::commander(), nova.clone()])
+            .unwrap();
+        let loaded = store.load_roster().unwrap();
+        assert_eq!(loaded[0].status, Status::NeedsApproval);
+        assert!(loaded[0].settled);
+        assert_eq!(loaded[0].workspace, nova.workspace);
+        assert!(loaded[0].changes.is_none());
+        let roster = scratch
+            .0
+            .join("profiles")
+            .join(STATE_DIRECTORY)
+            .join(ROSTER_FILE);
+        assert!(fs::read_to_string(&roster)
+            .unwrap()
+            .contains("\"NEEDS_APPROVAL\""));
+        let legacy = format!(
+            r#"{{"schema":"{SCHEMA}","specialists":[{{"name":"old","role":"r","task":"t","status":"DONE","workspace":{{"path":"{}","isolation":{{"worktree":{{"repository":"{}"}}}}}}}}]}}"#,
+            scratch.0.join("old").display(),
+            scratch.0.display()
+        );
+        fs::write(&roster, legacy).unwrap();
+        let loaded = store.load_roster().unwrap();
+        assert!(!loaded[0].settled && loaded[0].branch().is_none());
+        assert!(loaded[0].diff().unwrap_err().contains("detached"));
+        assert!(publish(&loaded[0], true, &branches::Tools::default())
+            .unwrap_err()
+            .starts_with("No PR for old: its worktree is detached"));
+    }
+
+    #[test]
+    fn cli_names_branches_reports_diffs_settles_and_keeps_unmerged_branches() {
+        let scratch = Scratch::new("cli-branches");
+        let repository = scratch.0.join("repo");
+        git_repository(&repository);
+        branches::tests::configure_identity(&repository);
+        let store = Store::new(scratch.0.join("profiles"));
+        let cli = |args: &[&str]| {
+            let mut out = Vec::new();
+            let result = run_with(&store, &repository, &strings(args), &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+        cli(&["spawn", "nova", "reviewer", "Review", "the", "λ", "docs"])
+            .0
+            .unwrap();
+        cli(&["spawn", "atlas", "builder"]).0.unwrap();
+        let crew = store.load_roster().unwrap();
+        let nova = crew[0].workspace.clone().unwrap();
+        assert_eq!(
+            nova.branch.as_ref().unwrap().name,
+            "ac/nova-review-the-docs"
+        );
+        assert_eq!(crew[1].branch().unwrap().name, "ac/atlas-builder");
+        fs::write(nova.path.join("README"), "fixture\nλ docs\n").unwrap();
+        fs::write(nova.path.join("ünïcode.md"), "one\n").unwrap();
+        let (result, diff) = cli(&["diff", "nova"]);
+        result.unwrap();
+        assert!(
+            diff.starts_with("nova · ac/nova-review-the-docs vs "),
+            "{diff}"
+        );
+        assert!(diff.contains("+1\t-0\tREADME\n+1\t-0\tünïcode.md\n+2 −0 · 2 files\n"));
+        let (_, listed) = cli(&["list"]);
+        assert!(listed.contains("nova\treviewer\tIDLE\tgit worktree"));
+        assert!(listed.contains("ac/nova-review-the-docs vs "), "{listed}");
+        assert!(listed.contains("+2 −0\tactive"));
+        let (refused, _) = cli(&["pr", "nova"]);
+        assert!(refused.unwrap_err().to_string().contains("--commit"));
+        let (missing, out) = cli(&["pr", "nova", "--commit"]);
+        assert!(missing.unwrap_err().to_string().contains("No Git remote"));
+        assert!(out.is_empty());
+        cli(&["settle", "nova"]).0.unwrap();
+        assert!(store.load_roster().unwrap()[0].settled);
+        let (_, status) = cli(&["status", "nova"]);
+        assert!(status.contains("queue: settled") && status.contains("branch: ac/nova"));
+        assert!(cli(&["settle", "nova"]).0.is_err());
+        cli(&["unsettle", "nova"]).0.unwrap();
+        let (_, removed) = cli(&["remove", "nova"]);
+        assert_eq!(
+            removed,
+            "Removed nova; kept unmerged branch ac/nova-review-the-docs.\n"
+        );
+        assert!(!git(
+            &repository,
+            &["branch", "--list", "ac/nova-review-the-docs"]
+        )
+        .unwrap()
+        .is_empty());
+        let (_, removed) = cli(&["remove", "atlas"]);
+        assert_eq!(removed, "Removed atlas.\n");
+        assert!(git(&repository, &["branch", "--list", "ac/atlas-builder"])
+            .unwrap()
+            .is_empty());
+        cli(&["spawn", "nova", "reviewer", "Review", "the", "docs"])
+            .0
+            .unwrap();
+        assert_eq!(
+            store.load_roster().unwrap()[0].branch().unwrap().name,
+            "ac/nova-review-the-docs-2"
+        );
+        let plain = scratch.0.join("plain");
+        fs::create_dir(&plain).unwrap();
+        let mut out = Vec::new();
+        run_with(&store, &plain, &strings(&["spawn", "echo", "w"]), &mut out).unwrap();
+        let error = run_with(&store, &plain, &strings(&["diff", "echo"]), &mut out).unwrap_err();
+        assert!(error.to_string().contains("plain directory"), "{error}");
     }
 }

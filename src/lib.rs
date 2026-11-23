@@ -1,4 +1,5 @@
 mod auth;
+mod branches;
 mod catalog;
 mod checkpoint;
 mod cli;
@@ -217,6 +218,7 @@ struct Delegation {
     review: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 enum ProfileRoute {
     Routed { model: String, metric: String },
     Excluded(String),
@@ -234,18 +236,49 @@ struct Live {
     usage_checked_at: Option<u64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
-    continuation: Option<String>,
     pending: Option<(usize, checkpoint::Claim)>,
     abandon_area: Rect,
-    mission: Option<(String, mission::Mission)>,
+    runs: Vec<Run>,
     store: Option<specialists::Store>,
     queue: VecDeque<Delegation>,
-    reviewing: bool,
-    reply: String,
+    tools: branches::Tools,
     entry: Option<(String, &'static str)>,
     routes: Vec<ProfileRoute>,
     allowances: Vec<usage::Allowance>,
     signed_in: Vec<bool>,
+}
+
+const MAX_PARALLEL_SPECIALISTS: usize = 4;
+const EVENTS_PER_POLL: usize = 64;
+
+struct Run {
+    name: String,
+    mission: mission::Mission,
+    reply: String,
+    continuation: Option<String>,
+    reviewing: bool,
+}
+
+impl Run {
+    fn new(name: &str, mission: mission::Mission, reviewing: bool) -> Self {
+        Self {
+            name: name.into(),
+            mission,
+            reply: String::new(),
+            continuation: None,
+            reviewing,
+        }
+    }
+
+    fn next_event(&self) -> Option<mission::Event> {
+        match self.mission.events.try_recv() {
+            Ok(event) => Some(event),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(mission::Event::Finished(Err(
+                io::Error::other("Mission worker stopped"),
+            ))),
+        }
+    }
 }
 
 impl Live {
@@ -267,18 +300,45 @@ impl Live {
             usage_checked_at: None,
             usage_worker: None,
             running_profile: None,
-            continuation: None,
             pending: None,
             abandon_area: Rect::default(),
-            mission: None,
+            runs: Vec::new(),
             queue: VecDeque::new(),
-            reviewing: false,
-            reply: String::new(),
+            tools: branches::Tools::default(),
             entry: None,
             routes: Vec::new(),
             allowances: Vec::new(),
             signed_in: Vec::new(),
         }
+    }
+
+    fn busy(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    fn running(&self, name: &str) -> bool {
+        self.run_position(name).is_some()
+    }
+
+    fn run_position(&self, name: &str) -> Option<usize> {
+        self.runs
+            .iter()
+            .position(|run| run.name.eq_ignore_ascii_case(name))
+    }
+
+    fn specialist_runs(&self) -> usize {
+        self.runs.iter().filter(|run| run.name != COMMANDER).count()
+    }
+
+    fn next_ready(&mut self) -> Option<Delegation> {
+        if self.specialist_runs() >= MAX_PARALLEL_SPECIALISTS {
+            return None;
+        }
+        let position = self
+            .queue
+            .iter()
+            .position(|delegation| !self.running(&delegation.name))?;
+        self.queue.remove(position)
     }
 
     fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
@@ -477,7 +537,7 @@ impl Live {
             .profiles
             .get(displayed)
             .and_then(|profile| usage::Usage::read(profile).ok());
-        if self.mission.is_some()
+        if self.busy()
             || self
                 .usage_worker
                 .as_ref()
@@ -523,6 +583,8 @@ pub struct App {
     pub send_area: Rect,
     crew_row_height: u16,
     crew_offset: usize,
+    pub show_settled: bool,
+    touch_clock: u64,
     pub deck_palette: token_burn::TokenBurnPalette,
     update_receiver: Option<Receiver<String>>,
     pub update_banner: Option<String>,
@@ -537,7 +599,7 @@ pub struct App {
     goal: Option<goal::Goal>,
     side_chats: Vec<side::SideChat>,
     side_answers: Vec<SideAnswer>,
-    snooze: Option<Snooze>,
+    snoozes: Vec<Snooze>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -563,6 +625,8 @@ impl Default for App {
             send_area: Rect::default(),
             crew_row_height: 1,
             crew_offset: 0,
+            show_settled: false,
+            touch_clock: 0,
             deck_palette: token_burn::TokenBurnPalette::default(),
             update_receiver: None,
             update_banner: None,
@@ -577,7 +641,7 @@ impl Default for App {
             goal: None,
             side_chats: Vec::new(),
             side_answers: Vec::new(),
-            snooze: None,
+            snoozes: Vec::new(),
         }
     }
 }
@@ -664,7 +728,7 @@ impl App {
 
     fn select_profile(&mut self) {
         let Some(live) = &mut self.live else { return };
-        if live.mission.is_some() || live.profiles.is_empty() {
+        if live.busy() || live.profiles.is_empty() {
             return;
         }
         live.preferred = match live.preferred {
@@ -693,33 +757,45 @@ impl App {
             live.refresh_usage();
         }
         self.poll_side();
-        for _ in 0..64 {
-            let Some((name, event)) = self.next_event() else {
+        for _ in 0..EVENTS_PER_POLL {
+            let events = self.next_events();
+            if events.is_empty() {
                 return;
-            };
-            self.handle_event(&name, event);
+            }
+            for (name, event) in events {
+                self.handle_event(&name, event);
+            }
         }
     }
 
-    fn next_event(&mut self) -> Option<(String, mission::Event)> {
-        let (name, running) = self.live.as_ref()?.mission.as_ref()?;
-        let event = match running.events.try_recv() {
-            Ok(event) => event,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                mission::Event::Finished(Err(io::Error::other("Mission worker stopped")))
-            }
+    fn next_events(&self) -> Vec<(String, mission::Event)> {
+        let Some(live) = &self.live else {
+            return Vec::new();
         };
-        Some((name.clone(), event))
+        live.runs
+            .iter()
+            .filter_map(|run| Some((run.name.clone(), run.next_event()?)))
+            .collect()
+    }
+
+    fn touch(&mut self, index: usize) {
+        self.touch_clock += 1;
+        self.crew[index].touched = self.touch_clock;
     }
 
     fn handle_event(&mut self, name: &str, event: mission::Event) {
-        let index = specialists::find(&self.crew, name).unwrap_or(0);
         let live = self.live.as_mut().expect("live mission");
+        let Some(position) = live.run_position(name) else {
+            return;
+        };
+        let Some(index) = specialists::find(&self.crew, name) else {
+            live.runs.remove(position);
+            return;
+        };
         match event {
             mission::Event::Running { profile, reason } => {
                 self.crew[index].status = Status::Running;
-                if !live.reviewing && !self.crew[index].is_commander() {
+                if !live.runs[position].reviewing && !self.crew[index].is_commander() {
                     self.crew[index]
                         .review
                         .record_author(live.profiles[profile].provider);
@@ -728,6 +804,7 @@ impl App {
                 live.last_routed = Some(profile);
                 live.usage_checked_at = None;
                 live.refresh_usage();
+                self.touch(index);
                 if let Some(reason) = reason {
                     self.notice = reason.clone();
                     self.push_log(format!("SYSTEM  {reason}"));
@@ -735,9 +812,11 @@ impl App {
             }
             mission::Event::Continuing { from, to } => {
                 let link = handoff_link(&live.profiles[from], &live.profiles[to]);
-                live.continuation = Some(link.clone());
-                live.pending = None;
-                self.snooze = None;
+                live.runs[position].continuation = Some(link.clone());
+                if name == COMMANDER {
+                    live.pending = None;
+                }
+                self.snoozes.retain(|snooze| snooze.thread != name);
                 self.crew[index].status = Status::Running;
                 self.notice = link.clone();
                 self.push_log(format!("SYSTEM  {link}"));
@@ -749,14 +828,16 @@ impl App {
                     reset_clock(until)
                 );
                 self.crew[index].status = Status::Snoozed;
-                self.snooze = Some(Snooze::new(name, &label));
+                self.snoozes.retain(|snooze| snooze.thread != name);
+                self.snoozes.push(Snooze::new(name, &label));
                 self.notice = label.clone();
                 self.push_log(format!("SYSTEM  {label}"));
             }
             mission::Event::Output(text) => {
-                live.reply.push_str(&text);
-                live.reply.push('\n');
-                let speaker = if live.reviewing {
+                let run = &mut live.runs[position];
+                run.reply.push_str(&text);
+                run.reply.push('\n');
+                let speaker = if run.reviewing {
                     format!("{name} review")
                 } else {
                     name.to_owned()
@@ -765,60 +846,83 @@ impl App {
                     self.record(index, format!("{speaker}  {line}"));
                 }
             }
-            mission::Event::Finished(result) => self.finish_mission(index, result),
+            mission::Event::Finished(result) => {
+                let run = live.runs.remove(position);
+                self.finish_mission(index, run, result)
+            }
         }
     }
 
-    fn finish_mission(&mut self, index: usize, result: io::Result<()>) {
+    fn settle_live_state(&mut self) {
         let live = self.live.as_mut().expect("live mission");
-        live.mission = None;
         if live.pending.is_some() {
             if let Ok(pending) = checkpoint::Claim::pending(&live.profiles, &live.workspace) {
                 live.pending = pending;
             }
         }
-        live.running_profile = None;
+        if !live.busy() {
+            live.running_profile = None;
+        }
         live.usage_checked_at = None;
         live.refresh_usage();
-        self.snooze = None;
-        let reply = std::mem::take(&mut live.reply);
-        let reviewing = std::mem::take(&mut live.reviewing);
-        let continuation = live.continuation.clone();
-        let member = &mut self.crew[index];
-        member.status = if result.is_ok() {
+    }
+
+    fn finish_mission(&mut self, index: usize, run: Run, result: io::Result<()>) {
+        self.settle_live_state();
+        self.touch(index);
+        let name = self.crew[index].name.clone();
+        self.snoozes.retain(|snooze| snooze.thread != name);
+        let outcome: Result<String, String> = match &result {
+            Ok(()) => Ok(run.reply.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        if self.crew[index].is_commander() {
+            self.finish_commander(run, result);
+        } else {
+            self.finish_specialist(index, &run, result);
+        }
+        self.advance_goal(&name, outcome.as_deref().map_err(String::as_str));
+        self.start_next();
+    }
+
+    fn finish_commander(&mut self, run: Run, result: io::Result<()>) {
+        self.crew[0].status = if result.is_ok() {
             Status::Done
         } else {
             Status::Error
         };
-        let name = member.name.clone();
-        let label = member.status.label();
-        if member.is_commander() {
-            self.notice = match &result {
-                Ok(()) => continuation.map_or_else(
-                    || format!("{name} replied."),
-                    |link| format!("Done · {link}"),
-                ),
-                Err(error) => format!("{name}: {error}"),
-            };
-            if result.is_ok() {
-                self.apply_directives(&reply);
-            }
-        } else {
-            let outcome = match &result {
-                Ok(()) => specialists::summary(&reply),
-                Err(error) => error.to_string(),
-            };
-            let kind = if reviewing { " review" } else { "" };
-            self.push_log(format!("{name}{kind}  {label} · {outcome}"));
-            self.notice = format!("{name} {label}");
-            self.save_roster();
-        }
-        let outcome = match &result {
-            Ok(()) => Ok(reply.as_str()),
-            Err(error) => Err(error.to_string()),
+        self.notice = match &result {
+            Ok(()) => run.continuation.map_or_else(
+                || format!("{COMMANDER} replied."),
+                |link| format!("Done · {link}"),
+            ),
+            Err(error) => format!("{COMMANDER}: {error}"),
         };
-        self.advance_goal(&name, outcome.as_ref().map_err(String::as_str).copied());
-        self.start_next();
+        if result.is_ok() {
+            self.apply_directives(&run.reply);
+        }
+    }
+
+    fn finish_specialist(&mut self, index: usize, run: &Run, result: io::Result<()>) {
+        let approval = (!run.reviewing)
+            .then(|| specialists::approval_request(&run.reply))
+            .flatten();
+        let (status, outcome) = match &result {
+            Ok(()) => match approval {
+                Some(question) => (Status::NeedsApproval, question),
+                None => (Status::Done, specialists::summary(&run.reply)),
+            },
+            Err(error) => (Status::Error, error.to_string()),
+        };
+        let member = &mut self.crew[index];
+        member.status = status;
+        member.refresh_changes();
+        let name = member.name.clone();
+        let label = status.label();
+        let kind = if run.reviewing { " review" } else { "" };
+        self.push_log(format!("{name}{kind}  {label} · {outcome}"));
+        self.notice = format!("{name} {label}");
+        self.save_roster();
     }
 
     fn limit_policy(&self) -> mission::LimitPolicy {
@@ -907,10 +1011,7 @@ impl App {
 
     fn turn_scheduled(&self, member: &str) -> bool {
         self.live.as_ref().is_some_and(|live| {
-            live.mission
-                .as_ref()
-                .is_some_and(|(running, _)| running == member)
-                || live.queue.iter().any(|queued| queued.name == member)
+            live.running(member) || live.queue.iter().any(|queued| queued.name == member)
         })
     }
 
@@ -976,15 +1077,23 @@ impl App {
         self.notice = format!("Side answer ready in the {} feed.", chat.thread);
     }
 
+    fn is_snoozed(&self, thread: &str) -> bool {
+        self.snoozes.iter().any(|snooze| snooze.thread == thread)
+    }
+
     fn snoozed(&self) -> bool {
-        self.snooze.is_some()
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.runs.iter().all(|run| self.is_snoozed(&run.name)))
     }
 
     fn apply_directives(&mut self, reply: &str) {
         for directive in specialists::directives(reply) {
             match directive {
                 specialists::Directive::Spawn { name, role, task } => {
-                    if let (Some(index), Some(task)) = (self.spawn(&name, &role, None), task) {
+                    if let (Some(index), Some(task)) =
+                        (self.spawn(&name, &role, None, task.as_deref()), task)
+                    {
                         self.delegate(index, task);
                     }
                 }
@@ -1013,6 +1122,7 @@ impl App {
             }
         }
         self.crew[index].remember(entry);
+        self.touch(index);
     }
 
     fn spawn(
@@ -1020,6 +1130,7 @@ impl App {
         name: &str,
         role: &str,
         mode: Option<permissions::PermissionMode>,
+        task: Option<&str>,
     ) -> Option<usize> {
         if let Err(error) = specialists::validate_name(name, &self.crew) {
             self.notice = error;
@@ -1031,13 +1142,15 @@ impl App {
             .as_ref()
             .and_then(|live| Some((live.store.as_ref()?, &live.workspace)))
         {
-            Some((store, base)) => match store.isolate_for(base, name, mode) {
-                Ok(workspace) => Some(workspace),
-                Err(error) => {
-                    self.notice = error;
-                    return None;
+            Some((store, base)) => {
+                match store.isolate_for(base, name, task.unwrap_or(role), mode) {
+                    Ok(workspace) => Some(workspace),
+                    Err(error) => {
+                        self.notice = error;
+                        return None;
+                    }
                 }
-            },
+            }
             None => match mode.require_isolation(None) {
                 Ok(()) => None,
                 Err(refusal) => {
@@ -1049,8 +1162,13 @@ impl App {
         self.crew
             .push(Member::new(name, role, None, workspace).with_permission(Some(mode)));
         let index = self.crew.len() - 1;
+        self.touch(index);
+        self.crew[index].refresh_changes();
+        let branch = self.crew[index]
+            .branch()
+            .map_or_else(String::new, |branch| format!(" on {}", branch.name));
         self.push_log(format!(
-            "SYSTEM  Spawned {name} ({role}, {}) · {}",
+            "SYSTEM  Spawned {name} ({role}, {}) · {}{branch}",
             mode.flag(),
             specialists::workspace_label(&self.crew[index])
         ));
@@ -1084,11 +1202,13 @@ impl App {
             }
         };
         self.crew[index].mission = targeted.text.clone();
+        self.crew[index].settled = false;
         self.record(index, format!("TASK  {task}"));
         let Some(live) = &mut self.live else {
             self.notice = PREVIEW_NOTICE.into();
             return;
         };
+        let busy = live.running(&name);
         live.queue.push_back(Delegation {
             name: name.clone(),
             task: targeted.text,
@@ -1096,6 +1216,9 @@ impl App {
             review: false,
         });
         self.push_log(format!("SYSTEM  Delegated to {name}: {task}"));
+        if busy {
+            self.notice = format!("{name} is busy; the task is queued for its workspace.");
+        }
         self.save_roster();
         self.start_next();
     }
@@ -1150,25 +1273,16 @@ impl App {
     }
 
     fn start_next(&mut self) {
-        let Some(live) = &mut self.live else { return };
-        if live.mission.is_some() {
-            return;
-        }
-        let Some(delegation) = live.queue.pop_front() else {
-            return;
-        };
-        let Some(index) = specialists::find(&self.crew, &delegation.name) else {
-            return self.start_next();
-        };
-        match self.launch_specialist(index, delegation) {
-            Ok(()) => {}
-            Err(reason) => {
+        while let Some(delegation) = self.live.as_mut().and_then(Live::next_ready) {
+            let Some(index) = specialists::find(&self.crew, &delegation.name) else {
+                continue;
+            };
+            if let Err(reason) = self.launch_specialist(index, delegation) {
                 let name = self.crew[index].name.clone();
                 self.crew[index].status = Status::Error;
                 self.push_log(format!("{name}  ERROR · {reason}"));
                 self.notice = reason;
                 self.save_roster();
-                self.start_next();
             }
         }
     }
@@ -1199,15 +1313,14 @@ impl App {
             });
             (request, member.permission)
         };
-        live.reply.clear();
-        live.continuation = None;
-        live.reviewing = delegation.review;
         let mission = mission::Mission::launch(
             live.profiles.clone(),
             live.route(request, delegation.target, mode, limits),
             workspace.path.clone(),
         );
-        live.mission = Some((member.name.clone(), mission));
+        live.runs
+            .push(Run::new(&member.name, mission, delegation.review));
+        self.crew[index].status = Status::Running;
         Ok(())
     }
 
@@ -1263,19 +1376,16 @@ impl App {
         }
     }
     fn mission_running(&self) -> bool {
-        self.live
-            .as_ref()
-            .is_some_and(|live| live.mission.is_some())
+        self.live.as_ref().is_some_and(Live::busy)
+    }
+
+    fn is_running(&self, name: &str) -> bool {
+        self.live.as_ref().is_some_and(|live| live.running(name))
     }
 
     pub fn toggle_pause(&mut self) {
         let name = self.crew[self.selected].name.clone();
-        if self
-            .live
-            .as_ref()
-            .and_then(|live| live.mission.as_ref())
-            .is_some_and(|(running, _)| *running == name)
-        {
+        if self.is_running(&name) {
             self.notice = "This mission is running. Pause is available between missions.".into();
             return;
         }
@@ -1312,7 +1422,7 @@ impl App {
                 mode,
                 task,
             } => {
-                if let Some(index) = self.spawn(&name, &role, mode) {
+                if let Some(index) = self.spawn(&name, &role, mode, task.as_deref()) {
                     self.selected = index;
                     if let Some(task) = task {
                         self.delegate(index, task);
@@ -1335,6 +1445,10 @@ impl App {
             }
             specialists::Command::Remove { name } => self.remove(&name),
             specialists::Command::Entry { profile } => self.set_entry(&profile),
+            specialists::Command::Diff { name } => self.show_diff(name.as_deref()),
+            specialists::Command::Pr { name, commit } => self.open_pr(name.as_deref(), commit),
+            specialists::Command::Settle { name, settled } => self.settle(&name, settled),
+            specialists::Command::SettledDrawer => self.toggle_settled_drawer(),
             specialists::Command::Settings => self.open_settings(),
             specialists::Command::Connect => self.open_connect(panel::Origin::Direct),
             specialists::Command::Side { question } => self.ask_side(&question),
@@ -1354,25 +1468,136 @@ impl App {
             self.notice = "Commander is the persistent entry bot and cannot be removed.".into();
             return;
         }
+        let mut retained = None;
         if let Some(live) = &mut self.live {
-            if live
-                .mission
-                .as_ref()
-                .is_some_and(|(running, _)| *running == member.name)
-            {
+            if live.running(&member.name) {
                 self.notice = format!("{} is running; remove it after it finishes.", member.name);
                 return;
             }
             live.queue.retain(|queued| queued.name != member.name);
-            if let Some(Err(error)) = live.store.as_ref().map(|store| store.release(member)) {
-                self.notice = format!("Cannot remove {}: {error}", member.name);
-                return;
+            match live.store.as_ref().map(|store| store.release(member)) {
+                Some(Err(error)) => {
+                    self.notice = format!("Cannot remove {}: {error}", member.name);
+                    return;
+                }
+                Some(Ok(branch)) => retained = branch,
+                None => {}
             }
         }
         let member = self.crew.remove(index);
-        self.selected = self.selected.min(self.crew.len() - 1);
-        self.push_log(format!("SYSTEM  Removed {}.", member.name));
+        self.selected = match self.selected {
+            selected if selected == index => 0,
+            selected if selected > index => selected - 1,
+            selected => selected,
+        };
+        let note = specialists::removal_note(&member.name, retained.as_deref());
+        self.push_log(format!("SYSTEM  {note}"));
         self.save_roster();
+    }
+
+    fn target(&self, name: Option<&str>, usage: &str) -> Result<usize, String> {
+        let index = match name {
+            Some(name) => specialists::find(&self.crew, name)
+                .ok_or_else(|| format!("No specialist named {name}."))?,
+            None => self.selected,
+        };
+        if self.crew[index].is_commander() {
+            return Err(format!("Select a specialist or name one. {usage}"));
+        }
+        Ok(index)
+    }
+
+    fn show_diff(&mut self, name: Option<&str>) {
+        let index = match self.target(name, "Usage: /diff [NAME]") {
+            Ok(index) => index,
+            Err(error) => return self.notice = error,
+        };
+        match self.crew[index].diff() {
+            Ok(stat) => {
+                let report = specialists::diff_report(&self.crew[index], &stat);
+                self.notice = format!("{} {}", self.crew[index].name, stat.label());
+                self.crew[index].changes = Some(stat);
+                self.push_log(format!("SYSTEM  Diff {report}"));
+            }
+            Err(error) => self.notice = error,
+        }
+    }
+
+    fn open_pr(&mut self, name: Option<&str>, commit: bool) {
+        let index = match self.target(name, "Usage: /pr [NAME] [--commit]") {
+            Ok(index) => index,
+            Err(error) => return self.notice = error,
+        };
+        if self.live.is_none() {
+            return self.notice = PREVIEW_NOTICE.into();
+        }
+        let tools = self
+            .live
+            .as_ref()
+            .map(|live| live.tools.clone())
+            .unwrap_or_default();
+        let result = specialists::publish(&self.crew[index], commit, &tools);
+        self.crew[index].refresh_changes();
+        let name = self.crew[index].name.clone();
+        match result {
+            Ok(published) => {
+                let report = published.describe();
+                self.notice = format!("{name}: {report}");
+                self.push_log(format!("SYSTEM  PR {name}: {report}"));
+            }
+            Err(error) => self.notice = error,
+        }
+    }
+
+    fn settle(&mut self, name: &str, settled: bool) {
+        let Some(index) = specialists::find(&self.crew, name) else {
+            return self.notice = format!("No specialist named {name}.");
+        };
+        if settled && self.is_running(name) {
+            return self.notice = format!(
+                "{} is running; settle it after it finishes.",
+                self.crew[index].name
+            );
+        }
+        match specialists::settle(&mut self.crew[index], settled) {
+            Ok(note) => {
+                if settled && self.selected == index && !self.show_settled {
+                    self.selected = 0;
+                }
+                self.push_log(format!("SYSTEM  {note}"));
+                self.save_roster();
+            }
+            Err(error) => self.notice = error,
+        }
+    }
+
+    fn toggle_settled_drawer(&mut self) {
+        self.show_settled = !self.show_settled;
+        if !self.show_settled && self.crew[self.selected].settled {
+            self.selected = 0;
+        }
+    }
+
+    fn roster_rows(&self) -> Vec<specialists::RosterRow> {
+        specialists::inbox_rows(&self.crew, self.show_settled)
+    }
+
+    fn step_selection(&mut self, forward: bool) {
+        let members: Vec<usize> = self
+            .roster_rows()
+            .into_iter()
+            .filter_map(specialists::RosterRow::member)
+            .collect();
+        let position = members
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = if forward {
+            (position + 1).min(members.len() - 1)
+        } else {
+            position.saturating_sub(1)
+        };
+        self.selected = members[next];
     }
 
     fn set_entry(&mut self, profile: &str) {
@@ -1380,7 +1605,7 @@ impl App {
             self.notice = "Preview: sign in to choose an entry profile.".into();
             return;
         };
-        if live.mission.is_some() {
+        if live.busy() {
             self.notice = "Change the entry profile between missions.".into();
             return;
         }
@@ -1416,11 +1641,11 @@ impl App {
             self.notice = PREVIEW_NOTICE.into();
             return;
         };
-        if live.mission.is_some() {
-            self.notice = if self.snooze.is_some() {
+        if live.running(COMMANDER) {
+            self.notice = if self.is_snoozed(COMMANDER) {
                 "A mission is snoozed until its limit resets; /btw still works.".into()
             } else {
-                "A mission is already running.".into()
+                "Commander is still working; wait for its reply.".into()
             };
             return;
         }
@@ -1429,16 +1654,14 @@ impl App {
             return;
         }
         if let Some((index, claim)) = live.pending.clone() {
-            live.mission = Some((
-                COMMANDER.into(),
-                mission::Mission::resume(
-                    live.profiles.clone(),
-                    index,
-                    live.workspace.clone(),
-                    command.clone(),
-                    claim,
-                ),
-            ));
+            let mission = mission::Mission::resume(
+                live.profiles.clone(),
+                index,
+                live.workspace.clone(),
+                command.clone(),
+                claim,
+            );
+            live.runs.push(Run::new(COMMANDER, mission, false));
             self.crew[0].mission = command;
             self.input.clear();
             return;
@@ -1464,9 +1687,6 @@ impl App {
             }
         };
         self.notice = format!("Routing in {}", live.workspace.display());
-        live.continuation = None;
-        live.reply.clear();
-        live.reviewing = false;
         let mission = mission::Mission::launch(
             live.profiles.clone(),
             live.route(
@@ -1477,7 +1697,7 @@ impl App {
             ),
             live.workspace.clone(),
         );
-        live.mission = Some((COMMANDER.into(), mission));
+        live.runs.push(Run::new(COMMANDER, mission, false));
         self.crew[0].mission = command.clone();
         self.input.clear();
         self.push_log(format!("YOU  {command}"));
@@ -1485,7 +1705,7 @@ impl App {
 
     fn abandon_continuation(&mut self) {
         let Some(live) = &mut self.live else { return };
-        if live.mission.is_some() {
+        if live.running(COMMANDER) {
             return;
         }
         let Some((index, claim)) = &live.pending else {
@@ -1527,6 +1747,7 @@ impl App {
             KeyCode::F(3) => self.open_settings(),
             KeyCode::F(4) => self.abandon_continuation(),
             KeyCode::F(6) => self.dismiss_update(),
+            KeyCode::F(7) => self.toggle_settled_drawer(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
             KeyCode::Enter if self.editing => self.submit(),
@@ -1535,8 +1756,8 @@ impl App {
                 self.input.pop();
             }
             KeyCode::Char(c) if self.editing => self.input.push(c),
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(self.crew.len() - 1),
+            KeyCode::Up => self.step_selection(false),
+            KeyCode::Down => self.step_selection(true),
             KeyCode::Home => self.selected = 0,
             _ => {}
         }
@@ -1569,23 +1790,25 @@ impl App {
             self.submit();
         } else if self.crew_area.contains(point) {
             let row = usize::from((y - self.crew_area.y) / self.crew_row_height.max(1));
-            if self.crew_offset + row < self.crew.len() {
-                self.selected = self.crew_offset + row;
+            match self.roster_rows().get(self.crew_offset + row) {
+                Some(specialists::RosterRow::Member(index)) => self.selected = *index,
+                Some(specialists::RosterRow::Settled { .. }) => self.toggle_settled_drawer(),
+                None => {}
             }
             self.editing = false;
         }
     }
     fn crew_counts(&self) -> [String; 4] {
-        let count = |status| {
+        let count = |wanted: fn(Status) -> bool| {
             self.crew
                 .iter()
-                .filter(|member| member.status == status)
+                .filter(|member| !member.settled && wanted(member.status))
                 .count()
         };
         [
             format!("{:02}  CREW", self.crew.len()),
-            format!("{:02}  RUNNING", count(Status::Running)),
-            format!("{:02}  NEED ATTENTION", count(Status::Error)),
+            format!("{:02}  RUNNING", count(|status| status == Status::Running)),
+            format!("{:02}  NEED ATTENTION", count(Status::needs_attention)),
             if self.live.is_some() {
                 "LIVE  /  COMMANDER".into()
             } else {
@@ -1609,16 +1832,65 @@ impl App {
                 Line::raw(format!("{} on roster", self.crew.len() - 1)),
             ]
         } else {
-            vec![
+            let mut details = Vec::new();
+            if let Some(branch) = member.branch() {
+                let changes = member
+                    .changes
+                    .as_ref()
+                    .map_or_else(|| "diff unavailable".into(), branches::DiffStat::label);
+                details.extend([
+                    Line::raw("BRANCH"),
+                    Line::raw(format!("{} → {}", branch.name, branch.base)),
+                    Line::raw(changes),
+                    Line::raw(""),
+                ]);
+            }
+            details.extend([
                 Line::raw("ROLE"),
                 Line::raw(member.role.clone()),
                 Line::raw(""),
                 Line::raw("WORKSPACE"),
                 Line::raw(specialists::workspace_label(member)),
-            ]
+            ]);
+            details
         };
         lines.extend(self.goal_lines(&member.name));
         lines
+    }
+
+    fn member_lines(&self, index: usize, t: &Theme) -> Vec<Line<'static>> {
+        let member = &self.crew[index];
+        let chosen = index == self.selected;
+        let style = match (chosen, member.settled) {
+            (true, _) => Style::default().fg(color("d1dce4")).bold(),
+            (false, true) => Style::default().fg(color(&t.muted)),
+            (false, false) => Style::default(),
+        };
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    " ●",
+                    Style::default().fg(color(status_color(member.status, t))),
+                ),
+                Span::styled(format!(" {}  ", member.name), style),
+                Span::styled(
+                    format!("/{:02}", index + 1),
+                    Style::default().fg(color(if chosen { "97a3ad" } else { "5f646b" })),
+                ),
+            ]),
+            Line::styled(
+                format!("   {} · {}", member.status.caption(), member.role),
+                style,
+            ),
+        ]
+    }
+
+    fn change_badge(member: &Member) -> String {
+        member
+            .changes
+            .as_ref()
+            .filter(|changes| !changes.files.is_empty())
+            .map_or_else(String::new, |changes| format!("  ·  {}", changes.totals()))
     }
 
     fn feed_entries(&self) -> Vec<(&str, &str)> {
@@ -1647,9 +1919,9 @@ impl App {
     }
 
     fn collapsed_snooze(&self, thread: &str) -> Option<&Entry> {
-        self.snooze
-            .as_ref()
-            .filter(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
+        self.snoozes
+            .iter()
+            .find(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
             .map(|snooze| &snooze.banner)
     }
 
@@ -1819,54 +2091,28 @@ impl App {
             .max(1);
         let visible = usize::from((self.crew_area.height / stride).max(1));
         self.crew_row_height = stride;
-        self.crew_offset = (self.selected + 1).saturating_sub(visible);
-        for (row_index, (i, member)) in self
-            .crew
+        let rows = self.roster_rows();
+        let selected_row = rows
             .iter()
-            .enumerate()
-            .skip(self.crew_offset)
-            .take(visible)
-            .enumerate()
+            .position(|row| *row == specialists::RosterRow::Member(self.selected))
+            .unwrap_or(0);
+        self.crew_offset = (selected_row + 1).saturating_sub(visible);
+        for (row_index, roster_row) in rows.iter().skip(self.crew_offset).take(visible).enumerate()
         {
-            let name = &member.name;
             let y = self.crew_area.y + row_index as u16 * stride;
             let row = r(self.crew_area.x, y, self.crew_area.width, stride);
-            if i == self.selected {
-                f.render_widget(
-                    Block::default().style(Style::default().bg(color(&t.selection))),
-                    row,
-                );
-            }
-            let style = if i == self.selected {
-                Style::default().fg(color("d1dce4")).bold()
-            } else {
-                Style::default()
+            let lines = match *roster_row {
+                specialists::RosterRow::Member(i) => {
+                    if i == self.selected {
+                        f.render_widget(
+                            Block::default().style(Style::default().bg(color(&t.selection))),
+                            row,
+                        );
+                    }
+                    self.member_lines(i, &t)
+                }
+                specialists::RosterRow::Settled { count, open } => settled_lines(count, open, &t),
             };
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        " ●",
-                        Style::default().fg(color(match member.status {
-                            Status::Running => &t.amber,
-                            Status::Error => "b86d67",
-                            _ => &t.accent,
-                        })),
-                    ),
-                    Span::styled(format!(" {name}  "), style),
-                    Span::styled(
-                        format!("/{:02}", i + 1),
-                        Style::default().fg(color(if i == self.selected {
-                            "97a3ad"
-                        } else {
-                            "5f646b"
-                        })),
-                    ),
-                ]),
-                Line::styled(
-                    format!("   {} · {}", self.status(i).to_lowercase(), member.role),
-                    style,
-                ),
-            ];
             f.render_widget(
                 Paragraph::new(lines),
                 r(row.x, row.y + u16::from(!compact), row.width, 2),
@@ -1906,11 +2152,7 @@ impl App {
                         }
                     ),
                     Style::default()
-                        .fg(color(if selected.status == Status::Running {
-                            &t.amber
-                        } else {
-                            &t.accent
-                        }))
+                        .fg(color(status_color(selected.status, &t)))
                         .bold(),
                 ),
             ])),
@@ -1924,9 +2166,10 @@ impl App {
                 ),
                 Line::styled(
                     format!(
-                        "{}  /  {:02}",
+                        "{}  /  {:02}{}",
                         selected.role.to_uppercase(),
-                        self.selected + 1
+                        self.selected + 1,
+                        Self::change_badge(selected)
                     ),
                     Style::default().fg(color(&t.muted)),
                 ),
@@ -2088,7 +2331,7 @@ impl App {
         let pending = self
             .live
             .as_ref()
-            .is_some_and(|live| live.pending.is_some() && live.mission.is_none());
+            .is_some_and(|live| live.pending.is_some() && !live.running(COMMANDER));
         f.render_widget(
             Paragraph::new(if pending && self.notice.is_empty() {
                 "Interrupted continuation pending · re-enter task, then Send"
@@ -2109,8 +2352,10 @@ impl App {
         let shortcuts = r(0, a.height.saturating_sub(1), a.width, 1);
         let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
         f.render_widget(
-            Paragraph::new(" ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed")
-                .style(style),
+            Paragraph::new(
+                " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed    F7 Settled",
+            )
+            .style(style),
             shortcuts,
         );
         if let Some(live) = &mut self.live {
@@ -2128,6 +2373,28 @@ impl App {
         }
         self.draw_panel(f, a);
     }
+}
+
+fn status_color(status: Status, t: &Theme) -> &str {
+    match status {
+        Status::Running => &t.amber,
+        Status::Error => "b86d67",
+        Status::NeedsApproval => "cc955d",
+        Status::Snoozed => &t.muted,
+        Status::Idle | Status::Done => &t.accent,
+    }
+}
+
+fn settled_lines(count: usize, open: bool, t: &Theme) -> Vec<Line<'static>> {
+    let marker = if open { "▾" } else { "▸" };
+    let action = if open { "F7 hide" } else { "F7 show" };
+    vec![
+        Line::styled(
+            format!(" {marker} SETTLED ({count})"),
+            Style::default().fg(color(&t.muted)).bold(),
+        ),
+        Line::styled(format!("   {action}"), Style::default().fg(color("666f78"))),
+    ]
 }
 
 const MENU_BRAND: &str = "  ▣  AGENT COMMAND";
@@ -3595,5 +3862,328 @@ esac
             assert_eq!(app.input, "x");
             app.input.clear();
         }
+    }
+
+    #[cfg(unix)]
+    const PARALLEL_PROVIDER: &str = r#"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+root="${CLAUDE_CONFIG_DIR%/profiles/claude/*}"
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$1"; }
+prompt=$(cat)
+case "$prompt" in
+  "You are Commander"*"Operator: Status?")
+    say "Crew is busy" ;;
+  "You are nova"*"Task: Build the λ parser")
+    touch "$root/started-nova"
+    while test ! -f "$root/started-atlas"; do sleep 0.01; done
+    while test ! -f "$root/release-nova"; do sleep 0.01; done
+    printf 'λ parser\n' > parser.txt
+    say "Parser ready" ;;
+  "You are nova"*"Task: Polish it")
+    test -f parser.txt || exit 4
+    say "Polished" ;;
+  "You are atlas"*"Task: Write docs")
+    touch "$root/started-atlas"
+    while test ! -f "$root/started-nova"; do sleep 0.01; done
+    say "Drafted\nNEEDS_APPROVAL: Publish the docs?" ;;
+  "You are atlas"*"Task: Hang")
+    touch "$root/hanging"
+    while test ! -f "$root/release-hang"; do sleep 0.01; done
+    touch "$root/hang-finished" ;;
+  *) exit 9 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    fn parallel_app(name: &str) -> (usage::tests::Fixture, PathBuf, App) {
+        let fixture = usage::tests::Fixture::new(name, PARALLEL_PROVIDER);
+        let repository = fixture.root.join("work");
+        specialists::tests::git_repository(&repository);
+        branches::tests::configure_identity(&repository);
+        let profiles = vec![fixture.profile(auth::Provider::Claude, "alpha")];
+        let app = App::from_live(test_live(repository.clone(), profiles, None));
+        (fixture, repository, app)
+    }
+
+    #[cfg(unix)]
+    fn member<'a>(app: &'a App, name: &str) -> &'a Member {
+        &app.crew[specialists::find(&app.crew, name).unwrap()]
+    }
+
+    #[cfg(unix)]
+    fn row_order(text: &str, names: &[&str]) -> Vec<usize> {
+        names.iter().map(|name| text.find(name).unwrap()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn specialists_run_in_parallel_on_named_branches_with_an_inbox_roster() {
+        let (fixture, repository, mut app) = parallel_app("parallel");
+        send(&mut app, "/spawn nova builder Build the λ parser");
+        send(&mut app, "/spawn atlas writer Write docs");
+        wait_for(&mut app, |app| {
+            member(app, "atlas").status == Status::NeedsApproval
+        });
+        assert_eq!(member(&app, "nova").status, Status::Running);
+        assert!(app.mission_running());
+        assert!(app
+            .log
+            .contains(&"atlas  NEEDS_APPROVAL · Publish the docs?".to_owned()));
+        assert_eq!(
+            member(&app, "nova").branch().unwrap().name,
+            "ac/nova-build-the-parser"
+        );
+        assert_eq!(
+            member(&app, "atlas").branch().unwrap().name,
+            "ac/atlas-write-docs"
+        );
+
+        app.selected = 0;
+        send(&mut app, "Status?");
+        wait_for(&mut app, |app| {
+            app.log.contains(&"Commander  Crew is busy".to_owned()) && app.status(0) == "DONE"
+        });
+        assert_eq!(member(&app, "nova").status, Status::Running);
+        send(&mut app, "/ask nova Polish it");
+        assert_eq!(
+            app.notice,
+            "nova is busy; the task is queued for its workspace."
+        );
+
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            let order = row_order(&crew, &["Commander", "atlas", "nova"]);
+            assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{crew}");
+            assert!(crew.contains("needs appr"), "{width}x{height}\n{crew}");
+            if width >= 105 {
+                let whole = region(&buffer, buffer.area);
+                assert!(
+                    whole.contains("01  RUNNING") && whole.contains("01  NEED ATTENTION"),
+                    "{whole}"
+                );
+            }
+        }
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.crew[app.selected].name, "atlas");
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.crew[app.selected].name, "nova");
+
+        fs::write(fixture.root.join("release-nova"), "").unwrap();
+        wait_for(&mut app, |app| {
+            !app.mission_running() && member(app, "nova").mission == "Polish it"
+        });
+        assert_eq!(member(&app, "nova").status, Status::Done, "{}", app.notice);
+        let feed: Vec<&str> = app.log.iter().map(String::as_str).collect();
+        let parser = feed
+            .iter()
+            .position(|line| *line == "nova  DONE · Parser ready");
+        let polished = feed
+            .iter()
+            .position(|line| *line == "nova  DONE · Polished");
+        assert!(parser.unwrap() < polished.unwrap(), "{feed:?}");
+        let nova = member(&app, "nova").clone();
+        assert_eq!(nova.changes.as_ref().unwrap().label(), "+1 −0 · 1 file");
+        assert!(!repository.join("parser.txt").exists());
+
+        app.selected = specialists::find(&app.crew, "nova").unwrap();
+        for (width, height) in SIZES {
+            let buffer = screen(&mut app, width, height);
+            let whole = region(&buffer, buffer.area);
+            assert!(
+                whole.contains("BUILDER  /  02  ·  +1 −0"),
+                "{width}x{height}\n{whole}"
+            );
+            if width >= 105 {
+                assert!(whole.contains("BRANCH") && whole.contains("ac/nova-build-the-parser →"));
+            }
+        }
+        send(&mut app, "/diff");
+        let report = app.log.back().unwrap().clone();
+        assert!(
+            report.starts_with("SYSTEM  Diff nova · ac/nova-build-the-parser vs ")
+                && report.ends_with("+1 −0 · 1 file · parser.txt +1 −0"),
+            "{report}"
+        );
+        send(&mut app, "/diff ghost");
+        assert_eq!(app.notice, "No specialist named ghost.");
+        app.selected = 0;
+        send(&mut app, "/diff");
+        assert!(app.notice.starts_with("Select a specialist or name one."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_drawer_and_pr_controls_work_from_keyboard_mouse_and_commands() {
+        let (fixture, repository, mut app) = parallel_app("settle-pr");
+        send(&mut app, "/spawn nova builder");
+        send(&mut app, "/spawn atlas writer");
+        let nova = specialists::find(&app.crew, "nova").unwrap();
+        fs::write(
+            app.crew[nova]
+                .workspace
+                .as_ref()
+                .unwrap()
+                .path
+                .join("ünï.txt"),
+            "λ\n",
+        )
+        .unwrap();
+        app.selected = nova;
+        send(&mut app, "/settle nova");
+        assert!(app.crew[nova].settled);
+        assert_eq!(app.selected, 0);
+        for (index, (width, height)) in SIZES.into_iter().enumerate() {
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            assert!(
+                crew.contains("▸ SETTLED (1)") && !crew.contains("nova"),
+                "{crew}"
+            );
+            if index == 0 {
+                app.key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+            } else {
+                let header = 2 * app.crew_row_height;
+                app.click(app.crew_area.x + 1, app.crew_area.y + header + 1);
+            }
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            let order = row_order(&crew, &["atlas", "▾ SETTLED (1)"]);
+            assert!(order[0] < order[1], "{crew}");
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.selected, nova);
+            let buffer = screen(&mut app, width, height);
+            let crew = region(&buffer, app.crew_area);
+            let order = row_order(&crew, &["SETTLED", "nova"]);
+            assert!(order[0] < order[1], "{width}x{height}\n{crew}");
+            send(&mut app, "/settled");
+            assert!(!app.show_settled);
+            assert_eq!(app.selected, 0);
+        }
+        assert!(
+            specialists::Store::new(fixture.root.join("profiles"))
+                .load_roster()
+                .unwrap()[0]
+                .settled
+        );
+
+        send(&mut app, "/pr nova");
+        assert!(
+            app.notice.contains("Confirm with --commit"),
+            "{}",
+            app.notice
+        );
+        send(&mut app, "/pr nova --commit");
+        assert!(app.notice.contains("No Git remote"), "{}", app.notice);
+        let remote = fixture.root.join("remote.git");
+        branches::git(
+            &fixture.root,
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        branches::git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        app.live.as_mut().unwrap().tools.gh = fixture.root.join("no-gh").into_os_string();
+        send(&mut app, "/pr nova");
+        assert!(
+            app.notice.starts_with(
+                "nova: pushed ac/nova-builder to origin · PR not opened: GitHub CLI `gh`"
+            ),
+            "{}",
+            app.notice
+        );
+        assert!(app
+            .log
+            .back()
+            .unwrap()
+            .starts_with("SYSTEM  PR nova: pushed"));
+        assert_eq!(
+            app.crew[nova].changes.as_ref().unwrap().label(),
+            "+1 −0 · 1 file"
+        );
+        send(&mut app, "/unsettle nova");
+        assert!(!app.crew[nova].settled);
+        send(&mut app, "/settle commander");
+        assert!(app.notice.contains("cannot be settled"));
+        send(&mut app, "/remove nova");
+        assert_eq!(app.log.back().unwrap(), "SYSTEM  Removed nova.");
+        assert!(!branches::git(&remote, &["rev-parse", "ac/nova-builder"])
+            .unwrap()
+            .is_empty());
+        app.crew[1].changes = None;
+        app.selected = 1;
+        let buffer = screen(&mut app, 120, 40);
+        assert!(region(&buffer, buffer.area).contains("diff unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_app_cancels_every_running_specialist() {
+        let (fixture, _repository, mut app) = parallel_app("parallel-drop");
+        send(&mut app, "/spawn atlas writer Hang");
+        wait_for(&mut app, |_| fixture.root.join("hanging").exists());
+        app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+        assert_eq!(app.notice, "Wait for the running mission before quitting.");
+        send(&mut app, "/settle atlas");
+        assert!(app.notice.contains("is running"));
+        send(&mut app, "/remove atlas");
+        assert!(app.notice.contains("is running"));
+        app.handle_event(
+            "atlas",
+            mission::Event::Snoozed {
+                profile: 0,
+                until: 4_102_444_800,
+            },
+        );
+        assert_eq!(member(&app, "atlas").status, Status::Snoozed);
+        assert!(app.is_snoozed("atlas") && !app.is_snoozed(COMMANDER));
+        app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+        drop(app);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::write(fixture.root.join("release-hang"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!fixture.root.join("hang-finished").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_launches_are_capped_and_never_share_a_workspace() {
+        let fixture = usage::tests::Fixture::new("parallel-cap", "exit 1\n");
+        let mut live = test_live(fixture.root.clone(), Vec::new(), None);
+        let idle = || {
+            mission::Mission::launch(
+                Vec::new(),
+                mission::Route::single("x", None),
+                fixture.root.clone(),
+            )
+        };
+        live.runs.push(Run::new(COMMANDER, idle(), false));
+        for name in ["s1", "s2", "s3", "s4"] {
+            live.runs.push(Run::new(name, idle(), false));
+        }
+        let delegation = |name: &str, task: &str| Delegation {
+            name: name.into(),
+            task: task.into(),
+            target: None,
+            review: false,
+        };
+        live.queue
+            .extend([delegation("s1", "again"), delegation("s5", "new")]);
+        assert_eq!(live.specialist_runs(), MAX_PARALLEL_SPECIALISTS);
+        assert_eq!(live.next_ready(), None);
+        live.runs.remove(4);
+        assert_eq!(live.next_ready(), Some(delegation("s5", "new")));
+        assert_eq!(live.next_ready(), None);
+        assert!(live.running("S1") && !live.running("s4"));
+        assert_eq!(live.queue.len(), 1);
     }
 }

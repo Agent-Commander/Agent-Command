@@ -169,6 +169,20 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
         .is_dir());
+    let diff = run(&["diff", "echo"]);
+    assert!(!diff.status.success());
+    assert!(String::from_utf8_lossy(&diff.stderr).contains("plain directory"));
+    let pr = run(&["pr", "echo", "--commit"]);
+    assert!(!pr.status.success());
+    assert!(String::from_utf8_lossy(&pr.stderr).contains("No PR for echo"));
+    assert!(run(&["settle", "echo"]).status.success());
+    let listed = String::from_utf8_lossy(&run(&["list"]).stdout).into_owned();
+    assert!(
+        listed.trim_end().ends_with("no branch\tsettled"),
+        "{listed}"
+    );
+    assert!(!run(&["settle", "echo"]).status.success());
+    assert!(run(&["unsettle", "echo"]).status.success());
     assert!(run(&["remove", "echo"]).status.success());
     assert!(!run(&["status", "echo"]).status.success());
     assert!(!run(&["unknown"]).status.success());

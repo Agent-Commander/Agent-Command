@@ -383,7 +383,7 @@ impl Control {
         let isolated = self
             .shared
             .store
-            .isolate(&base, name)
+            .isolate(&base, name, task.map(str::trim).unwrap_or(role.trim()))
             .map_err(|error| refused(format!("Cannot isolate {name}: {error}")))?;
         let member = Member::new(name, role.trim(), task.map(str::trim), Some(isolated));
         let permission = external_mode(member.permission);
