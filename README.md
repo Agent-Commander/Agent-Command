@@ -109,6 +109,17 @@ Click `Settings` at the right of the top bar, press F3, or type `/settings`.
   `/entry` and F2.
 - **Check for updates on launch**: on or off, saved in `settings.toml`;
   `AGENT_COMMAND_NO_UPDATE_CHECK=1` still forces it off.
+- **Resume after limits** (`auto_resume_on_reset`, default off): when every
+  eligible profile is latched and the reset time is known, the mission waits in
+  SNOOZED state and resumes itself after the reset (see below).
+- **Snooze limited** (`snooze_limited_missions`, default off): collapses a
+  snoozed thread's feed to one SNOOZED line until it resumes.
+- **Fallback profile** (`fallback_profile`, default Off): a signed-in profile
+  from the *other* provider used when the limited provider has no eligible
+  alternate. Enter cycles Off and each signed-in profile.
+- **Text-gen profile** (`text_gen_profile`, default Off): a lightweight profile
+  slot reserved for titles, branch names, commit messages and PR text.
+- `goal_turn_cap` (settings.toml only, default 10, 1–100): the `/goal` safety cap.
 - The app version and where profiles, theme and settings live.
 
 ### Build from source
@@ -132,6 +143,21 @@ cargo run --locked --bin dev
 Save `theme.toml` to refresh colors in place. Invalid theme edits keep the last working palette. Save Rust source to rebuild and restart automatically; demo state resets after a rebuild. The development supervisor and application are both Rust.
 
 Controls: arrows select an agent, Tab changes focus, Ctrl+N focuses command input, Enter sends a local demo command, Ctrl+P pauses/resumes, Ctrl+L clears the feed, F3 opens Settings, and Ctrl+Q exits. The roster, action buttons and the `Settings` menu item also accept mouse clicks. The other menu-bar labels remain decorative.
+
+## Triage
+
+`agent-command triage` works without starting the terminal UI. It prints the
+version, OS and terminal variables, `settings.toml`, `catalog show`
+provenance, each profile's signed-in status and usage allowance, checkpoint
+and claim counts, and the specialist roster. It never reads credential files;
+sign-in status is only the provider CLI's yes/no answer, and the whole report
+passes through a redactor that replaces token-like values with `[REDACTED]`.
+
+```sh
+agent-command triage                 # readable report
+agent-command triage --json          # structured report
+agent-command triage --pipe claude   # open claude (or codex) with the report
+```
 
 ## Validation
 
@@ -159,6 +185,9 @@ it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 /remove NAME                            remove a specialist and its workspace
 /settings                               open Settings (also F3 or the top-bar item)
 /connect                                connect a provider profile
+/btw QUESTION                           ask a read-only side question (alias /side)
+/goal CRITERIA                          pin a goal and keep taking turns until GOAL_MET
+/goal cancel                            stop the pinned goal after the current turn
 ```
 
 ### Permission modes
@@ -211,9 +240,22 @@ visible reason. Two different targets in one delegation are refused.
 Commander can also reply with `SPAWN_SPECIALIST: NAME | ROLE | TASK` or
 `DELEGATE: NAME | TASK` lines. Each specialist runs in its own `git worktree`
 (or an isolated directory outside Git repositories) with its own history.
-Delegations run one at a time; the roster shows IDLE, RUNNING, DONE or ERROR,
+Delegations run one at a time; the roster shows IDLE, RUNNING, SNOOZED, DONE or ERROR,
 and each result is posted back to Commander's feed. Select a specialist with
 ↑ ↓ or a click to inspect its history; Home or the Commander row returns.
+
+`/btw QUESTION` (or `/side QUESTION`) never cancels or queues behind the
+running mission. It sends the selected thread's last 20 feed lines and the
+question to a separate one-shot, read-only process (Claude `--permission-mode
+plan`, Codex `--sandbox read-only`) on the first unlatched profile, and shows
+the answer as `BTW` lines in that thread's feed. Side answers are not added to
+Commander's transcript or context.
+
+`/goal CRITERIA` pins a goal on the selected thread and sends it as the first
+turn. After each turn the agent either ends with a line `GOAL_MET`, or gets
+another turn, up to `goal_turn_cap` turns (default 10). The details panel shows
+`GOAL turn N/CAP · criteria`; `/goal cancel` stops it at any time, and a failed
+turn stops it too.
 
 ```sh
 agent-command specialist spawn nova reviewer Review the patch
@@ -374,6 +416,20 @@ a checkpoint for the root of a Git workspace. It checks the workspace again
 before launching one continuation on an eligible alternate. The terminal shows
 the source and destination profiles together with the reason. It stops if there
 is no eligible account, the workspace changed, or a continuation also hits a limit.
+
+When the limited provider has no eligible alternate and a Fallback profile from
+the other provider is configured, signed in and not latched, the same
+checkpoint continues there instead, using that provider's default model. The
+claim records the handoff kind (same-provider, cross-provider or after-reset),
+so a reopened claim resumes only on the kind of profile it was fenced for.
+
+With Resume after limits on and no eligible alternate or fallback, a known
+future reset puts the mission in SNOOZED state. The claim is reserved
+immediately, and once the reset passes the interrupted profile is re-checked
+and the workspace SHA-256 digest is verified again before one continuation
+launches. A changed workspace, or a reset that is or becomes unknown, stops the
+mission instead. Ctrl+Q works while snoozed; the reserved claim then waits as a
+pending continuation for the next launch.
 
 A checkpoint stores a mission UUID, interrupted profile, progress counters,
 and a SHA-256 digest covering HEAD, index, and tracked and non-ignored working

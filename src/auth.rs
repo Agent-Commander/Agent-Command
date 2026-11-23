@@ -254,7 +254,7 @@ impl Profile {
 
     pub(crate) fn checkpoint_directory(&self) -> io::Result<PathBuf> {
         self.directory(false)?;
-        let directory = self.root.join("agent-command-checkpoints-v1");
+        let directory = self.root.join(crate::checkpoint::DIRECTORY);
         privacy::create(&directory)?;
         Ok(directory)
     }

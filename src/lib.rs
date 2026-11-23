@@ -5,6 +5,7 @@ mod cli;
 mod connect;
 mod control;
 mod daemon;
+mod goal;
 mod http;
 mod install;
 mod mcp;
@@ -15,9 +16,11 @@ mod permissions;
 mod review;
 mod routing;
 mod settings;
+mod side;
 mod specialists;
 mod targeting;
 pub mod token_burn;
+mod triage;
 pub mod update;
 mod usage;
 pub use cli::run_cli;
@@ -162,6 +165,48 @@ const UPDATE_DISMISS_HINT: &str = " ✕ F6 ";
 fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
     request.units = request.units.iter().map(|unit| frame(unit)).collect();
     request
+}
+
+struct SideAnswer {
+    thread: String,
+    entry: Entry,
+}
+
+struct Snooze {
+    thread: String,
+    banner: Entry,
+}
+
+impl Snooze {
+    fn new(thread: &str, label: &str) -> Self {
+        Self {
+            thread: thread.into(),
+            banner: Entry::now(format!(
+                "SNOOZED  {label} Feed collapsed until the mission resumes."
+            )),
+        }
+    }
+}
+
+fn handoff_link(from: &auth::Profile, to: &auth::Profile) -> String {
+    if from.to_string() == to.to_string() {
+        format!("Reset passed: resumed on {from}")
+    } else if from.provider != to.provider {
+        format!("Limit: {from} → {to} (cross-provider fallback)")
+    } else {
+        format!("Limit: {from} → {to}")
+    }
+}
+
+fn reset_clock(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0).map_or_else(
+        || "an unknown time".into(),
+        |utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -319,15 +364,29 @@ impl Live {
         request: routing::Request,
         target: Option<targeting::Target>,
         mode: permissions::PermissionMode,
+        limits: mission::LimitPolicy,
     ) -> mission::Route {
         mission::Route {
             request,
+            limits,
             preferred: self.preferred.map(|index| self.profiles[index].to_string()),
             catalog: self.catalog(),
             pins: self.pins.clone(),
             target,
             mode,
         }
+    }
+
+    fn side_profile(&self, now: usage::Tick) -> Option<auth::Profile> {
+        [self.running_profile, self.preferred, self.last_routed]
+            .into_iter()
+            .flatten()
+            .chain(0..self.profiles.len())
+            .filter(|index| *index < self.profiles.len())
+            .find(|index| {
+                usage::Usage::read(&self.profiles[*index]).is_ok_and(|usage| !usage.blocked(now))
+            })
+            .map(|index| self.profiles[index].clone())
     }
 
     fn displayed_profile(&self) -> usize {
@@ -475,6 +534,10 @@ pub struct App {
     host: Option<Box<dyn panel::Host>>,
     settings: settings::Settings,
     launch: settings::LaunchConfig,
+    goal: Option<goal::Goal>,
+    side_chats: Vec<side::SideChat>,
+    side_answers: Vec<SideAnswer>,
+    snooze: Option<Snooze>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -511,6 +574,10 @@ impl Default for App {
             host: None,
             settings: settings::Settings::default(),
             launch: settings::LaunchConfig::default(),
+            goal: None,
+            side_chats: Vec::new(),
+            side_answers: Vec::new(),
+            snooze: None,
         }
     }
 }
@@ -625,6 +692,7 @@ impl App {
         if let Some(live) = &mut self.live {
             live.refresh_usage();
         }
+        self.poll_side();
         for _ in 0..64 {
             let Some((name, event)) = self.next_event() else {
                 return;
@@ -666,11 +734,24 @@ impl App {
                 }
             }
             mission::Event::Continuing { from, to } => {
-                let link = format!("Limit: {} → {}", live.profiles[from], live.profiles[to]);
+                let link = handoff_link(&live.profiles[from], &live.profiles[to]);
                 live.continuation = Some(link.clone());
                 live.pending = None;
+                self.snooze = None;
+                self.crew[index].status = Status::Running;
                 self.notice = link.clone();
                 self.push_log(format!("SYSTEM  {link}"));
+            }
+            mission::Event::Snoozed { profile, until } => {
+                let label = format!(
+                    "Snoozed: {} limit resets at {}; auto-resume re-verifies the workspace first.",
+                    live.profiles[profile],
+                    reset_clock(until)
+                );
+                self.crew[index].status = Status::Snoozed;
+                self.snooze = Some(Snooze::new(name, &label));
+                self.notice = label.clone();
+                self.push_log(format!("SYSTEM  {label}"));
             }
             mission::Event::Output(text) => {
                 live.reply.push_str(&text);
@@ -699,6 +780,7 @@ impl App {
         live.running_profile = None;
         live.usage_checked_at = None;
         live.refresh_usage();
+        self.snooze = None;
         let reply = std::mem::take(&mut live.reply);
         let reviewing = std::mem::take(&mut live.reviewing);
         let continuation = live.continuation.clone();
@@ -731,7 +813,171 @@ impl App {
             self.notice = format!("{name} {label}");
             self.save_roster();
         }
+        let outcome = match &result {
+            Ok(()) => Ok(reply.as_str()),
+            Err(error) => Err(error.to_string()),
+        };
+        self.advance_goal(&name, outcome.as_ref().map_err(String::as_str).copied());
         self.start_next();
+    }
+
+    fn limit_policy(&self) -> mission::LimitPolicy {
+        mission::LimitPolicy {
+            auto_resume_on_reset: self.settings.auto_resume_on_reset,
+            fallback_profile: self.settings.fallback_profile.clone(),
+        }
+    }
+
+    fn start_goal(&mut self, criteria: &str) {
+        if let Some(active) = &self.goal {
+            self.notice = format!(
+                "Goal already pinned on {} ({}). /goal cancel first.",
+                active.member,
+                active.status()
+            );
+            return;
+        }
+        let member = self.crew[self.selected].name.clone();
+        if self.selected == 0 && self.mission_running() {
+            self.notice = "Wait for the running mission before pinning a Commander goal.".into();
+            return;
+        }
+        let mut goal = goal::Goal::new(&member, criteria, self.settings.goal_cap());
+        let prompt = goal.begin();
+        self.notice = format!("Goal pinned on {member}: {}", goal.status());
+        self.push_log(format!(
+            "SYSTEM  Goal pinned on {member}: {}",
+            goal.status()
+        ));
+        self.goal = Some(goal);
+        self.send_goal_turn(&member, prompt);
+    }
+
+    fn cancel_goal(&mut self) {
+        self.notice = match self.goal.take() {
+            Some(goal) => {
+                let message = format!(
+                    "Goal cancelled on {} after {} of {} turns.",
+                    goal.member, goal.turns, goal.cap
+                );
+                self.push_log(format!("SYSTEM  {message}"));
+                message
+            }
+            None => "No goal is pinned.".into(),
+        };
+    }
+
+    fn advance_goal(&mut self, member: &str, outcome: Result<&str, &str>) {
+        let Some(goal) = self.goal.as_mut().filter(|goal| goal.member == member) else {
+            return;
+        };
+        let message = match goal.after_turn(outcome) {
+            goal::Step::Continue(prompt) => {
+                let status = goal.status();
+                self.push_log(format!("SYSTEM  Goal continues: {status}"));
+                self.send_goal_turn(member, prompt);
+                return;
+            }
+            goal::Step::Met => format!("Goal met on {member}: {}", goal.status()),
+            goal::Step::CapReached => format!(
+                "Goal stopped at the {}-turn safety cap on {member}: {}",
+                goal.cap, goal.criteria
+            ),
+            goal::Step::Failed(error) => format!("Goal stopped on {member}: {error}"),
+        };
+        self.goal = None;
+        self.notice = message.clone();
+        self.push_log(format!("SYSTEM  {message}"));
+    }
+
+    fn send_goal_turn(&mut self, member: &str, prompt: String) {
+        let typed = std::mem::take(&mut self.input);
+        match specialists::find(&self.crew, member) {
+            Some(0) => self.message_commander(prompt),
+            Some(index) => self.delegate(index, prompt),
+            None => {}
+        }
+        self.input = typed;
+        if !self.turn_scheduled(member) {
+            let reason = std::mem::take(&mut self.notice);
+            self.goal = None;
+            self.notice = format!("Goal stopped on {member}: {reason}");
+        }
+    }
+
+    fn turn_scheduled(&self, member: &str) -> bool {
+        self.live.as_ref().is_some_and(|live| {
+            live.mission
+                .as_ref()
+                .is_some_and(|(running, _)| running == member)
+                || live.queue.iter().any(|queued| queued.name == member)
+        })
+    }
+
+    fn ask_side(&mut self, question: &str) {
+        let Some(live) = &self.live else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        let Some(profile) = live.side_profile(usage::now()) else {
+            self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
+            return;
+        };
+        let member = &self.crew[self.selected];
+        let workspace = member.workspace.as_ref().map_or_else(
+            || live.workspace.clone(),
+            |workspace| workspace.path.clone(),
+        );
+        let history: Vec<&str> = if member.is_commander() {
+            self.log.iter().map(String::as_str).collect()
+        } else {
+            member
+                .history
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect()
+        };
+        let label = profile.to_string();
+        let chat = side::SideChat::launch(&member.name, question, profile, workspace, &history);
+        self.side_chats.push(chat);
+        self.notice = format!("Side question sent to {label}; the mission keeps running.");
+    }
+
+    fn poll_side(&mut self) {
+        let mut waiting = Vec::new();
+        for chat in std::mem::take(&mut self.side_chats) {
+            match chat.poll() {
+                side::Poll::Waiting => waiting.push(chat),
+                side::Poll::Answered(result) => self.show_side_answer(&chat, result),
+            }
+        }
+        waiting.append(&mut self.side_chats);
+        self.side_chats = waiting;
+    }
+
+    fn show_side_answer(&mut self, chat: &side::SideChat, result: io::Result<Vec<String>>) {
+        let mut lines = vec![format!("BTW  Q: {}", chat.question)];
+        match result {
+            Ok(answer) if answer.is_empty() => lines.push("BTW  (no answer)".into()),
+            Ok(answer) => lines.extend(answer.into_iter().map(|line| format!("BTW  {line}"))),
+            Err(error) => lines.push(format!("BTW  Side chat failed: {error}")),
+        }
+        for text in lines {
+            self.side_answers.push(SideAnswer {
+                thread: chat.thread.clone(),
+                entry: Entry::now(text),
+            });
+        }
+        let overflow = self
+            .side_answers
+            .len()
+            .saturating_sub(specialists::FEED_LIMIT);
+        self.side_answers.drain(..overflow);
+        self.notice = format!("Side answer ready in the {} feed.", chat.thread);
+    }
+
+    fn snoozed(&self) -> bool {
+        self.snooze.is_some()
     }
 
     fn apply_directives(&mut self, reply: &str) {
@@ -928,6 +1174,7 @@ impl App {
     }
 
     fn launch_specialist(&mut self, index: usize, delegation: Delegation) -> Result<(), String> {
+        let limits = self.limit_policy();
         let live = self.live.as_mut().expect("live delegation");
         let member = &self.crew[index];
         let workspace = member
@@ -957,7 +1204,7 @@ impl App {
         live.reviewing = delegation.review;
         let mission = mission::Mission::launch(
             live.profiles.clone(),
-            live.route(request, delegation.target, mode),
+            live.route(request, delegation.target, mode, limits),
             workspace.path.clone(),
         );
         live.mission = Some((member.name.clone(), mission));
@@ -1090,6 +1337,9 @@ impl App {
             specialists::Command::Entry { profile } => self.set_entry(&profile),
             specialists::Command::Settings => self.open_settings(),
             specialists::Command::Connect => self.open_connect(panel::Origin::Direct),
+            specialists::Command::Side { question } => self.ask_side(&question),
+            specialists::Command::Goal { criteria } => self.start_goal(&criteria),
+            specialists::Command::GoalCancel => self.cancel_goal(),
             specialists::Command::Message(text) => self.message_commander(text),
         }
     }
@@ -1158,6 +1408,7 @@ impl App {
     }
 
     fn message_commander(&mut self, command: String) {
+        let limits = self.limit_policy();
         let Some(live) = &mut self.live else {
             self.crew[0].mission = command.clone();
             self.push_log(format!("YOU  {command}"));
@@ -1166,7 +1417,11 @@ impl App {
             return;
         };
         if live.mission.is_some() {
-            self.notice = "A mission is already running.".into();
+            self.notice = if self.snooze.is_some() {
+                "A mission is snoozed until its limit resets; /btw still works.".into()
+            } else {
+                "A mission is already running.".into()
+            };
             return;
         }
         if self.crew[0].paused {
@@ -1218,6 +1473,7 @@ impl App {
                 request,
                 targeted.target,
                 permissions::PermissionMode::Supervised,
+                limits,
             ),
             live.workspace.clone(),
         );
@@ -1252,7 +1508,7 @@ impl App {
         }
         if control {
             match key.code {
-                KeyCode::Char('q' | 'c') if self.mission_running() => {
+                KeyCode::Char('q' | 'c') if self.mission_running() && !self.snoozed() => {
                     self.notice = "Wait for the running mission before quitting.".into();
                 }
                 KeyCode::Char('q' | 'c') => self.quit = true,
@@ -1340,7 +1596,7 @@ impl App {
 
     fn selected_details(&self) -> Vec<Line<'static>> {
         let member = &self.crew[self.selected];
-        if member.is_commander() {
+        let mut lines = if member.is_commander() {
             let entry = self
                 .live
                 .as_ref()
@@ -1360,23 +1616,50 @@ impl App {
                 Line::raw("WORKSPACE"),
                 Line::raw(specialists::workspace_label(member)),
             ]
-        }
+        };
+        lines.extend(self.goal_lines(&member.name));
+        lines
     }
 
     fn feed_entries(&self) -> Vec<(&str, &str)> {
-        if self.selected == 0 {
-            self.log_times
+        let thread = self.crew[self.selected].name.as_str();
+        let mut entries: Vec<(&str, &str)> = match self.collapsed_snooze(thread) {
+            Some(banner) => vec![(banner.at.as_str(), banner.text.as_str())],
+            None if self.selected == 0 => self
+                .log_times
                 .iter()
                 .zip(&self.log)
                 .map(|(at, text)| (at.as_str(), text.as_str()))
-                .collect()
-        } else {
-            self.crew[self.selected]
+                .collect(),
+            None => self.crew[self.selected]
                 .history
                 .iter()
                 .map(|entry| (entry.at.as_str(), entry.text.as_str()))
-                .collect()
-        }
+                .collect(),
+        };
+        entries.extend(
+            self.side_answers
+                .iter()
+                .filter(|answer| answer.thread == thread)
+                .map(|answer| (answer.entry.at.as_str(), answer.entry.text.as_str())),
+        );
+        entries
+    }
+
+    fn collapsed_snooze(&self, thread: &str) -> Option<&Entry> {
+        self.snooze
+            .as_ref()
+            .filter(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
+            .map(|snooze| &snooze.banner)
+    }
+
+    fn goal_lines(&self, member: &str) -> Vec<Line<'static>> {
+        self.goal
+            .as_ref()
+            .filter(|goal| goal.member == member)
+            .map_or_else(Vec::new, |goal| {
+                vec![Line::raw(""), Line::raw("GOAL"), Line::raw(goal.status())]
+            })
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
@@ -2670,6 +2953,192 @@ esac
     fn send(app: &mut App, text: &str) {
         app.input = text.into();
         app.submit();
+    }
+
+    #[cfg(unix)]
+    const SIDE_AND_GOAL_PROVIDER: &str = r#"
+if test "$1" = auth; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+    exit
+fi
+prompt=$(cat)
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$1"; }
+case "$*" in *"--permission-mode plan"*)
+    case "$prompt" in
+      *"Side question (/btw)"*"MAIN-HISTORY-MARKER"*"Question:"*"Where are we?") say "Side answer: still on step 2"; exit ;;
+    esac
+    exit 5 ;;
+esac
+operator=${prompt##*Operator: }
+case "$operator" in
+  *MAIN-HISTORY-MARKER*)
+    while ! test -f release; do sleep 0.02; done
+    say "Main finished" ;;
+  *"Pinned goal (turn 1 of at most 10): ship the release"*) say "Turn one progress" ;;
+  *"Pinned goal (turn 2 of at most 10): ship the release"*) say "Shipped"; say "GOAL_MET" ;;
+  *"endless polish"*)
+    printf 'turn\n' >> turns
+    say "Still polishing" ;;
+  *) exit 6 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn side_chat_answers_without_interrupting_the_running_mission() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("side-chat", SIDE_AND_GOAL_PROVIDER);
+        let workspace = fixture.root.join("work");
+        fs::create_dir(&workspace).unwrap();
+        let profiles = vec![fixture.profile(Provider::Claude, "alpha")];
+        let mut app = App::from_live(test_live(workspace.clone(), profiles, None));
+        send(&mut app, "Long task MAIN-HISTORY-MARKER");
+        wait_for(&mut app, |app| app.crew[0].status == Status::Running);
+        send(&mut app, "/btw Where are we?");
+        assert!(app.input.is_empty());
+        wait_for(&mut app, |app| app.side_answers.len() >= 2);
+        assert!(app.mission_running());
+        assert_eq!(app.crew[0].status, Status::Running);
+        let feed: Vec<String> = app
+            .feed_entries()
+            .into_iter()
+            .map(|(_, text)| text.to_owned())
+            .collect();
+        assert!(
+            feed.contains(&"BTW  Q: Where are we?".to_owned()),
+            "{feed:?}"
+        );
+        assert!(feed.contains(&"BTW  Side answer: still on step 2".to_owned()));
+        assert!(!app.log.iter().any(|line| line.starts_with("BTW")));
+        fs::write(workspace.join("release"), "").unwrap();
+        wait_for(&mut app, |app| app.crew[0].status == Status::Done);
+        assert!(app.log.contains(&"Commander  Main finished".to_owned()));
+        assert!(!app.log.iter().any(|line| line.contains("Side answer")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snoozed_mission_shows_state_collapses_feed_and_allows_quit() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("snooze-view", SIDE_AND_GOAL_PROVIDER);
+        let workspace = fixture.root.join("work");
+        fs::create_dir(&workspace).unwrap();
+        let profiles = vec![
+            fixture.profile(Provider::Claude, "alpha"),
+            fixture.profile(Provider::Codex, "backup"),
+        ];
+        assert_eq!(
+            handoff_link(&profiles[0], &profiles[1]),
+            "Limit: claude/alpha → codex/backup (cross-provider fallback)"
+        );
+        let mut app = App::from_live(test_live(workspace.clone(), profiles, None));
+        send(&mut app, "Long task MAIN-HISTORY-MARKER");
+        wait_for(&mut app, |app| app.crew[0].status == Status::Running);
+        let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        app.key(quit);
+        assert!(!app.quit);
+        app.handle_event(
+            COMMANDER,
+            mission::Event::Snoozed {
+                profile: 0,
+                until: 4_102_444_800,
+            },
+        );
+        assert_eq!(app.status(0), "SNOOZED");
+        assert!(app
+            .notice
+            .starts_with("Snoozed: claude/alpha limit resets at"));
+        let expanded = app.feed_entries().len();
+        assert!(expanded > 1);
+        app.settings.snooze_limited_missions = true;
+        let collapsed = app.feed_entries();
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed[0].1.starts_with("SNOOZED  Snoozed: claude/alpha"));
+        send(&mut app, "Another task");
+        assert!(app.notice.contains("snoozed until its limit resets"));
+        app.handle_event(COMMANDER, mission::Event::Continuing { from: 0, to: 0 });
+        assert_eq!(app.status(0), "RUNNING");
+        assert_eq!(app.notice, "Reset passed: resumed on claude/alpha");
+        assert!(app.feed_entries().len() > 1);
+        app.handle_event(
+            COMMANDER,
+            mission::Event::Snoozed {
+                profile: 0,
+                until: 4_102_444_800,
+            },
+        );
+        app.key(quit);
+        assert!(app.quit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_loop_runs_until_goal_met_stops_at_cap_and_cancels() {
+        use auth::Provider;
+        use usage::tests::Fixture;
+
+        let fixture = Fixture::new("goal-loop", SIDE_AND_GOAL_PROVIDER);
+        let workspace = fixture.root.join("work");
+        fs::create_dir(&workspace).unwrap();
+        let profiles = vec![fixture.profile(Provider::Claude, "alpha")];
+        let mut app = App::from_live(test_live(workspace.clone(), profiles, None));
+        send(&mut app, "/goal ship the release");
+        assert_eq!(
+            app.goal.as_ref().map(goal::Goal::status).as_deref(),
+            Some("turn 1/10 · ship the release")
+        );
+        assert!(app
+            .goal_lines(COMMANDER)
+            .iter()
+            .any(|line| line.to_string() == "turn 1/10 · ship the release"));
+        wait_for(&mut app, |app| app.goal.is_none() && !app.mission_running());
+        assert!(
+            app.log.contains(
+                &"SYSTEM  Goal met on Commander: turn 2/10 · ship the release".to_owned()
+            ),
+            "{:?}",
+            app.log
+        );
+
+        app.settings.goal_turn_cap = 2;
+        app.input = "half-typed".into();
+        app.start_goal("endless polish");
+        wait_for(&mut app, |app| app.goal.is_none() && !app.mission_running());
+        assert_eq!(app.input, "half-typed");
+        assert_eq!(
+            fs::read_to_string(workspace.join("turns")).unwrap(),
+            "turn\nturn\n"
+        );
+        assert!(app
+            .notice
+            .starts_with("Goal stopped at the 2-turn safety cap on Commander"));
+
+        app.input.clear();
+        send(&mut app, "/goal endless polish");
+        send(&mut app, "/goal cancel");
+        assert!(app.goal.is_none());
+        assert!(app
+            .notice
+            .starts_with("Goal cancelled on Commander after 1 of 2"));
+        wait_for(&mut app, |app| !app.mission_running());
+        assert_eq!(
+            fs::read_to_string(workspace.join("turns")).unwrap(),
+            "turn\nturn\nturn\n"
+        );
+        send(&mut app, "/goal cancel");
+        assert_eq!(app.notice, "No goal is pinned.");
+
+        app.crew[0].paused = true;
+        send(&mut app, "/goal endless polish");
+        assert!(app.goal.is_none());
+        assert_eq!(
+            app.notice,
+            "Goal stopped on Commander: Resume Commander before sending a message."
+        );
     }
 
     #[cfg(unix)]

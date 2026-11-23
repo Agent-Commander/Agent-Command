@@ -1,7 +1,7 @@
 use crate::{
     auth::{Profile, Provider},
     catalog::Catalog,
-    mission::{Event, Mission, Route},
+    mission::{Event, LimitPolicy, Mission, Route},
     native::Pins,
     permissions::PermissionMode,
     routing::Request,
@@ -293,6 +293,7 @@ pub(crate) fn review_route(plan: &ReviewPlan, catalog: Catalog, pins: Pins) -> R
         pins,
         target: Some(plan.target),
         mode: PermissionMode::ReadOnly,
+        limits: LimitPolicy::default(),
     }
 }
 
@@ -309,7 +310,9 @@ pub(crate) fn run_to_completion(
                 reason: Some(reason),
                 ..
             } => writeln!(out, "{reason}")?,
-            Event::Running { reason: None, .. } | Event::Continuing { .. } => {}
+            Event::Running { reason: None, .. }
+            | Event::Continuing { .. }
+            | Event::Snoozed { .. } => {}
             Event::Output(text) => writeln!(out, "{text}")?,
             Event::Finished(result) => return result,
         }

@@ -531,10 +531,9 @@ fn update_toggle_persists_and_the_environment_variable_overrides_it() {
             click(&mut app, toggle);
         }
         let path = sandbox.0.join("config/settings.toml");
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "check_for_updates = false\n"
-        );
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("check_for_updates = false\n"));
         assert!(!app.launch_update_check());
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("Off on launch"), "{text}");
@@ -547,6 +546,56 @@ fn update_toggle_persists_and_the_environment_variable_overrides_it() {
         forced.open_settings();
         let text = screen(&render(&mut forced, width, height));
         assert!(text.contains("AGENT_COMMAND_NO_UPDATE_CHECK=1"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn limit_toggles_and_profile_slots_persist_from_keyboard_and_mouse() {
+    for (index, (width, height)) in SIZES.into_iter().enumerate() {
+        let sandbox = Sandbox::new(&format!("limit-slots-{width}"));
+        existing(&sandbox, Provider::Claude, "work");
+        existing(&sandbox, Provider::Codex, "backup");
+        let host = fake([true, true], &["claude/work", "codex/backup"]);
+        let mut app = launched(&sandbox, &host);
+        press(&mut app, KeyCode::F(3));
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("Resume after limits"), "{text}");
+        assert!(text.contains("Fallback profile"), "{text}");
+        assert_inside(&app, width, height);
+        let activate = |app: &mut App, action: Action| {
+            if index == 0 {
+                while app.focused_action() != Some(action) {
+                    press(app, KeyCode::Down);
+                }
+                press(app, KeyCode::Enter);
+            } else {
+                render(app, width, height);
+                click(app, hit(app, action));
+            }
+        };
+        activate(&mut app, Action::AutoResume);
+        activate(&mut app, Action::SnoozeMissions);
+        activate(&mut app, Action::FallbackProfile);
+        activate(&mut app, Action::FallbackProfile);
+        activate(&mut app, Action::TextGenProfile);
+        assert!(status(&app).contains("Text generation profile: claude/work"));
+        let saved = settings::Settings::load(&sandbox.0.join("config/settings.toml")).unwrap();
+        assert!(saved.auto_resume_on_reset);
+        assert!(saved.snooze_limited_missions);
+        assert_eq!(saved.fallback_profile.as_deref(), Some("codex/backup"));
+        assert_eq!(saved.text_gen_profile.as_deref(), Some("claude/work"));
+        assert_eq!(
+            app.limit_policy(),
+            crate::mission::LimitPolicy {
+                auto_resume_on_reset: true,
+                fallback_profile: Some("codex/backup".into()),
+            }
+        );
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("codex/backup"), "{text}");
+        activate(&mut app, Action::FallbackProfile);
+        assert!(status(&app).contains("Cross-provider fallback: Off"));
     }
 }
 
