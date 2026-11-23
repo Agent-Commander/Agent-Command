@@ -44,6 +44,24 @@ The installers download the latest published release. Re-running the installer u
 
 At launch, release builds check once for a newer release in the background and show a one-line banner; press F6 or click it to dismiss. Nothing installs automatically. Run `agent-command update` to install a newer release (on Windows it prints the PowerShell command). Turn the launch check off in Settings, or set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip it regardless of Settings. Development builds never check.
 
+## Uninstall
+
+Paste the command for your system. It removes `agent-command`, its empty install folder, and only the PATH lines the installer added. It honors `AGENT_COMMAND_INSTALL_DIR` and is safe to run twice.
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/uninstall.sh | sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/uninstall.ps1 | iex
+```
+
+Sign-ins and app data are kept: profiles in `~/.local/share/sub-auth` (or `SUB_AUTH_DIR`) and `theme.toml` stay where they are. To sign out, run `agent-command auth logout PROVIDER PROFILE` before uninstalling. If you also installed with Cargo, run `cargo uninstall agent-command`. Close Agent Command first on Windows.
+
 Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`. Settings are saved in `settings.toml` in that same `agent-command` directory.
 
 ### First run: connect a provider
