@@ -42,6 +42,24 @@ The command is `agent-command`, so tools already named `agent` are unaffected. I
 
 The installers download the latest published release. Re-running the installer updates the app. Close an existing instance before updating on Windows.
 
+## Uninstall
+
+Paste the command for your system. It removes `agent-command`, its empty install folder, and only the PATH lines the installer added. It honors `AGENT_COMMAND_INSTALL_DIR` and is safe to run twice.
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/uninstall.sh | sh
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/uninstall.ps1 | iex
+```
+
+Sign-ins and app data are kept: profiles in `~/.local/share/sub-auth` (or `SUB_AUTH_DIR`) and `theme.toml` stay where they are. To sign out, run `agent-command auth logout PROVIDER PROFILE` before uninstalling. If you also installed with Cargo, run `cargo uninstall agent-command`. Close Agent Command first on Windows.
+
 Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`.
 
 ### Build from source
