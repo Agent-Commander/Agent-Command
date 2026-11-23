@@ -99,6 +99,7 @@ fn model_pins_round_trip_through_versioned_state_and_refuse_aliases() {
         &["pin", "claude", "work", "opus"][..],
         &["pin", "claude", "work", "claude-opus-5-5", "ultra"],
         &["pin", "claude", "absent", "claude-opus-5-5"],
+        &["pin", "claude", "work", "claude-opus-5-5-high"],
     ] {
         assert!(!model(refused).status.success(), "{refused:?}");
     }

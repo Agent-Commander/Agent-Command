@@ -11,6 +11,7 @@ const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 const CLAUDE_ROLLING_ALIASES: [&str; 6] =
     ["default", "best", "opus", "sonnet", "haiku", "opusplan"];
 const ROLLING_SUFFIX: &str = "-latest";
+const BENCHMARK_VARIANT_SUFFIXES: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const MAX_MODEL_LENGTH: usize = 64;
 pub(crate) const PINS_FILE: &str = "native-pins-v1.json";
 pub(crate) const PINS_SCHEMA: &str = "agent-command-native-pins-v1";
@@ -55,7 +56,24 @@ fn has_version_segment(model: &str) -> bool {
         .any(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+fn benchmark_variant_effort(model: &str) -> Option<(&str, &str)> {
+    let (base, suffix) = model.rsplit_once('-')?;
+    BENCHMARK_VARIANT_SUFFIXES
+        .contains(&suffix)
+        .then_some((base, suffix))
+}
+
+fn refuse_benchmark_variant(model: &str) -> Result<(), String> {
+    match benchmark_variant_effort(model) {
+        Some((base, effort)) => Err(format!(
+            "{model} names a benchmark effort variant, not a native model; pin {base} with effort {effort}"
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn validate_pinned_model(provider: Provider, model: &str) -> Result<(), String> {
+    refuse_benchmark_variant(model)?;
     match provider {
         Provider::Claude if CLAUDE_ROLLING_ALIASES.contains(&model) => Err(format!(
             "{model} is a rolling alias; pin a full Claude model name such as claude-<family>-<version>"
@@ -133,7 +151,7 @@ impl Pin {
         Provider::named(self.profile.split_once('/')?.0)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         let provider = self
             .provider()
             .ok_or_else(|| format!("{} does not name a provider profile", self.profile))?;
@@ -360,6 +378,54 @@ mod tests {
     }
 
     #[test]
+    fn effort_suffixed_names_are_benchmark_variants_not_native_models() {
+        for (provider, variant) in [
+            (Provider::Claude, "claude-opus-5-5-high"),
+            (Provider::Claude, "claude-opus-5-5-xhigh"),
+            (Provider::Claude, "claude-opus-5-5-max"),
+            (Provider::Claude, "claude-sonnet-5-low"),
+            (Provider::Codex, "gpt-6.2-sol-high"),
+            (Provider::Codex, "gpt-6-2-sol-medium"),
+            (Provider::Codex, "gpt-6.2-sol-minimal"),
+        ] {
+            let refusal = validate_pinned_model(provider, variant).unwrap_err();
+            assert!(
+                refusal.contains("benchmark effort variant"),
+                "{variant}: {refusal}"
+            );
+            for effort in [None, Some("high")] {
+                assert_eq!(
+                    benchmark(provider, Some(variant), effort),
+                    None,
+                    "{variant}"
+                );
+            }
+        }
+        assert_eq!(
+            validate_pinned_model(Provider::Claude, "claude-opus-5-5-high").unwrap_err(),
+            "claude-opus-5-5-high names a benchmark effort variant, not a native model; pin claude-opus-5-5 with effort high"
+        );
+        for (provider, model) in [
+            (Provider::Claude, "claude-opus-5-5"),
+            (Provider::Claude, "claude-opus-6"),
+            (Provider::Claude, "claude-sonnet-6-1-20270301"),
+            (Provider::Claude, "claude-haiku-6-highland"),
+            (Provider::Codex, "gpt-6.2-sol"),
+            (Provider::Codex, "gpt-6.2-sol-mini"),
+            (Provider::Codex, "gpt-7-nova-maxi"),
+        ] {
+            assert_eq!(validate_pinned_model(provider, model), Ok(()), "{model}");
+            let exact = benchmark(provider, Some(model), Some("high")).unwrap();
+            assert_eq!(exact.effort, Some("high"));
+            assert_eq!(
+                exact.models_free_slug(),
+                format!("{}-high", model.replace('.', "-"))
+            );
+            assert_eq!(benchmark(provider, Some(model), None).unwrap().effort, None);
+        }
+    }
+
+    #[test]
     fn pins_accept_native_efforts_and_refuse_aliases() {
         let pin = |profile: &str, model: &str, effort: Option<&str>| Pin {
             profile: profile.into(),
@@ -386,6 +452,8 @@ mod tests {
             pin("codex/work", "gpt-6.2-sol", Some("max")),
             pin("codex/work", "GPT-6.2", None),
             pin("gemini/work", "claude-opus-5-5", None),
+            pin("claude/work", "claude-opus-5-5-high", None),
+            pin("codex/work", "gpt-6.2-sol-high", None),
         ] {
             assert!(pins.set(refused.clone()).is_err(), "{refused:?}");
         }
@@ -421,6 +489,10 @@ mod tests {
             text.replace("claude-opus-5-5", "opus"),
             text.replace("\"high\"", "\"ultra\""),
             text.replace("\"effort\"", "\"reasoning\""),
+            text.replace(
+                "\"claude-opus-5-5\",\"effort\":\"high\"",
+                "\"claude-opus-5-5-high\",\"effort\":null",
+            ),
         ] {
             fs::write(state.join(PINS_FILE), corrupt).unwrap();
             assert!(Pins::load(&state).is_err());

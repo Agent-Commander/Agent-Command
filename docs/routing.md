@@ -134,6 +134,21 @@ efforts with no published suffix (`max`, `minimal`, and anything else such as
 name without a version), and options with no matching row (for example
 `gpt-reserve` or `codex-auto-review`).
 
+**Native model and benchmark variant stay separate.** A native model name is
+what the CLI receives as `--model` or `-c model=…`; a benchmark variant is the
+`models/free` slug `<slug>-<effort>` derived from it. A model name whose last
+hyphen segment is an effort (`minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`), such as `claude-opus-5-5-high` or `gpt-6.2-sol-high`, is a benchmark
+variant and is refused as a pin: pin `claude-opus-5-5` with effort `high`
+instead. Without this, a pin with no effort would match the synthetic effort
+row as its default setting and send the suffixed string to the native CLI.
+Full future names are kept as long as the last segment is not exactly an
+effort (`claude-opus-6-1`, `claude-sonnet-6-1-20270301`, `gpt-6.2-sol-mini`,
+`claude-haiku-6-highland`). A pins file holding a variant is invalid, so the
+app shows a notice and uses no pin; dispatch also drops any pin that fails
+validation, so a cold start with no cache stays unscored and `/standard` and
+`/hard` start nothing.
+
 ### Model pins
 
 ```sh
@@ -180,10 +195,15 @@ with the exact model and effort of the interrupted configuration.
 ## Ranking metric and difficulty floors
 
 Every ranking uses one metric for all of its candidates, chosen from the
-eligible candidates in this order: AA coding agent index (`agents/coding`),
-then AA coding index (`models/free`), then AA intelligence index
-(`models/free`). The first metric that has a value for at least one candidate
-is used; candidates without that metric are null for the whole ranking and
+eligible candidates in this order: AA coding index (`models/free`), then AA
+intelligence index (`models/free`). The first metric that has a value for at
+least one candidate is used; the coding index wins whenever any candidate has
+one. The AA coding agent index from the optional `agents/coding` endpoint is
+an independent measurement of a harness, not a fallback for either index, so
+it never selects or scores a ranking: a candidate with a coding index of 70
+meets `/hard` even when another candidate, or the same one, has a coding
+agent index of 41. `agents/coding` rows still supply seconds-per-task speed,
+which is preferred over tokens per second when both exist. candidates without that metric are null for the whole ranking and
 rank last on it. When no candidate has any index, every configuration is
 `unscored`. The metric name appears in every routing reason, ranked
 description and floor refusal, for example `Auto → codex/work gpt-6.2-sol high

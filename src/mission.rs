@@ -1106,19 +1106,44 @@ sleep 0.05
 rmdir running.lock
 "#;
 
-    fn synthetic_catalog(rows: Vec<crate::catalog::Row>) -> Catalog {
-        use crate::catalog::{Endpoint, Origin, Snapshot, Source};
+    fn synthetic_source(
+        endpoint: crate::catalog::Endpoint,
+        rows: Vec<crate::catalog::Row>,
+    ) -> crate::catalog::Source {
+        use crate::catalog::{Origin, Snapshot, Source};
+        Source {
+            endpoint,
+            origin: Origin::Cache,
+            snapshot: Snapshot::sealed(
+                endpoint,
+                "synthetic-1".into(),
+                "synthetic test fixture".into(),
+                rows,
+            ),
+        }
+    }
+
+    fn synthetic_catalog(
+        models: Vec<crate::catalog::Row>,
+        agents: Vec<crate::catalog::Row>,
+    ) -> Catalog {
+        use crate::catalog::Endpoint;
         Catalog {
-            sources: vec![Source {
-                endpoint: Endpoint::AgentsCoding,
-                origin: Origin::Cache,
-                snapshot: Snapshot::sealed(
-                    Endpoint::AgentsCoding,
-                    "synthetic-1".into(),
-                    "synthetic test fixture".into(),
-                    rows,
-                ),
-            }],
+            sources: vec![
+                synthetic_source(Endpoint::AgentsCoding, agents),
+                synthetic_source(Endpoint::ModelsFree, models),
+            ],
+        }
+    }
+
+    fn coding_row(provider: &str, variant: &str, index: f64) -> crate::catalog::Row {
+        crate::catalog::Row {
+            provider: provider.into(),
+            slug: variant.into(),
+            effort: None,
+            coding_index: Some(index),
+            intelligence_index: None,
+            speed: None,
         }
     }
 
@@ -1131,6 +1156,13 @@ rmdir running.lock
             intelligence_index: None,
             speed: None,
         }
+    }
+
+    fn contrary_agent_rows() -> Vec<crate::catalog::Row> {
+        vec![
+            agent_row("claude", "claude-opus-5-5", "high", 90.0),
+            agent_row("codex", "gpt-6-2-sol", "high", 41.0),
+        ]
     }
 
     fn pins() -> Pins {
@@ -1166,8 +1198,8 @@ rmdir running.lock
         ];
         let rows = || {
             vec![
-                agent_row("claude", "claude-opus-5-5", "high", 60.0),
-                agent_row("codex", "gpt-6-2-sol", "high", 70.0),
+                coding_row("claude", "claude-opus-5-5-high", 60.0),
+                coding_row("codex", "gpt-6-2-sol-high", 70.0),
             ]
         };
         let route = |difficulty, preferred: Option<&str>, rows| Route {
@@ -1177,19 +1209,19 @@ rmdir running.lock
                 ..Request::default()
             },
             preferred: preferred.map(str::to_owned),
-            catalog: synthetic_catalog(rows),
+            catalog: synthetic_catalog(rows, contrary_agent_rows()),
             pins: pins(),
         };
         for (difficulty, preferred, expected) in [
             (
                 routing::Difficulty::Hard,
                 None,
-                "Auto → codex/beta gpt-6.2-sol high · AA coding agent index 70.0 · speed n/a · headroom unknown",
+                "Auto → codex/beta gpt-6.2-sol high · AA coding index 70.0 · speed n/a · headroom unknown",
             ),
             (
                 routing::Difficulty::Hard,
                 Some("claude/alpha"),
-                "Override → claude/alpha claude-opus-5-5 high · AA coding agent index 60.0 · speed n/a · headroom unknown",
+                "Override → claude/alpha claude-opus-5-5 high · AA coding index 60.0 · speed n/a · headroom unknown",
             ),
         ] {
             let mission = Mission::launch(
@@ -1207,7 +1239,7 @@ rmdir running.lock
             "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
 alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --|Routed work\n"
         );
-        let below = vec![agent_row("claude", "claude-opus-5-5", "high", 50.0)];
+        let below = vec![coding_row("claude", "claude-opus-5-5-high", 50.0)];
         let mission = Mission::launch(
             profiles,
             route(routing::Difficulty::Hard, None, below),
@@ -1217,7 +1249,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
         assert!(reasons.is_empty());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "No eligible model meets the hard floor 55 on the AA coding agent index; best is 50.0."
+            "No eligible model meets the hard floor 55 on the AA coding index; best is 50.0."
         );
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
@@ -1236,7 +1268,10 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
                 ..Request::default()
             },
             preferred: Some(profiles[0].to_string()),
-            catalog: synthetic_catalog(vec![agent_row("claude", "claude-opus-5-5", "high", 60.0)]),
+            catalog: synthetic_catalog(
+                vec![coding_row("claude", "claude-opus-5-5-high", 60.0)],
+                contrary_agent_rows(),
+            ),
             pins: pins(),
         };
         let mission = Mission::launch_with_clock(profiles, route, workspace.clone(), || {

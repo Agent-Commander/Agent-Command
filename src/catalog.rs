@@ -82,17 +82,15 @@ impl Endpoint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Metric {
-    CodingAgent,
     Coding,
     Intelligence,
 }
 
 impl Metric {
-    pub(crate) const PREFERENCE: [Self; 3] = [Self::CodingAgent, Self::Coding, Self::Intelligence];
+    pub(crate) const PREFERENCE: [Self; 2] = [Self::Coding, Self::Intelligence];
 
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::CodingAgent => "AA coding agent index",
             Self::Coding => "AA coding index",
             Self::Intelligence => "AA intelligence index",
         }
@@ -278,7 +276,6 @@ pub(crate) struct Metrics {
 impl Metrics {
     pub(crate) fn value(&self, metric: Metric) -> Option<f64> {
         match metric {
-            Metric::CodingAgent => self.coding_agent_index,
             Metric::Coding => self.coding_index,
             Metric::Intelligence => self.intelligence_index,
         }
@@ -1429,6 +1426,15 @@ mod tests {
                 speed: seconds(280.0),
             }
         );
+        let variant_rows: Vec<_> = catalog
+            .sources
+            .iter()
+            .flat_map(|source| &source.snapshot.rows)
+            .filter(|row| ["claude-opus-5-5-high", "gpt-6-2-sol-high"].contains(&row.slug.as_str()))
+            .map(|row| (row.slug.as_str(), row.effort.as_deref()))
+            .collect();
+        assert!(variant_rows.contains(&("claude-opus-5-5-high", None)));
+        assert!(variant_rows.contains(&("gpt-6-2-sol-high", None)));
         for (provider, model, effort) in [
             (Provider::Codex, "gpt-6.2-sol", Some("low")),
             (Provider::Codex, "gpt-6.2-sol", Some("xhigh")),
@@ -1442,6 +1448,10 @@ mod tests {
             (Provider::Claude, "claude-opus-5-5", Some("low")),
             (Provider::Claude, "opus", None),
             (Provider::Claude, "claude-opus", None),
+            (Provider::Claude, "claude-opus-5-5-high", None),
+            (Provider::Claude, "claude-opus-5-5-high", Some("high")),
+            (Provider::Codex, "gpt-6.2-sol-high", None),
+            (Provider::Codex, "gpt-6-2-sol-high", None),
         ] {
             assert_eq!(
                 lookup(&catalog, provider, model, effort),

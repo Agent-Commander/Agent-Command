@@ -42,7 +42,7 @@ pub(crate) fn configurations(provider: Provider, pin: Option<&Pin>) -> Vec<Confi
         }));
     }
     configurations.extend(
-        pin.filter(|pin| pin.provider() == Some(provider))
+        pin.filter(|pin| pin.provider() == Some(provider) && pin.validate().is_ok())
             .map(|pin| Configuration {
                 provider,
                 model: Model::Pinned(pin.model.clone()),
@@ -645,7 +645,7 @@ exit 3
                 .map(|(_, value)| value)
         };
         Metrics {
-            coding_agent_index: value(Metric::CodingAgent),
+            coding_agent_index: None,
             coding_index: value(Metric::Coding),
             intelligence_index: value(Metric::Intelligence),
             speed: speed.map(|(unit, value)| Speed { unit, value }),
@@ -841,6 +841,44 @@ exit 3
     }
 
     #[test]
+    fn cold_start_with_an_effort_suffixed_pin_fails_closed() {
+        let fixture = Fixture::new("keyless-variant", SIGNED_IN);
+        let profiles = [fixture.profile(Provider::Claude, "work")];
+        let state = fixture.root.join("variant-pins");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join(crate::native::PINS_FILE),
+            r#"{"schema":"agent-command-native-pins-v1","pins":[{"profile":"claude/work","model":"claude-opus-5-5-high","effort":null}]}"#,
+        )
+        .unwrap();
+        assert!(Pins::load(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("benchmark effort variant"));
+        let bypassed = pin("claude/work", "claude-opus-5-5-high", None);
+        let (unvalidated, _) = candidates(
+            &profiles,
+            &Catalog::load(None),
+            &Pins::default(),
+            tick(NOW, 0),
+        );
+        assert_eq!(
+            configurations(Provider::Claude, Some(&bypassed)).len(),
+            unvalidated.len()
+        );
+        for difficulty in [Difficulty::Standard, Difficulty::Hard] {
+            assert!(rank(unvalidated.clone(), Policy::Default, difficulty)
+                .unwrap_err()
+                .contains("no published coding or intelligence index is available"));
+        }
+        let any = rank(unvalidated, Policy::Default, Difficulty::Any).unwrap();
+        assert!(any.iter().all(|candidate| !candidate
+            .configuration
+            .arguments()
+            .contains(&"claude-opus-5-5-high".to_owned())));
+    }
+
+    #[test]
     fn ordinary_policy_ranks_by_soonest_expiring_headroom_with_stable_ties() {
         let fixture = Fixture::new("ordinary-policy", SIGNED_IN);
         let profiles = [
@@ -967,35 +1005,91 @@ exit 3
             ranked.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
             ["claude/high", "claude/low"]
         );
-        let mut mixed = intelligence_only;
-        mixed.push(candidate(
-            "claude/agent",
-            3,
-            Some((Metric::CodingAgent, 41.0)),
-            None,
-            None,
-        ));
-        mixed[0].metrics.coding_index = Some(70.0);
-        assert_eq!(ranking_metric(&mixed), Some(Metric::CodingAgent));
-        let ranked = rank(mixed.clone(), Policy::Default, Difficulty::Any).unwrap();
-        assert_eq!(
-            ranked.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
-            ["claude/agent", "claude/alias", "claude/low", "claude/high"]
-        );
-        assert!(ranked
+        assert!(describe(&ranked[1]).contains("· AA intelligence index 58.0 ·"));
+    }
+
+    fn with_agent_index(mut candidate: Candidate, index: f64) -> Candidate {
+        candidate.metrics.coding_agent_index = Some(index);
+        candidate
+    }
+
+    fn agent_only(label: &str, index: f64) -> Candidate {
+        with_agent_index(candidate(label, 3, None, None, Some(9.0)), index)
+    }
+
+    fn order(ranked: &[Candidate]) -> Vec<&str> {
+        ranked.iter().map(|c| c.label.as_str()).collect()
+    }
+
+    #[test]
+    fn coding_index_ranks_ahead_of_an_independent_coding_agent_index() {
+        let candidates = vec![
+            with_agent_index(
+                candidate("claude/coding", 3, Some((Metric::Coding, 70.0)), None, None),
+                41.0,
+            ),
+            agent_only("claude/agent", 99.0),
+        ];
+        assert_eq!(ranking_metric(&candidates), Some(Metric::Coding));
+        let hard = rank(candidates.clone(), Policy::Default, Difficulty::Hard).unwrap();
+        assert_eq!(order(&hard), ["claude/coding"]);
+        assert!(describe(&hard[0]).contains("· AA coding index 70.0 ·"));
+        let any = rank(candidates, Policy::Default, Difficulty::Any).unwrap();
+        assert_eq!(order(&any), ["claude/coding", "claude/agent"]);
+        assert!(any
             .iter()
-            .all(|candidate| candidate.metric == Some(Metric::CodingAgent)));
-        assert!(describe(&ranked[3]).contains("· AA coding agent index n/a ·"));
-        assert!(describe(&ranked[0]).contains("· AA coding agent index 41.0 ·"));
+            .all(|candidate| candidate.metric == Some(Metric::Coding)));
+        assert!(describe(&any[1]).contains("· AA coding index n/a ·"));
+        assert!(any
+            .iter()
+            .all(|candidate| !describe(candidate).contains("agent index")));
+    }
+
+    #[test]
+    fn intelligence_index_ranks_ahead_of_an_independent_coding_agent_index() {
+        let candidates = vec![
+            candidate(
+                "claude/intelligence",
+                3,
+                Some((Metric::Intelligence, 58.0)),
+                None,
+                None,
+            ),
+            agent_only("claude/agent", 99.0),
+        ];
+        assert_eq!(ranking_metric(&candidates), Some(Metric::Intelligence));
+        let hard = rank(candidates.clone(), Policy::Default, Difficulty::Hard).unwrap();
+        assert_eq!(order(&hard), ["claude/intelligence"]);
+        let any = rank(candidates, Policy::Default, Difficulty::Any).unwrap();
+        assert_eq!(order(&any), ["claude/intelligence", "claude/agent"]);
+        assert!(describe(&any[1]).contains("· AA intelligence index n/a ·"));
+        let below = vec![
+            candidate(
+                "claude/intelligence",
+                3,
+                Some((Metric::Intelligence, 41.0)),
+                None,
+                None,
+            ),
+            agent_only("claude/agent", 99.0),
+        ];
         assert_eq!(
-            rank(mixed.clone(), Policy::Default, Difficulty::Hard).unwrap_err(),
-            "No eligible model meets the hard floor 55 on the AA coding agent index; best is 41.0."
+            rank(below, Policy::Default, Difficulty::Hard).unwrap_err(),
+            "No eligible model meets the hard floor 55 on the AA intelligence index; best is 41.0."
         );
-        mixed.pop();
-        assert_eq!(ranking_metric(&mixed), Some(Metric::Coding));
-        let ranked = rank(mixed, Policy::Default, Difficulty::Standard).unwrap();
-        assert_eq!(ranked.len(), 1);
-        assert!(describe(&ranked[0]).contains("AA coding index 70.0"));
+    }
+
+    #[test]
+    fn coding_agent_index_alone_never_scores_a_ranking() {
+        let candidates = vec![agent_only("claude/agent", 99.0)];
+        assert_eq!(ranking_metric(&candidates), None);
+        assert!(
+            rank(candidates.clone(), Policy::Default, Difficulty::Standard)
+                .unwrap_err()
+                .contains("no published coding or intelligence index is available")
+        );
+        let any = rank(candidates, Policy::Default, Difficulty::Any).unwrap();
+        assert!(describe(&any[0]).contains("· unscored ·"));
     }
 
     #[test]
@@ -1129,6 +1223,31 @@ exit 3
         let unset = claude(None).swap_remove(3);
         assert_eq!(unset.arguments(), ["--model", "claude-opus-5-5"]);
         assert_eq!(unset.label(), "claude-opus-5-5 AA default setting");
+        for variant in [
+            pin("claude/work", "claude-opus-5-5-high", None),
+            pin("claude/work", "claude-opus-5-5-high", Some("high")),
+            pin("claude/work", "opus", None),
+        ] {
+            let dispatched = configurations(Provider::Claude, Some(&variant));
+            assert_eq!(dispatched.len(), 3, "{variant:?}");
+            assert!(dispatched.iter().all(|configuration| !configuration
+                .arguments()
+                .iter()
+                .any(|argument| argument.starts_with("claude-opus-5-5"))));
+        }
+        let future = configurations(
+            Provider::Claude,
+            Some(&pin("claude/work", "claude-opus-6-1", Some("xhigh"))),
+        )
+        .swap_remove(3);
+        assert_eq!(
+            future.arguments(),
+            ["--model", "claude-opus-6-1", "--effort", "xhigh"]
+        );
+        assert_eq!(
+            future.benchmark().unwrap().models_free_slug(),
+            "claude-opus-6-1-xhigh"
+        );
         let codex = configurations(
             Provider::Codex,
             Some(&pin("codex/work", "gpt-6.2-sol", Some("high"))),

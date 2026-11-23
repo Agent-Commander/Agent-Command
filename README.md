@@ -182,16 +182,20 @@ the bundled snapshots contain no benchmark values by licensing decision, so
 before a refresh every configuration is unscored and `/standard` and `/hard`
 start nothing and say why. `models/free` is required; `agents/coding` is
 optional (the free plan returns HTTP 403) and never suppresses `models/free`.
-A ranking uses one metric for every candidate: the AA coding agent index, then
-the AA coding index, then the AA intelligence index, whichever is the first to
-have a value. The metric name appears in each routing reason.
+A ranking uses one metric for every candidate: the AA coding index from
+`models/free` if any candidate has one, otherwise the AA intelligence index.
+The AA coding agent index from `agents/coding` never ranks or meets a floor;
+that endpoint only adds seconds-per-task speed. The metric name appears in
+each routing reason.
 
 A configuration is scored only through the exact identity of a pinned model:
 Codex model IDs have dots turned into hyphens (`gpt-6.2-sol` →
 `gpt-6-2-sol`), full Claude names are used verbatim, an explicit `low`,
 `medium`, `high` or `xhigh` effort needs the matching suffixed row, and no
 effort uses the base row (`AA default setting`). Aliases such as `opus`,
-`max` or `minimal` effort, and models with no matching row stay unscored. The
+`max` or `minimal` effort, and models with no matching row stay unscored.
+A model name ending in an effort, such as `claude-opus-5-5-high`, is a
+benchmark variant rather than a native model and is refused as a pin. The
 profile panel shows the displayed profile's pin. See
 [docs/routing.md](docs/routing.md) for integrity checks, threshold
 provenance, ranking precedence, split allocation and override behavior.
