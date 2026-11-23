@@ -30,6 +30,7 @@ pub enum Status {
     Running,
     Done,
     Error,
+    Snoozed,
 }
 
 impl Status {
@@ -39,6 +40,7 @@ impl Status {
             Self::Running => "RUNNING",
             Self::Done => "DONE",
             Self::Error => "ERROR",
+            Self::Snoozed => "SNOOZED",
         }
     }
 }
@@ -396,6 +398,13 @@ pub(crate) enum Command {
     },
     Settings,
     Connect,
+    Side {
+        question: String,
+    },
+    Goal {
+        criteria: String,
+    },
+    GoalCancel,
     Message(String),
 }
 
@@ -403,6 +412,8 @@ const SPAWN_USAGE: &str = "Usage: /spawn NAME ROLE [TASK]";
 const ASK_USAGE: &str = "Usage: /ask NAME TASK";
 const REMOVE_USAGE: &str = "Usage: /remove NAME";
 const ENTRY_USAGE: &str = "Usage: /entry PROVIDER/PROFILE or /entry auto";
+const SIDE_USAGE: &str = "Usage: /btw QUESTION (alias /side QUESTION)";
+const GOAL_USAGE: &str = "Usage: /goal CRITERIA or /goal cancel";
 
 fn next_word(text: &str) -> Option<(&str, &str)> {
     let text = text.trim_start();
@@ -442,6 +453,17 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
         "/roster" => Ok(Command::Roster),
         "/settings" => Ok(Command::Settings),
         "/connect" => Ok(Command::Connect),
+        "/btw" | "/side" if !rest.is_empty() => Ok(Command::Side {
+            question: rest.into(),
+        }),
+        "/btw" | "/side" => Err(SIDE_USAGE.into()),
+        "/goal" => match rest {
+            "" => Err(GOAL_USAGE.into()),
+            "cancel" | "stop" => Ok(Command::GoalCancel),
+            criteria => Ok(Command::Goal {
+                criteria: criteria.into(),
+            }),
+        },
         "/remove" => match next_word(rest) {
             Some((name, "")) => Ok(Command::Remove { name: name.into() }),
             _ => Err(REMOVE_USAGE.into()),
@@ -789,6 +811,30 @@ pub(crate) mod tests {
         assert_eq!(parse_command("/spawn nova").unwrap_err(), SPAWN_USAGE);
         assert_eq!(parse_command("/ask nova").unwrap_err(), ASK_USAGE);
         assert_eq!(parse_command("/remove a b").unwrap_err(), REMOVE_USAGE);
+    }
+
+    #[test]
+    fn side_and_goal_commands_parse_with_aliases_and_usage() {
+        for input in ["/btw what changed?", "/side   what changed?"] {
+            assert_eq!(
+                parse_command(input).unwrap(),
+                Command::Side {
+                    question: "what changed?".into()
+                }
+            );
+        }
+        assert_eq!(parse_command("/btw").unwrap_err(), SIDE_USAGE);
+        assert_eq!(parse_command("/side  ").unwrap_err(), SIDE_USAGE);
+        assert_eq!(
+            parse_command("/goal all tests pass").unwrap(),
+            Command::Goal {
+                criteria: "all tests pass".into()
+            }
+        );
+        assert_eq!(parse_command("/goal cancel").unwrap(), Command::GoalCancel);
+        assert_eq!(parse_command("/goal stop").unwrap(), Command::GoalCancel);
+        assert_eq!(parse_command("/goal").unwrap_err(), GOAL_USAGE);
+        assert_eq!(Status::Snoozed.label(), "SNOOZED");
     }
 
     #[test]

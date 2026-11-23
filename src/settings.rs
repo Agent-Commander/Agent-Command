@@ -14,17 +14,52 @@ const THEME_FILE: &str = "theme.toml";
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Settings {
     pub(crate) check_for_updates: bool,
+    pub(crate) auto_resume_on_reset: bool,
+    pub(crate) snooze_limited_missions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fallback_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text_gen_profile: Option<String>,
+    pub(crate) goal_turn_cap: u32,
 }
+
+pub(crate) const DEFAULT_GOAL_TURN_CAP: u32 = 10;
+pub(crate) const MAX_GOAL_TURN_CAP: u32 = 100;
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             check_for_updates: true,
+            auto_resume_on_reset: false,
+            snooze_limited_missions: false,
+            fallback_profile: None,
+            text_gen_profile: None,
+            goal_turn_cap: DEFAULT_GOAL_TURN_CAP,
         }
     }
 }
 
+pub(crate) fn next_profile_slot(current: Option<&str>, labels: &[String]) -> Option<String> {
+    let position = current.and_then(|label| labels.iter().position(|candidate| candidate == label));
+    match position {
+        None => labels.first().cloned(),
+        Some(index) => labels.get(index + 1).cloned(),
+    }
+}
+
+pub(crate) fn slot_label(slot: Option<&str>, labels: &[String]) -> String {
+    match slot {
+        None => "Off".into(),
+        Some(label) if labels.iter().any(|candidate| candidate == label) => label.into(),
+        Some(label) => format!("{label} (not signed in)"),
+    }
+}
+
 impl Settings {
+    pub(crate) fn goal_cap(&self) -> u32 {
+        self.goal_turn_cap.clamp(1, MAX_GOAL_TURN_CAP)
+    }
+
     pub(crate) fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
@@ -98,12 +133,15 @@ mod tests {
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
         let off = Settings {
             check_for_updates: false,
+            ..Settings::default()
         };
         off.save(&path).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "check_for_updates = false\n"
+            "check_for_updates = false\nauto_resume_on_reset = false\nsnooze_limited_missions = false\ngoal_turn_cap = 10\n"
         );
+        assert_eq!(Settings::load(&path).unwrap(), off);
+        fs::write(&path, "check_for_updates = false\n").unwrap();
         assert_eq!(Settings::load(&path).unwrap(), off);
         fs::write(&path, "check_for_updates = 3").unwrap();
         assert_eq!(
@@ -123,7 +161,65 @@ mod tests {
         assert!(!launch_update_check(&on, Some(&one)));
         let off = Settings {
             check_for_updates: false,
+            ..Settings::default()
         };
         assert!(!launch_update_check(&off, None));
+    }
+
+    #[test]
+    fn limit_and_profile_slots_round_trip_through_settings_toml() {
+        let path = env::temp_dir()
+            .join(format!("ac-settings-slots-{}", std::process::id()))
+            .join(SETTINGS_FILE);
+        let configured = Settings {
+            check_for_updates: true,
+            auto_resume_on_reset: true,
+            snooze_limited_missions: true,
+            fallback_profile: Some("codex/backup".into()),
+            text_gen_profile: Some("claude/light".into()),
+            goal_turn_cap: 4,
+        };
+        configured.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("auto_resume_on_reset = true"));
+        assert!(text.contains("fallback_profile = \"codex/backup\""));
+        assert!(text.contains("text_gen_profile = \"claude/light\""));
+        assert_eq!(Settings::load(&path).unwrap(), configured);
+        fs::write(&path, "fallback_token = \"x\"").unwrap();
+        assert_eq!(
+            Settings::load(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn goal_cap_is_clamped_and_profile_slots_cycle_through_off() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.goal_cap(), DEFAULT_GOAL_TURN_CAP);
+        settings.goal_turn_cap = 0;
+        assert_eq!(settings.goal_cap(), 1);
+        settings.goal_turn_cap = 5_000;
+        assert_eq!(settings.goal_cap(), MAX_GOAL_TURN_CAP);
+        let labels = vec!["claude/a".to_owned(), "codex/b".to_owned()];
+        assert_eq!(
+            next_profile_slot(None, &labels).as_deref(),
+            Some("claude/a")
+        );
+        assert_eq!(
+            next_profile_slot(Some("claude/a"), &labels).as_deref(),
+            Some("codex/b")
+        );
+        assert_eq!(next_profile_slot(Some("codex/b"), &labels), None);
+        assert_eq!(
+            next_profile_slot(Some("gone/x"), &labels).as_deref(),
+            Some("claude/a")
+        );
+        assert_eq!(slot_label(None, &labels), "Off");
+        assert_eq!(slot_label(Some("codex/b"), &labels), "codex/b");
+        assert_eq!(
+            slot_label(Some("gone/x"), &labels),
+            "gone/x (not signed in)"
+        );
     }
 }

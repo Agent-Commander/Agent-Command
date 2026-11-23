@@ -148,3 +148,40 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(!run(&["unknown"]).status.success());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn triage_reports_json_without_a_terminal_and_never_prints_secrets() {
+    let base = std::env::temp_dir().join(format!("agent-cli-triage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let config = base.join("config");
+    std::fs::create_dir_all(config.join("agent-command")).unwrap();
+    std::fs::write(
+        config.join("agent-command/settings.toml"),
+        "auto_resume_on_reset = true\nfallback_profile = \"codex/backup\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-command"))
+        .args(["triage", "--json"])
+        .env("SUB_AUTH_DIR", base.join("profiles"))
+        .env("XDG_CONFIG_HOME", &config)
+        .env("TERM_PROGRAM", "sk-proj-0123456789abcdefghij")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("sk-proj-0123456789abcdefghij"));
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(report["stdout_terminal"], false);
+    assert_eq!(report["settings"]["auto_resume_on_reset"], true);
+    assert_eq!(report["settings"]["fallback_profile"], "codex/backup");
+    assert!(report["catalog"]
+        .as_array()
+        .is_some_and(|lines| !lines.is_empty()));
+    let usage = Command::new(env!("CARGO_BIN_EXE_agent-command"))
+        .args(["triage", "--pipe", "gemini"])
+        .output()
+        .unwrap();
+    assert!(!usage.status.success());
+    std::fs::remove_dir_all(base).unwrap();
+}

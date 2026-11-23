@@ -98,6 +98,11 @@ impl Usage {
         self.latch.is_some_and(|reset| reset > now.wall)
     }
 
+    pub(crate) fn known_reset(self, now: Tick) -> Option<i64> {
+        self.latch
+            .filter(|reset| *reset > now.wall && *reset != i64::MAX)
+    }
+
     pub(crate) fn eligible_alternate(self, now: Tick) -> bool {
         !self.blocked(now)
             && ![self.five, self.week]
@@ -345,6 +350,20 @@ pub(crate) fn alternates(profiles: &[Profile], preferred: usize, now: Tick) -> V
         .collect();
     alternates.sort_unstable();
     alternates.into_iter().map(|(_, index)| index).collect()
+}
+
+pub(crate) fn cross_provider_fallback(
+    profiles: &[Profile],
+    interrupted: usize,
+    configured: Option<&str>,
+    now: Tick,
+) -> Option<usize> {
+    let configured = configured?;
+    profiles.iter().position(|profile| {
+        profile.to_string() == configured
+            && profile.provider != profiles[interrupted].provider
+            && Usage::read(profile).is_ok_and(|usage| usage.eligible_alternate(now))
+    })
 }
 
 fn codex_windows(
@@ -646,6 +665,62 @@ pub(crate) mod tests {
         assert!(!state.blocked(tick(2000, 1000)));
         assert_eq!(state.latch_label(tick(1999, 999)), "Latched 1s");
         assert!(state.rows(tick(1950, 950))[0].contains("stale 15m50s"));
+    }
+
+    #[test]
+    fn cross_provider_fallback_needs_the_configured_eligible_other_provider() {
+        let fixture = Fixture::new("cross-fallback", "");
+        let profiles = [
+            fixture.profile(Provider::Claude, "selected"),
+            fixture.profile(Provider::Claude, "sibling"),
+            fixture.profile(Provider::Codex, "backup"),
+        ];
+        let now = tick(CLOCK, 0);
+        assert_eq!(cross_provider_fallback(&profiles, 0, None, now), None);
+        assert_eq!(
+            cross_provider_fallback(&profiles, 0, Some("claude/sibling"), now),
+            None
+        );
+        assert_eq!(
+            cross_provider_fallback(&profiles, 0, Some("codex/missing"), now),
+            None
+        );
+        assert_eq!(
+            cross_provider_fallback(&profiles, 0, Some("codex/backup"), now),
+            Some(2)
+        );
+        update(&profiles[2], |state| {
+            state.record_limit(Some(CLOCK + 60), now);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            cross_provider_fallback(&profiles, 0, Some("codex/backup"), now),
+            None
+        );
+        assert_eq!(
+            cross_provider_fallback(&profiles, 0, Some("codex/backup"), tick(CLOCK + 61, 61)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn known_reset_ignores_past_and_unknown_latches() {
+        let fixture = Fixture::new("known-reset", "");
+        let profile = fixture.profile(Provider::Claude, "selected");
+        let now = tick(CLOCK, 0);
+        assert_eq!(Usage::read(&profile).unwrap().known_reset(now), None);
+        Usage::observe_claude(&profile, &claude_status("rejected"), now).unwrap();
+        assert_eq!(Usage::read(&profile).unwrap().known_reset(now), Some(2000));
+        assert_eq!(
+            Usage::read(&profile).unwrap().known_reset(tick(2000, 1000)),
+            None
+        );
+        let unknown = fixture.profile(Provider::Codex, "unknown");
+        Usage::record_codex_limit(&unknown, now).unwrap();
+        let state = Usage::read(&unknown).unwrap();
+        assert!(state.blocked(now));
+        assert_eq!(state.known_reset(now), None);
     }
 
     #[test]
