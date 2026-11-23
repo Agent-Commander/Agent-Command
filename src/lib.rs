@@ -1,7 +1,14 @@
+mod auth;
 mod cli;
+mod mission;
 pub use cli::run_cli;
 
-use std::{collections::VecDeque, fs, io, path::Path, time::SystemTime};
+use std::{
+    collections::VecDeque,
+    fs, io,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -77,7 +84,17 @@ pub fn color(hex: &str) -> Color {
     Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
+struct Live {
+    workspace: PathBuf,
+    profiles: Vec<auth::Profile>,
+    selected_profile: usize,
+    profile_area: Rect,
+    mission: Option<(usize, mission::Mission)>,
+    outcomes: [&'static str; 4],
+}
+
 pub struct App {
+    live: Option<Live>,
     pub selected: usize,
     pub paused: [bool; 4],
     pub missions: [String; 4],
@@ -98,6 +115,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            live: None,
             selected: 0,
             paused: [false; 4],
             missions: MISSIONS.map(str::to_owned),
@@ -123,6 +141,72 @@ impl Default for App {
     }
 }
 impl App {
+    fn live(workspace: PathBuf) -> Self {
+        let mut app = Self::default();
+        let profiles = auth::root()
+            .and_then(|root| auth::profiles(&root))
+            .unwrap_or_else(|error| {
+                app.notice = format!("Cannot load profiles: {error}");
+                Vec::new()
+            });
+        app.live = Some(Live {
+            workspace,
+            profiles,
+            selected_profile: 0,
+            profile_area: Rect::default(),
+            mission: None,
+            outcomes: ["READY"; 4],
+        });
+        app.log.clear();
+        app.log_times.clear();
+        app.missions = std::array::from_fn(|_| "Standing by for a new mission".into());
+        app
+    }
+
+    fn select_profile(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        if !live.profiles.is_empty() {
+            live.selected_profile = (live.selected_profile + 1) % live.profiles.len();
+        }
+    }
+
+    fn status(&self, index: usize) -> &'static str {
+        self.live
+            .as_ref()
+            .map_or(STATUSES[index], |live| live.outcomes[index])
+    }
+
+    fn poll_mission(&mut self) {
+        for _ in 0..64 {
+            let Some(live) = &mut self.live else { return };
+            let Some((agent, running)) = &live.mission else {
+                return;
+            };
+            let agent = *agent;
+            match running.events.try_recv() {
+                Ok(mission::Event::Running) => live.outcomes[agent] = "RUNNING",
+                Ok(mission::Event::Output(text)) => {
+                    self.push_log(format!("{}  {text}", NAMES[agent]))
+                }
+                Ok(mission::Event::Finished(result)) => self.finish_mission(agent, result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_mission(agent, Err(io::Error::other("Mission worker stopped")));
+                }
+            }
+        }
+    }
+
+    fn finish_mission(&mut self, agent: usize, result: io::Result<()>) {
+        let live = self.live.as_mut().expect("live mission");
+        live.mission = None;
+        live.outcomes[agent] = if result.is_ok() { "DONE" } else { "FAILED" };
+        self.notice = match result {
+            Ok(()) => format!("{} completed the mission.", NAMES[agent]),
+            Err(error) => format!("{}: {error}", NAMES[agent]),
+        };
+    }
+
     pub fn poll_theme(&mut self, path: &Path) {
         let stamp = fs::metadata(path).and_then(|m| m.modified()).ok();
         if stamp != self.theme_stamp {
@@ -145,10 +229,25 @@ impl App {
             self.log_times.pop_front();
         }
     }
+    fn mission_running(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.mission.is_some())
+    }
+
     pub fn toggle_pause(&mut self) {
+        if self
+            .live
+            .as_ref()
+            .and_then(|live| live.mission.as_ref())
+            .is_some_and(|(agent, _)| *agent == self.selected)
+        {
+            self.notice = "This mission is running. Pause is available between missions.".into();
+            return;
+        }
         self.paused[self.selected] = !self.paused[self.selected];
         self.push_log(format!(
-            "{}  {} in preview.",
+            "{}  {}.",
             NAMES[self.selected],
             if self.paused[self.selected] {
                 "Paused"
@@ -159,7 +258,31 @@ impl App {
     }
     pub fn submit(&mut self) {
         let command = self.input.trim().to_owned();
-        if !command.is_empty() {
+        if command.is_empty() {
+            return;
+        }
+        if let Some(live) = &mut self.live {
+            if live.mission.is_some() {
+                self.notice = "A mission is already running.".into();
+                return;
+            }
+            if self.paused[self.selected] {
+                self.notice = "Resume this agent before sending a mission.".into();
+                return;
+            }
+            let Some(profile) = live.profiles.get(live.selected_profile).cloned() else {
+                self.notice = "Sign in with agent-command auth login PROVIDER PROFILE.".into();
+                return;
+            };
+            self.notice = format!("Starting {profile} in {}", live.workspace.display());
+            live.outcomes[self.selected] = "STARTING";
+            live.mission = Some((
+                self.selected,
+                mission::Mission::launch(profile, live.workspace.clone(), command.clone()),
+            ));
+            self.missions[self.selected] = command;
+            self.input.clear();
+        } else {
             self.missions[self.selected] = command.clone();
             self.push_log(format!("YOU -> {}  {command}", NAMES[self.selected]));
             self.input.clear();
@@ -169,6 +292,9 @@ impl App {
     pub fn key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('q' | 'c') if self.mission_running() => {
+                    self.notice = "Wait for the running mission before quitting.".into();
+                }
                 KeyCode::Char('q' | 'c') => self.quit = true,
                 KeyCode::Char('n') => self.editing = true,
                 KeyCode::Char('p') => self.toggle_pause(),
@@ -181,6 +307,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::F(2) => self.select_profile(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
             KeyCode::Enter if self.editing => self.submit(),
@@ -196,7 +323,13 @@ impl App {
     }
     pub fn click(&mut self, x: u16, y: u16) {
         let point = ratatui::layout::Position::new(x, y);
-        if self.new_area.contains(point) || self.input_area.contains(point) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.profile_area.contains(point))
+        {
+            self.select_profile();
+        } else if self.new_area.contains(point) || self.input_area.contains(point) {
             self.editing = true;
         } else if self.pause_area.contains(point) {
             self.toggle_pause();
@@ -248,13 +381,15 @@ impl App {
                 r(3, 2, a.width.saturating_sub(41), 3),
             );
             f.render_widget(
-            Paragraph::new(
-                "PRIVATEER RADIO  /  LOCAL\n───┤ ◆ ├───  SIGNAL CLEAR\n1200 BAUD  ·  UI PREVIEW",
-            )
-            .alignment(ratatui::layout::Alignment::Right)
-            .style(Style::default().fg(color(&t.muted))),
-            r(a.width.saturating_sub(38), 2, 35, 3),
-        );
+                Paragraph::new(if self.live.is_some() {
+                    "PRIVATEER RADIO  /  LOCAL"
+                } else {
+                    "PRIVATEER RADIO  /  LOCAL\n───┤ ◆ ├───  SIGNAL CLEAR\n1200 BAUD  ·  UI PREVIEW"
+                })
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(Style::default().fg(color(&t.muted))),
+                r(a.width.saturating_sub(38), 2, 35, 3),
+            );
             let mut stripe = ["89a76f", "dbc77b", "cc955d", "b86d67", "9c829f", "7d9fb6"]
                 .map(|c| Span::styled("━━", Style::default().fg(color(c))))
                 .to_vec();
@@ -269,15 +404,17 @@ impl App {
                 ma,
             );
             let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
-            for (i, label) in [
-                "04  AGENTS ONLINE",
-                "02  ACTIVE MISSIONS",
-                "00  NEED ATTENTION",
-                "UI PROTOTYPE  /  SAMPLE DATA",
-            ]
-            .iter()
-            .enumerate()
-            {
+            let labels = if self.live.is_some() {
+                ["", "", "", ""]
+            } else {
+                [
+                    "04  AGENTS ONLINE",
+                    "02  ACTIVE MISSIONS",
+                    "00  NEED ATTENTION",
+                    "UI PROTOTYPE  /  SAMPLE DATA",
+                ]
+            };
+            for (i, label) in labels.iter().enumerate() {
                 f.render_widget(
                     Paragraph::new(*label)
                         .alignment(ratatui::layout::Alignment::Center)
@@ -371,7 +508,7 @@ impl App {
                         })),
                     ),
                 ]),
-                Line::styled(format!("   {}", STATUSES[i].to_lowercase()), style),
+                Line::styled(format!("   {}", self.status(i).to_lowercase()), style),
             ];
             f.render_widget(
                 Paragraph::new(lines),
@@ -407,7 +544,7 @@ impl App {
                         if self.paused[self.selected] {
                             "PAUSED"
                         } else {
-                            STATUSES[self.selected]
+                            self.status(self.selected)
                         }
                     ),
                     Style::default()
@@ -421,7 +558,9 @@ impl App {
             ])),
             r(x, y, w, 1),
         );
-        let elapsed = if self.selected == 0 {
+        let elapsed = if self.live.is_some() {
+            "—"
+        } else if self.selected == 0 {
             "12m 34s"
         } else if self.selected == 1 {
             "04m 18s"
@@ -442,7 +581,7 @@ impl App {
             .wrap(Wrap { trim: false }),
             r(x, y + 2, w, 4),
         );
-        if cols[1].height > 22 {
+        if self.live.is_none() && cols[1].height > 22 {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::raw("WORKSPACE"),
@@ -499,8 +638,8 @@ impl App {
             cols[2].width.saturating_sub(5),
             cols[2].height.saturating_sub(6),
         );
-        let keep = usize::from(feed.height / 3).max(1);
-        let lines: Vec<_> = self
+        let keep = (usize::from(feed.height) + 1).div_ceil(3);
+        let mut lines: Vec<_> = self
             .log
             .iter()
             .zip(self.log_times.iter())
@@ -517,8 +656,25 @@ impl App {
                 ]
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), feed);
+        lines.pop();
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let hidden_rows = paragraph
+            .line_count(feed.width)
+            .saturating_sub(usize::from(feed.height));
+        let scroll = u16::try_from(hidden_rows).unwrap_or(u16::MAX);
+        f.render_widget(paragraph.scroll((scroll, 0)), feed);
         let iy = a.height.saturating_sub(5);
+        if let Some(live) = &mut self.live {
+            live.profile_area = r(7, iy.saturating_sub(1), a.width.saturating_sub(14), 1);
+            let label = live.profiles.get(live.selected_profile).map_or_else(
+                || "No profiles · agent-command auth login PROVIDER PROFILE".into(),
+                |profile| format!("Profile {profile}  ·  F2 or click to switch"),
+            );
+            f.render_widget(
+                Paragraph::new(label).style(Style::default().fg(color(&t.accent))),
+                live.profile_area,
+            );
+        }
         f.render_widget(
             Paragraph::new("❯").style(Style::default().fg(color("b8ccd9"))),
             r(4, iy + 1, 1, 1),
@@ -555,7 +711,11 @@ impl App {
         f.render_widget(button("Send ↗", true, &t), self.send_area);
         f.render_widget(
             Paragraph::new(if self.notice.is_empty() {
-                "   ● SIGNAL CLEAR    Local demo · commands stay in this preview"
+                if self.live.is_some() {
+                    "   Ready"
+                } else {
+                    "   ● SIGNAL CLEAR    Local demo · commands stay in this preview"
+                }
             } else {
                 &self.notice
             })
@@ -667,6 +827,139 @@ pub fn source_stamp(root: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn live_mission_uses_selected_profile_and_renders_output_and_outcome() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{Duration, Instant},
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("agent-command-mission-{}", std::process::id()));
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("workspace-marker"), "").unwrap();
+        let helper = workspace.join("provider");
+        fs::write(&helper, r#"#!/bin/sh
+case "${1}" in
+    auth)
+        test -d "$CLAUDE_CONFIG_DIR" && test -z "$CODEX_HOME" || exit 8
+        printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+        exit
+        ;;
+    -c)
+        test -d "$CODEX_HOME" && test -z "$CLAUDE_CONFIG_DIR" || exit 8
+        shift 4
+        if test "$1" = login; then
+            printf '%s\n' 'Logged in using ChatGPT' >&2
+            exit
+        fi
+        ;;
+esac
+test -f workspace-marker && test "$(cat)" = "Mission input" || exit 9
+long=
+remaining=58
+while test "$remaining" -gt 0; do
+    long="${long}wide "
+    remaining=$((remaining - 1))
+done
+if test "$1" = --print; then
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$long"
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude output"},{"type":"tool_use","input":"internal event"}]}}'
+else
+    test "$1" = -a && test "$3" = exec || exit 10
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$long"
+    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Codex output"}}'
+fi
+while test ! -f release-mission; do sleep 0.01; done
+"#).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = workspace.join("profiles");
+        let claude = auth::Profile::fixture(&root, auth::Provider::Claude, helper.clone());
+        let codex = auth::Profile::fixture(&root, auth::Provider::Codex, helper);
+
+        for (width, height, key, provider) in [
+            (80, 24, true, "Claude"),
+            (80, 24, false, "Codex"),
+            (120, 40, true, "Claude"),
+            (120, 40, false, "Codex"),
+        ] {
+            let mut app = App {
+                live: Some(Live {
+                    workspace: workspace.clone(),
+                    profiles: vec![codex.clone(), claude.clone()],
+                    selected_profile: usize::from(!key),
+                    profile_area: Rect::default(),
+                    mission: None,
+                    outcomes: ["READY"; 4],
+                }),
+                ..App::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let profile = app.live.as_ref().unwrap().profile_area;
+            if key {
+                app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+            } else {
+                app.click(profile.x, profile.y);
+            }
+            app.input = "Mission input".into();
+            if key {
+                app.editing = true;
+                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                app.click(app.send_area.x, app.send_area.y);
+            }
+            wait_for(&mut app, |app| {
+                app.log
+                    .back()
+                    .is_some_and(|line| line.contains(&format!("{provider} output")))
+            });
+            assert_eq!(app.status(0), "RUNNING");
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                screen.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden during streaming"
+            );
+            assert!(screen.contains("RUNNING"));
+            assert!(!screen.contains("internal event"));
+            fs::write(workspace.join("release-mission"), "").unwrap();
+            wait_for(&mut app, |app| !app.mission_running());
+            assert_eq!(app.status(0), "DONE", "{}", app.notice);
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains("DONE"));
+            assert!(
+                screen.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden after completion"
+            );
+            fs::remove_file(workspace.join("release-mission")).unwrap();
+        }
+        fs::remove_dir_all(workspace).unwrap();
+
+        fn wait_for(app: &mut App, ready: impl Fn(&App) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready(app) {
+                assert!(Instant::now() < deadline, "{}", app.notice);
+                app.poll_mission();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
     #[test]
     fn controls_and_unicode() {
         let mut a = App::default();

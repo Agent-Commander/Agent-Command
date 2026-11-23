@@ -12,8 +12,14 @@ use std::{
     time::Duration,
 };
 pub fn run_cli(args: &[String]) -> io::Result<()> {
+    if let Some(("auth", rest)) = args
+        .split_first()
+        .map(|(first, rest)| (first.as_str(), rest))
+    {
+        return crate::auth::run(rest);
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -63,9 +69,10 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let result = (|| {
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut app = App::default();
+        let mut app = App::live(std::env::current_dir()?);
         while !app.quit {
-            if std::env::var_os("AGENT_COMMAND_DEV").is_some()
+            if !app.mission_running()
+                && std::env::var_os("AGENT_COMMAND_DEV").is_some()
                 && crate::source_stamp(&source_root) != source_stamp
             {
                 reload = true;
@@ -74,6 +81,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             if let Some(path) = &path {
                 app.poll_theme(path);
             }
+            app.poll_mission();
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
                 match event::read()? {
