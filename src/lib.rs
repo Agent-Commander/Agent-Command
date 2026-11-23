@@ -2,6 +2,7 @@ mod auth;
 mod catalog;
 mod checkpoint;
 mod cli;
+mod install;
 mod mission;
 mod native;
 mod panel;
