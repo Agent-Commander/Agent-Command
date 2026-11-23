@@ -68,9 +68,28 @@ Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml
 
 When no profile is signed in, the TUI opens **Connect providers** instead of an
 empty Commander. It shows whether `claude` (Claude Code) and `codex` (Codex
-CLI) are on PATH. If one is missing, install it from the provider's own docs
-([Claude Code](https://code.claude.com/docs/en/setup),
-[Codex CLI](https://github.com/openai/codex)) and press R to recheck.
+CLI) are installed. A missing CLI gets an **Install** button.
+
+### Install a missing CLI from the Connect screen
+
+Install shows the exact command for your system and waits for Y (N or Esc
+cancels; nothing runs without Y). On Y the TUI steps aside, the provider's
+official installer runs in the same terminal, and the TUI returns and rechecks.
+The commands come from each provider's install docs and install for your user
+only, with no sudo or administrator rights:
+
+| CLI | macOS / Linux | Windows | What it does |
+| --- | --- | --- | --- |
+| Claude Code ([docs](https://code.claude.com/docs/en/setup)) | `curl -fsSL https://claude.ai/install.sh \| bash` | `powershell -NoProfile -Command "irm https://claude.ai/install.ps1 \| iex"` | Native installer, no Node.js; puts `claude` in `~/.local/bin` (`%USERPROFILE%\.local\bin`). |
+| Codex CLI ([docs](https://github.com/openai/codex#installing-and-running-codex-cli)) | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` | `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 \| iex"` | Standalone installer, no npm or Homebrew; puts `codex` in `CODEX_INSTALL_DIR` or `~/.local/bin` (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`). |
+
+If a tool the command needs (`curl`, `bash`/`sh`, or `powershell`) is missing,
+Install says what is needed and links the docs instead of running. If the
+installer fails, the reason is shown and the app stays usable. If the new
+executable is not yet on this terminal's PATH, Agent Command checks the
+installer's directory above and uses that path for this session, saying which
+path it used. Otherwise, open a new terminal and press R. Settings > Providers
+offers the same Install button.
 
 Pick Claude, Codex or both, keep or change the profile name (`main` by
 default), and choose Connect. The TUI steps aside, the provider's sign-in runs

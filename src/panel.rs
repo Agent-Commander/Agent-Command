@@ -1,6 +1,8 @@
 use crate::{
-    auth::{self, Profile, Provider},
-    color, settings, update, App,
+    auth::{self, Found, Profile, Provider},
+    color,
+    install::{self, Plan, Platform},
+    settings, update, App,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -15,20 +17,29 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph},
     Frame,
 };
-use std::{io, path::Path};
+use std::{
+    env, io,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub(crate) const NO_PROVIDER_HINT: &str = "No provider connected · press F3 or Settings to connect";
 pub(crate) const DEFAULT_PROFILE_NAME: &str = "main";
 const PANEL_MAX_WIDTH: u16 = 78;
 const PROFILE_LABEL_WIDTH: usize = 22;
 const STATUS_MAX_ROWS: usize = 3;
+const PREVIEW_BLOCKER: &str = "Connecting needs the live terminal; this is a preview.";
 
 pub(crate) trait Host {
-    fn installed(&self, provider: Provider) -> bool;
+    fn found(&self, provider: Provider) -> Option<Found>;
+    fn documented_executable(&self, provider: Provider) -> Option<PathBuf>;
+    fn adopt(&self, provider: Provider, executable: &Path);
+    fn has_program(&self, name: &str) -> bool;
     fn profiles(&self, root: &Path) -> io::Result<Vec<Profile>>;
     fn signed_in(&self, profile: &Profile) -> bool;
     fn suspend(&mut self) -> io::Result<()>;
     fn sign_in(&mut self, profile: &Profile) -> io::Result<()>;
+    fn install(&mut self, plan: &Plan) -> io::Result<()>;
     fn restore(&mut self) -> io::Result<()>;
     fn sign_out(&mut self, profile: &Profile) -> io::Result<()>;
 }
@@ -36,8 +47,20 @@ pub(crate) trait Host {
 pub(crate) struct TerminalHost;
 
 impl Host for TerminalHost {
-    fn installed(&self, provider: Provider) -> bool {
-        auth::installed(provider)
+    fn found(&self, provider: Provider) -> Option<Found> {
+        auth::found(provider)
+    }
+
+    fn documented_executable(&self, provider: Provider) -> Option<PathBuf> {
+        install::documented_executable(provider, Platform::current(), |name| env::var_os(name))
+    }
+
+    fn adopt(&self, provider: Provider, executable: &Path) {
+        auth::adopt(provider, executable)
+    }
+
+    fn has_program(&self, name: &str) -> bool {
+        auth::program_on_path(name)
     }
 
     fn profiles(&self, root: &Path) -> io::Result<Vec<Profile>> {
@@ -61,6 +84,20 @@ impl Host for TerminalHost {
     fn sign_in(&mut self, profile: &Profile) -> io::Result<()> {
         println!("Signing in {profile}. Follow the provider's prompts.");
         auth::succeeded(profile, auth::sign_in(profile)?)
+    }
+
+    fn install(&mut self, plan: &Plan) -> io::Result<()> {
+        println!(
+            "Installing {}: {}",
+            provider_title(plan.provider),
+            plan.command
+        );
+        let status = Command::new(plan.program).args(&plan.arguments).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("installer exited with {status}")))
+        }
     }
 
     fn restore(&mut self) -> io::Result<()> {
@@ -95,19 +132,56 @@ pub(crate) enum Action {
     Connect,
     Recheck,
     Leave,
+    Install(Provider),
+    ConfirmInstall,
+    CancelInstall,
+}
+
+#[derive(Debug, Default)]
+struct Clis([Option<Found>; 2]);
+
+impl Clis {
+    fn located(host: Option<&dyn Host>) -> Self {
+        Self(Provider::ALL.map(|provider| host.and_then(|host| locate(host, provider))))
+    }
+
+    fn found(&self, provider: Provider) -> Option<&Found> {
+        self.0[provider_slot(provider)].as_ref()
+    }
+
+    fn missing(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|provider| self.found(*provider).is_none())
+            .collect()
+    }
+}
+
+fn locate(host: &dyn Host, provider: Provider) -> Option<Found> {
+    if let Some(found) = host.found(provider) {
+        return Some(found);
+    }
+    let executable = host
+        .documented_executable(provider)
+        .filter(|path| path.is_file())?;
+    host.adopt(provider, &executable);
+    Some(Found::At(executable))
 }
 
 #[derive(Debug)]
 pub(crate) struct SettingsView {
     focus: usize,
     confirm: Option<usize>,
+    clis: Clis,
+    installing: Option<Provider>,
     status: String,
 }
 
 #[derive(Debug)]
 pub(crate) struct ConnectForm {
     pub(crate) origin: Origin,
-    installed: [bool; 2],
+    clis: Clis,
+    installing: Option<Provider>,
     chosen: [bool; 2],
     pub(crate) name: String,
     focus: usize,
@@ -188,29 +262,32 @@ impl ConnectForm {
     fn new(origin: Origin, host: Option<&dyn Host>) -> Self {
         let mut form = Self {
             origin,
-            installed: [false; 2],
+            clis: Clis::default(),
+            installing: None,
             chosen: [false; 2],
             name: DEFAULT_PROFILE_NAME.into(),
             focus: 0,
             status: String::new(),
         };
         form.recheck(host);
-        if let Some(first) = form.installed.iter().position(|found| *found) {
-            form.chosen[first] = true;
+        if let Some(first) = Provider::ALL
+            .into_iter()
+            .find(|provider| form.clis.found(*provider).is_some())
+        {
+            form.chosen[provider_slot(first)] = true;
         }
         form
     }
 
     fn recheck(&mut self, host: Option<&dyn Host>) {
+        self.clis = Clis::located(host);
         for provider in Provider::ALL {
-            let slot = provider_slot(provider);
-            self.installed[slot] = host.is_some_and(|host| host.installed(provider));
-            self.chosen[slot] &= self.installed[slot];
+            self.chosen[provider_slot(provider)] &= self.clis.found(provider).is_some();
         }
     }
 
     fn missing(&self) -> bool {
-        self.installed.contains(&false)
+        !self.clis.missing().is_empty()
     }
 
     fn chosen_providers(&self) -> Vec<Provider> {
@@ -221,12 +298,17 @@ impl ConnectForm {
     }
 
     fn actions(&self) -> Vec<Action> {
-        let mut actions = vec![
-            Action::Toggle(Provider::Claude),
-            Action::Toggle(Provider::Codex),
-            Action::Name,
-            Action::Connect,
-        ];
+        if self.installing.is_some() {
+            return vec![Action::ConfirmInstall, Action::CancelInstall];
+        }
+        let mut actions = Vec::new();
+        for provider in Provider::ALL {
+            actions.push(Action::Toggle(provider));
+            if self.clis.found(provider).is_none() {
+                actions.push(Action::Install(provider));
+            }
+        }
+        actions.extend([Action::Name, Action::Connect]);
         if self.missing() {
             actions.push(Action::Recheck);
         }
@@ -242,7 +324,7 @@ impl ConnectForm {
         }
     }
 
-    fn rows(&self, editing_name: bool) -> Vec<Row> {
+    fn rows(&self, editing_name: bool, width: usize) -> Vec<Row> {
         let mut rows: Vec<Row> = vec![
             vec![text(
                 "Pick Claude, Codex or both. One provider is enough to continue.",
@@ -253,24 +335,16 @@ impl ConnectForm {
         for provider in Provider::ALL {
             let slot = provider_slot(provider);
             let mark = if self.chosen[slot] { "[x]" } else { "[ ]" };
-            let availability = if self.installed[slot] {
-                text(format!("  ✓ {} on PATH", provider.binary()), Tone::Good)
-            } else {
-                text(
-                    format!(
-                        "  ✗ {} not on PATH · install it, then press R",
-                        provider.binary()
-                    ),
-                    Tone::Warn,
-                )
-            };
-            rows.push(vec![
-                button(
-                    format!("{mark} {:<11}", provider_title(provider)),
-                    Action::Toggle(provider),
-                ),
-                availability,
-            ]);
+            let mut row = vec![button(
+                format!("{mark} {:<11}", provider_title(provider)),
+                Action::Toggle(provider),
+            )];
+            row.extend(availability(
+                provider,
+                self.clis.found(provider),
+                width.saturating_sub(19),
+            ));
+            rows.push(row);
         }
         let cursor = if editing_name { "▏" } else { " " };
         rows.push(vec![]);
@@ -279,6 +353,10 @@ impl ConnectForm {
             button(format!("{:<16}{cursor}", self.name), Action::Name),
         ]);
         rows.push(vec![]);
+        if let Some(provider) = self.installing {
+            rows.extend(install_prompt(provider, width));
+            return rows;
+        }
         let mut controls = vec![button("Connect", Action::Connect), text("  ", Tone::Plain)];
         if self.missing() {
             controls.push(button("R Recheck", Action::Recheck));
@@ -295,11 +373,58 @@ impl ConnectForm {
     }
 }
 
+fn availability(provider: Provider, found: Option<&Found>, width: usize) -> Vec<Segment> {
+    let binary = provider.binary();
+    match found {
+        Some(Found::OnPath) => vec![text(format!("  ✓ {binary} on PATH"), Tone::Good)],
+        Some(Found::At(path)) => vec![text(
+            truncated(&format!("  ✓ {binary} at {}", path.display()), width),
+            Tone::Good,
+        )],
+        None => vec![
+            text(format!("  ✗ {binary} not found  "), Tone::Warn),
+            button("Install", Action::Install(provider)),
+        ],
+    }
+}
+
+fn install_prompt(provider: Provider, width: usize) -> Vec<Row> {
+    let plan = install::plan(provider, Platform::current());
+    let mut rows = vec![vec![text(
+        format!(
+            "Install {} with its official installer:",
+            provider_title(provider)
+        ),
+        Tone::Heading,
+    )]];
+    rows.extend(
+        wrapped(&plan.command, width.saturating_sub(2), 3)
+            .into_iter()
+            .map(|line| vec![text(format!("  {line}"), Tone::Plain)]),
+    );
+    rows.push(vec![text(
+        truncated(&format!("Docs  {}", plan.docs), width),
+        Tone::Muted,
+    )]);
+    rows.push(vec![text(
+        "Runs here for your user; no sudo or admin. Nothing runs without Y.",
+        Tone::Muted,
+    )]);
+    rows.push(vec![
+        button("Y Install", Action::ConfirmInstall),
+        text("  ", Tone::Plain),
+        button("N Cancel", Action::CancelInstall),
+    ]);
+    rows
+}
+
 impl SettingsView {
-    fn new() -> Self {
+    fn new(host: Option<&dyn Host>) -> Self {
         Self {
             focus: 0,
             confirm: None,
+            clis: Clis::located(host),
+            installing: None,
             status: String::new(),
         }
     }
@@ -307,7 +432,7 @@ impl SettingsView {
 
 impl App {
     pub(crate) fn open_settings(&mut self) {
-        self.panel = Some(Panel::Settings(SettingsView::new()));
+        self.panel = Some(Panel::Settings(SettingsView::new(self.host.as_deref())));
     }
 
     pub(crate) fn open_connect(&mut self, origin: Origin) {
@@ -355,11 +480,15 @@ impl App {
             Some(Panel::Settings(view)) if view.confirm.is_some() => {
                 vec![Action::ConfirmSignOut, Action::CancelSignOut]
             }
-            Some(Panel::Settings(_)) => {
+            Some(Panel::Settings(view)) if view.installing.is_some() => {
+                vec![Action::ConfirmInstall, Action::CancelInstall]
+            }
+            Some(Panel::Settings(view)) => {
                 let count = self.live.as_ref().map_or(0, |live| live.profiles.len());
                 let mut actions: Vec<Action> = (0..count)
                     .flat_map(|index| [Action::Reconnect(index), Action::SignOut(index)])
                     .collect();
+                actions.extend(view.clis.missing().into_iter().map(Action::Install));
                 actions.extend([
                     Action::ConnectNew,
                     Action::CommanderProfile,
@@ -434,6 +563,12 @@ impl App {
                     self.activate(action);
                 }
             }
+            KeyCode::Char('y' | 'Y') if self.pending_install().is_some() => {
+                self.activate(Action::ConfirmInstall)
+            }
+            KeyCode::Char('n' | 'N') if self.pending_install().is_some() => {
+                self.activate(Action::CancelInstall)
+            }
             KeyCode::Char('r' | 'R') if matches!(self.panel, Some(Panel::Connect(_))) => {
                 self.activate(Action::Recheck)
             }
@@ -483,6 +618,9 @@ impl App {
         if self.confirming() {
             return self.activate(Action::CancelSignOut);
         }
+        if self.pending_install().is_some() {
+            return self.activate(Action::CancelInstall);
+        }
         match &self.panel {
             Some(Panel::Connect(_)) => self.activate(Action::Leave),
             _ => self.panel = None,
@@ -520,6 +658,113 @@ impl App {
             Action::Connect => self.connect_chosen(),
             Action::Recheck => self.recheck(),
             Action::Leave => self.leave_connect(),
+            Action::Install(provider) => self.offer_install(provider),
+            Action::ConfirmInstall => {
+                if let Some(provider) = self.pending_install() {
+                    self.run_install(provider);
+                }
+            }
+            Action::CancelInstall => {
+                self.set_pending_install(None);
+                self.set_panel_status("Install cancelled. Nothing ran.".into());
+            }
+        }
+    }
+
+    fn pending_install(&self) -> Option<Provider> {
+        match &self.panel {
+            Some(Panel::Settings(view)) => view.installing,
+            Some(Panel::Connect(form)) => form.installing,
+            None => None,
+        }
+    }
+
+    fn set_pending_install(&mut self, provider: Option<Provider>) {
+        match &mut self.panel {
+            Some(Panel::Settings(view)) => {
+                view.installing = provider;
+                view.focus = 0;
+            }
+            Some(Panel::Connect(form)) => {
+                form.installing = provider;
+                form.focus = 0;
+            }
+            None => {}
+        }
+    }
+
+    fn offer_install(&mut self, provider: Provider) {
+        let Some(host) = self.host.as_deref() else {
+            return self.set_panel_status(PREVIEW_BLOCKER.into());
+        };
+        let plan = install::plan(provider, Platform::current());
+        let missing = install::missing_prerequisites(&plan, |name| host.has_program(name));
+        if !missing.is_empty() {
+            return self.set_panel_status(prerequisite_guidance(&plan, &missing));
+        }
+        self.set_pending_install(Some(provider));
+        self.set_panel_status(String::new());
+    }
+
+    fn install_blocker(&self) -> Option<&'static str> {
+        if self.host.is_none() {
+            return Some(PREVIEW_BLOCKER);
+        }
+        self.live
+            .as_ref()
+            .filter(|live| live.mission.is_some())
+            .map(|_| "Finish the running mission before installing.")
+    }
+
+    fn run_install(&mut self, provider: Provider) {
+        self.set_pending_install(None);
+        if let Some(blocker) = self.install_blocker() {
+            return self.set_panel_status(blocker.into());
+        }
+        let plan = install::plan(provider, Platform::current());
+        let host = self.host.as_mut().expect("checked by install_blocker");
+        let outcome = match host.suspend() {
+            Ok(()) => host.install(&plan),
+            Err(error) => Err(error),
+        };
+        let restored = host.restore();
+        self.full_redraw = true;
+        let mut summary = match outcome {
+            Ok(()) => self.located_after_install(provider),
+            Err(error) => format!(
+                "{} install failed: {error}. Nothing else changed.",
+                provider_title(provider)
+            ),
+        };
+        self.recheck_clis();
+        if let Err(error) = restored {
+            summary.push_str(&format!(" · Terminal restore failed: {error}"));
+        }
+        self.set_panel_status(summary);
+    }
+
+    fn located_after_install(&self, provider: Provider) -> String {
+        let title = provider_title(provider);
+        let binary = provider.binary();
+        let host = self.host.as_deref().expect("checked by install_blocker");
+        match locate(host, provider) {
+            Some(Found::OnPath) => format!("{title} installed: {binary} is on PATH."),
+            Some(Found::At(path)) => format!(
+                "{title} installed. Using {} for {binary} in this session.",
+                path.display()
+            ),
+            None => format!(
+                "{title} installer finished, but {binary} was not found. Open a new terminal, then press R."
+            ),
+        }
+    }
+
+    fn recheck_clis(&mut self) {
+        let host = self.host.as_deref();
+        match &mut self.panel {
+            Some(Panel::Settings(view)) => view.clis = Clis::located(host),
+            Some(Panel::Connect(form)) => form.recheck(host),
+            None => {}
         }
     }
 
@@ -528,11 +773,11 @@ impl App {
             return;
         };
         let slot = provider_slot(provider);
-        if form.installed[slot] {
+        if form.clis.found(provider).is_some() {
             form.chosen[slot] = !form.chosen[slot];
         } else {
             form.status = format!(
-                "{} is not on PATH. Install it (see README), then press R.",
+                "{} is not installed. Choose Install, or install it yourself and press R.",
                 provider.binary()
             );
         }
@@ -566,10 +811,10 @@ impl App {
 
     fn connect_blocker(&self) -> Option<&'static str> {
         if self.host.is_none() {
-            return Some("Connecting needs the live terminal; this is a preview.");
+            return Some(PREVIEW_BLOCKER);
         }
         match &self.live {
-            None => Some("Connecting needs the live terminal; this is a preview."),
+            None => Some(PREVIEW_BLOCKER),
             Some(live) if live.profile_root.is_none() => {
                 Some("No profile directory. Set an absolute SUB_AUTH_DIR.")
             }
@@ -728,8 +973,12 @@ impl App {
         self.set_panel_status(status);
     }
 
-    fn settings_rows(&self, view: &SettingsView) -> Vec<Row> {
+    fn settings_rows(&self, view: &SettingsView, width: usize) -> Vec<Row> {
         let mut rows: Vec<Row> = vec![vec![text("PROVIDERS", Tone::Heading)]];
+        if let Some(provider) = view.installing {
+            rows.extend(install_prompt(provider, width));
+            return rows;
+        }
         let profiles = self
             .live
             .as_ref()
@@ -762,6 +1011,20 @@ impl App {
                     ]);
                 }
             }
+        }
+        for provider in view.clis.missing() {
+            rows.push(vec![
+                text(
+                    format!(
+                        "{:<width$}",
+                        format!("{} CLI", provider.binary()),
+                        width = PROFILE_LABEL_WIDTH
+                    ),
+                    Tone::Plain,
+                ),
+                text("✗ not found   ", Tone::Warn),
+                button("Install", Action::Install(provider)),
+            ]);
         }
         if let Some(index) = view.confirm {
             let label = self
@@ -845,22 +1108,27 @@ impl App {
     pub(crate) fn draw_panel(&mut self, f: &mut Frame, area: Rect) {
         self.panel_hits.clear();
         let Some(panel) = &self.panel else { return };
+        let width = area.width.saturating_sub(2).min(PANEL_MAX_WIDTH);
+        let inner_width = usize::from(width.saturating_sub(4));
         let (title, rows, status, footer) = match panel {
             Panel::Settings(view) => (
                 " Settings ",
-                self.settings_rows(view),
+                self.settings_rows(view, inner_width),
                 view.status.clone(),
                 "↑↓ Tab move · Enter select · Esc close",
             ),
             Panel::Connect(form) => (
                 " Connect providers ",
-                form.rows(self.editing_name()),
+                form.rows(self.editing_name(), inner_width),
                 form.status.clone(),
                 "↑↓ Tab move · Enter select · R recheck · Esc leave",
             ),
         };
-        let width = area.width.saturating_sub(2).min(PANEL_MAX_WIDTH);
-        let inner_width = usize::from(width.saturating_sub(4));
+        let footer = if self.pending_install().is_some() {
+            "Y install · N or Esc cancel"
+        } else {
+            footer
+        };
         let status_rows = wrapped(&status, inner_width, STATUS_MAX_ROWS);
         let content_rows = rows.len() + status_rows.len() + 2;
         let height = (content_rows as u16 + 2).min(area.height.saturating_sub(1));
@@ -916,6 +1184,15 @@ impl App {
         painter.row(f, &vec![text(footer, Tone::Muted)], footer_area);
         self.panel_hits = hits;
     }
+}
+
+fn prerequisite_guidance(plan: &Plan, missing: &[&str]) -> String {
+    format!(
+        "Installing {} needs {} on PATH, which is missing. Nothing ran. Install it, or follow {}",
+        provider_title(plan.provider),
+        missing.join(" and "),
+        plan.docs
+    )
 }
 
 fn form_origin(panel: &Option<Panel>) -> Option<Origin> {

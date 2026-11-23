@@ -6,10 +6,21 @@ mod privacy;
 mod privacy;
 
 use std::{
-    env, fmt, fs, io,
+    env,
+    ffi::{OsStr, OsString},
+    fmt, fs, io,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::{Mutex, PoisonError},
 };
+
+static ADOPTED: Mutex<[Option<PathBuf>; 2]> = Mutex::new([None, None]);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Found {
+    OnPath,
+    At(PathBuf),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Provider {
@@ -30,6 +41,13 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            Self::Claude => 0,
+            Self::Codex => 1,
         }
     }
 
@@ -264,7 +282,7 @@ impl Profile {
     }
 
     fn command(&self, directory: &Path) -> Command {
-        let mut command = Command::new(self.provider.binary());
+        let mut command = Command::new(program(self.provider));
         #[cfg(test)]
         if let Some(executable) = &self.executable {
             command = Command::new(executable);
@@ -372,11 +390,35 @@ pub(crate) fn validate_name(name: &str) -> Result<(), &'static str> {
     }
 }
 
-pub(crate) fn installed(provider: Provider) -> bool {
-    env::var_os("PATH").is_some_and(|path| on_path(provider.binary(), &path))
+pub(crate) fn adopt(provider: Provider, executable: &Path) {
+    ADOPTED.lock().unwrap_or_else(PoisonError::into_inner)[provider.slot()] =
+        Some(executable.to_path_buf());
 }
 
-fn on_path(binary: &str, path: &std::ffi::OsStr) -> bool {
+fn adopted(provider: Provider) -> Option<PathBuf> {
+    ADOPTED.lock().unwrap_or_else(PoisonError::into_inner)[provider.slot()].clone()
+}
+
+fn program(provider: Provider) -> OsString {
+    program_for(provider, adopted(provider))
+}
+
+fn program_for(provider: Provider, adopted: Option<PathBuf>) -> OsString {
+    adopted.map_or_else(|| provider.binary().into(), PathBuf::into_os_string)
+}
+
+pub(crate) fn found(provider: Provider) -> Option<Found> {
+    if let Some(executable) = adopted(provider).filter(|path| path.is_file()) {
+        return Some(Found::At(executable));
+    }
+    program_on_path(provider.binary()).then_some(Found::OnPath)
+}
+
+pub(crate) fn program_on_path(binary: &str) -> bool {
+    env::var_os("PATH").is_some_and(|path| on_path(binary, &path))
+}
+
+fn on_path(binary: &str, path: &OsStr) -> bool {
     let extensions = executable_extensions();
     env::split_paths(path).any(|directory| {
         extensions
@@ -495,6 +537,16 @@ mod tests {
         assert!(on_path("fake-cli", &path));
         assert!(!on_path("absent-cli", &path));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_adopted_executable_replaces_the_bare_provider_name() {
+        assert_eq!(program_for(Provider::Codex, None), "codex");
+        let executable = env::temp_dir().join("bin").join("claude");
+        assert_eq!(
+            program_for(Provider::Claude, Some(executable.clone())),
+            executable.into_os_string()
+        );
     }
 
     #[test]
