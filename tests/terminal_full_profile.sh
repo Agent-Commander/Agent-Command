@@ -9,7 +9,11 @@ profiles="$fixture/profiles"
 long=1234567890abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzab
 test "${#long}" = 64
 umask 077
-mkdir -p "$profiles/claude/0" "$profiles/claude/$long" "$fixture/work"
+usage="$profiles/agent-command-usage-v1/claude/$long"
+mkdir -p "$profiles/claude/0" "$profiles/claude/$long" "$usage" "$fixture/work"
+now=$(date +%s)
+printf '{"week":{"used":97,"reset":%s,"observed":%s,"stamp":null},"unavailable":false}\n' \
+    "$((now + 604800))" "$((now - 901))" > "$usage/state.json"
 
 t() {
     tmux -S "$socket" "$@"
@@ -42,8 +46,9 @@ for dimensions in 80x24 120x40; do
     fi
     await_capture "$dimensions" "claude/$long"
     grep -Fq '5h unavailable' "$fixture/screen"
-    grep -Fq 'Week unavailable' "$fixture/screen"
+    await_capture "$dimensions" "stale age unknown"
+    grep -Eq "Week 97% used / 3% left.*stale" "$fixture/screen"
     grep -Fq 'No latch' "$fixture/screen"
-    printf '%s full profile and both usage windows visible\n' "$dimensions"
+    printf '%s full profile, unavailable five-hour window and stale weekly window visible\n' "$dimensions"
     t kill-session -t "$dimensions"
 done

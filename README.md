@@ -120,11 +120,16 @@ unavailable. Agent Command sends no synthetic Claude prompts to collect usage.
 
 A reported subscription limit latches the profile until the provider's reset
 time. When no reliable reset is available, the profile stays latched and shows
-“reset unknown.” A reported past reset requires a new reading. Usage metadata lives in the private `agent-command-usage-v1`
+“reset unknown.” After a reported past reset, the display asks for a new reading. Usage metadata lives in the private `agent-command-usage-v1`
 directory under the isolated profile root.
 
 For new missions, a latched preferred profile can be replaced by the first
-signed-in same-provider profile by name with fresh headroom in both windows.
+eligible signed-in profile from the same provider, ordered by name. Rotation
+and continuation skip profiles with an active latch, unreadable or corrupt
+usage state, or a reported window at or above 100% whose reset is still ahead.
+Unreported windows show as unavailable. Stale readings below 100% still allow
+selection. If the continuation is rejected for a usage limit, Agent Command
+latches that profile and stops.
 If the provider interrupts a mission with a usage limit, Agent Command creates
 a checkpoint for the root of a Git workspace. It checks the workspace again
 before launching one continuation on an eligible alternate. The terminal shows

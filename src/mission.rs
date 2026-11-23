@@ -162,12 +162,12 @@ impl Execution {
                     && profile.to_string() == claim.alternate
             })
             .ok_or_else(|| io::Error::other("Claimed alternate profile is unavailable"))?;
-        let next = profile.authenticated_command()?;
-        if !Usage::read(profile)?.can_resume_claim((self.clock)()) {
+        if !Usage::read(profile)?.eligible_alternate((self.clock)()) {
             return Err(io::Error::other(
-                "Claimed alternate needs a fresh reading or is latched",
+                "Claimed alternate is latched or has an exhausted usage window",
             ));
         }
+        let next = profile.authenticated_command()?;
         self.continue_with((index, to, next), &claim, sender, cancel)
     }
 
@@ -518,6 +518,11 @@ case "$prompt" in
   *"do not redo completed work"*"Retained workspace manifest:"*'"kind":"tracked","path":"completed","index_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","worktree_sha256":"d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2"'*"Keep the finished step"*) ;;
   *) exit 9 ;;
 esac
+if test -f .git/reject-continuation; then
+    printf 'rejected\n' >> completed
+    printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","utilization":1,"resetsAt":4102444800}}'
+    exit 1
+fi
 printf 'continued\n' >> completed
 "#,
         );
@@ -529,10 +534,10 @@ printf 'continued\n' >> completed
         Usage::observe_claude(
             &profiles[1],
             &json!({
-                "type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{
-                    "five_hour":{"utilization":0.25,"resetsAt":now.wall + 3000},
-                    "seven_day":{"utilization":0.25,"resetsAt":now.wall + 8000}
-                }}
+                "type":"rate_limit_event","rate_limit_info":{
+                    "status":"allowed_warning","rateLimitType":"seven_day",
+                    "utilization":0.97,"resetsAt":now.wall + 8000
+                }
             }),
             now,
         )
@@ -552,14 +557,14 @@ printf 'continued\n' >> completed
     }
 
     #[test]
-    fn interrupted_mission_checkpoints_once_and_continues_on_the_next_profile() {
+    fn stale_weekly_only_alternate_continues_once() {
         let (_fixture, workspace, profiles) = limit_fixture("continue", usage::tick(FAKE_NOW, 0));
         let mission = Mission::launch_with_clock(
             profiles.clone(),
             0,
             workspace.clone(),
             "Keep the finished step".into(),
-            || usage::tick(FAKE_NOW, 0),
+            || usage::tick(FAKE_NOW + 901, 901),
         );
         let (links, result) = drain(&mission);
         result.unwrap();
@@ -605,6 +610,84 @@ printf 'continued\n' >> completed
     }
 
     #[test]
+    fn exhausted_latched_or_corrupt_alternates_never_start() {
+        for (case, status, utilization) in [
+            ("latched", "rejected", 0.5),
+            ("exhausted", "allowed_warning", 1.0),
+            ("over-limit", "allowed_warning", 1.02),
+            ("corrupt", "allowed", 0.5),
+        ] {
+            let now = usage::tick(FAKE_NOW, 0);
+            let (_fixture, workspace, profiles) = limit_fixture(case, now);
+            Usage::observe_claude(
+                &profiles[1],
+                &json!({"type":"rate_limit_event","rate_limit_info":{
+                    "status":status,"rateLimitType":"seven_day",
+                    "utilization":utilization,"resetsAt":FAKE_NOW + 3600
+                }}),
+                now,
+            )
+            .unwrap();
+            if case == "corrupt" {
+                std::fs::write(
+                    profiles[1].usage_directory().unwrap().join("state.json"),
+                    b"{",
+                )
+                .unwrap();
+            }
+            let mission = Mission::launch_with_clock(
+                profiles,
+                0,
+                workspace.clone(),
+                "Keep the finished step".into(),
+                || usage::tick(FAKE_NOW, 0),
+            );
+            let (links, result) = drain(&mission);
+            assert!(links.is_empty(), "{case}");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("No eligible signed-in alternate"),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("completed")).unwrap(),
+                "done\n"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_unobserved_continuation_latches_and_does_not_try_third_profile() {
+        let (fixture, workspace, mut profiles) =
+            limit_fixture("rejected-continuation", usage::tick(FAKE_NOW, 0));
+        std::fs::remove_file(profiles[1].usage_directory().unwrap().join("state.json")).unwrap();
+        profiles.push(fixture.profile(Provider::Claude, "third"));
+        std::fs::write(workspace.join(".git/reject-continuation"), "").unwrap();
+        let mission = Mission::launch_with_clock(
+            profiles.clone(),
+            0,
+            workspace.clone(),
+            "Keep the finished step".into(),
+            || usage::tick(FAKE_NOW, 0),
+        );
+        let (links, result) = drain(&mission);
+        assert_eq!(links, [(0, 1)]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Continuation hit a usage limit"));
+        assert!(Usage::read(&profiles[1])
+            .unwrap()
+            .blocked(usage::tick(FAKE_NOW, 0)));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("completed")).unwrap(),
+            "done\nrejected\n"
+        );
+    }
+
+    #[test]
     fn separate_process_shows_and_resumes_pending_claim_once_or_abandons_it() {
         for abandon in [false, true] {
             let tag = if abandon {
@@ -624,6 +707,8 @@ printf 'continued\n' >> completed
             .unwrap();
             let claim = checkpoint
                 .reserve(&profiles[0], &workspace, &profiles[1])
+                .unwrap();
+            std::fs::remove_file(profiles[1].usage_directory().unwrap().join("state.json"))
                 .unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "mission::tests::recovery_child", "--nocapture"])
@@ -836,9 +921,8 @@ exit 1
         let workspace = git_workspace(&fixture);
         for provider in [Provider::Claude, Provider::Codex] {
             let selected = fixture.profile(provider, "original");
-            let standby = fixture.profile(provider, "standby");
             let mission = Mission::launch(
-                vec![selected.clone(), standby],
+                vec![selected.clone()],
                 0,
                 workspace.clone(),
                 "Do work".into(),

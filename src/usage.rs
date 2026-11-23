@@ -92,26 +92,10 @@ impl Usage {
 
     pub(crate) fn eligible_alternate(self, now: Tick) -> bool {
         !self.blocked(now)
-            && !self.unavailable
-            && !self.needs_reading()
-            && [self.five, self.week].into_iter().all(|window| {
-                window.is_some_and(|window| {
-                    window.used < 100.0
-                        && window.reset > now.wall
-                        && observation_age(window, now).is_some_and(|age| age < STALE_SECONDS)
-                })
-            })
-    }
-
-    pub(crate) fn can_resume_claim(self, now: Tick) -> bool {
-        !self.blocked(now)
-            && !self.needs_reading()
-            && !self.unavailable
-            && [self.five, self.week].into_iter().all(|window| {
-                window.is_some_and(|window| {
-                    window.used < 100.0 && window.observed <= now.wall && window.reset > now.wall
-                })
-            })
+            && ![self.five, self.week]
+                .into_iter()
+                .flatten()
+                .any(|window| window.used >= 100.0 && window.reset > now.wall)
     }
 
     pub(crate) fn rows(self, now: Tick) -> [String; 2] {
@@ -125,7 +109,7 @@ impl Usage {
                 format!(
                     "{name} {:.0}% used / {:.0}% left, reset {} · {}{}",
                     window.used,
-                    100.0 - window.used,
+                    (100.0 - window.used).max(0.0),
                     duration(window.reset.saturating_sub(now.wall)),
                     if stale { "stale " } else { "age " },
                     age.map_or_else(
@@ -248,7 +232,7 @@ fn observation_age(window: Window, now: Tick) -> Option<u64> {
 }
 
 fn window(used: f64, reset: i64, now: Tick) -> Option<Window> {
-    ((0.0..=100.0).contains(&used) && (now.wall..i64::MAX).contains(&reset)).then_some(Window {
+    (used.is_finite() && used >= 0.0 && (now.wall..i64::MAX).contains(&reset)).then_some(Window {
         used,
         reset,
         observed: now.wall,
@@ -374,7 +358,7 @@ pub(crate) fn refresh_codex(profile: &Profile, now: Tick) -> io::Result<()> {
             let (five, week, limit) = codex_windows(&result, now);
             state.five = five.or(state.five);
             state.week = week.or(state.week);
-            state.unavailable = five.is_none() || week.is_none();
+            state.unavailable = five.is_none() && week.is_none();
             if let Some(reset) = limit {
                 state.record_limit(reset, now);
             } else if (five.is_some() || week.is_some())
@@ -535,7 +519,7 @@ pub(crate) mod tests {
         let state = Usage::read(&profile).unwrap();
         assert!(state.eligible_alternate(observed));
         let backwards = tick(CLOCK - 3600, 6);
-        assert!(!state.eligible_alternate(backwards));
+        assert!(state.eligible_alternate(backwards));
         assert!(state.rows(backwards)[0].contains("stale age unknown"));
         assert!(state.rows(tick(CLOCK + 700, 10))[0].contains("age 5s"));
     }
@@ -550,7 +534,7 @@ pub(crate) mod tests {
         Usage::observe_claude(&profile, &rejected, now).unwrap();
         let state = Usage::read(&profile).unwrap();
         assert!(!state.blocked(now));
-        assert!(!state.eligible_alternate(now));
+        assert!(state.eligible_alternate(now));
         assert_eq!(state.latch_label(now), "Needs fresh reading");
         rejected["rate_limit_info"]["resetsAt"] = Value::Null;
         Usage::observe_claude(&profile, &rejected, now).unwrap();
@@ -618,7 +602,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rotation_order_uses_fresh_same_provider_allowances() {
+    fn rotation_order_accepts_stale_and_unreported_same_provider_allowances() {
         let fixture = Fixture::new("rotation", "");
         let profiles = [
             fixture.profile(Provider::Claude, "selected"),
@@ -632,15 +616,43 @@ pub(crate) mod tests {
         for profile in &profiles[1..3] {
             Usage::observe_claude(profile, &claude_status("allowed"), tick(CLOCK, 0)).unwrap();
         }
-        assert_eq!(choices(&profiles, 0, tick(CLOCK, 0)).unwrap(), [2, 1]);
-        assert!(choices(
-            &profiles,
-            0,
-            tick(CLOCK + STALE_SECONDS as i64, STALE_SECONDS)
-        )
-        .unwrap()
-        .is_empty());
+        assert_eq!(choices(&profiles, 0, tick(CLOCK, 0)).unwrap(), [2, 4, 1]);
+        assert_eq!(
+            choices(
+                &profiles,
+                0,
+                tick(CLOCK + STALE_SECONDS as i64, STALE_SECONDS)
+            )
+            .unwrap(),
+            [2, 4, 1]
+        );
         assert_eq!(choices(&profiles, 0, tick(2000, 1000)).unwrap(), [0]);
+    }
+
+    #[test]
+    fn codex_weekly_only_readback_is_current_and_eligible() {
+        let fixture = Fixture::new(
+            "codex-weekly-only",
+            r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '%s\n' '{"id":3,"result":{"rateLimits":{"primary":{"usedPercent":97,"resetsAt":5000,"windowDurationMins":10080}}}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let profile = fixture.profile(Provider::Codex, "weekly");
+        let now = tick(CLOCK, 0);
+        refresh_codex(&profile, now).unwrap();
+        let state = Usage::read(&profile).unwrap();
+        let [five, week] = state.rows(now);
+        assert_eq!(five, "5h unavailable");
+        assert!(week.contains("97% used / 3% left") && week.ends_with("age 0s"));
+        assert!(state.eligible_alternate(tick(CLOCK + 901, 901)));
     }
 
     #[test]
