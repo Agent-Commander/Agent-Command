@@ -2,7 +2,7 @@
 
 ## What we're working on
 
-A Rust terminal interface for managing agents: a selectable crew roster, mission controls, command input, and an activity feed. The current prototype uses sample agents; commands stay local.
+A Rust terminal interface for managing agents: one persistent entry bot, Commander, plus on-demand specialists with isolated workspaces, a selectable crew roster, mission controls, command input, and an activity feed.
 
 The interface retains its existing layout, block-letter backdrop, muted blue palette, ivory menu bar, and small color accent.
 
@@ -75,6 +75,35 @@ cargo test --locked --all-targets
 ```
 
 CI checks Windows, Linux, and macOS. No Python runtime is required.
+
+## Commander and specialists
+
+Commander is the default conversation on launch. Its transcript and the
+specialist roster persist in the private `agent-command-orchestrator-v1`
+directory under the profile root. Commander's entry model is chosen by the
+routing ranking (Auto), falling back to the first signed-in profile; override
+it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
+
+```text
+/spawn NAME ROLE [TASK]   create a specialist, optionally delegating TASK
+/ask NAME TASK            delegate TASK to a specialist
+/roster                   list the crew in Commander's feed
+/remove NAME              remove a specialist and its workspace
+```
+
+Commander can also reply with `SPAWN_SPECIALIST: NAME | ROLE | TASK` or
+`DELEGATE: NAME | TASK` lines. Each specialist runs in its own `git worktree`
+(or an isolated directory outside Git repositories) with its own history.
+Delegations run one at a time; the roster shows IDLE, RUNNING, DONE or ERROR,
+and each result is posted back to Commander's feed. Select a specialist with
+↑ ↓ or a click to inspect its history; Home or the Commander row returns.
+
+```sh
+agent-command specialist spawn nova reviewer Review the patch
+agent-command specialist list
+agent-command specialist status nova
+agent-command specialist remove nova
+```
 
 ## Subscription profiles
 

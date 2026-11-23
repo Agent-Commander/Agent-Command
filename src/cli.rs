@@ -19,10 +19,11 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         Some(("auth", rest)) => return crate::auth::run(rest),
         Some(("catalog", rest)) => return crate::catalog::run(rest),
         Some(("model", rest)) => return crate::native::run(rest),
+        Some(("specialist", rest)) => return crate::specialists::run(rest),
         _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}");
+        println!("Agent Command\n\nUsage: agent-command [--snapshot PATH]\n       agent-command auth --help\n       agent-command catalog {{show|refresh}}\n       agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n       agent-command specialist {{list|spawn NAME ROLE [TASK]|status NAME|remove NAME}}\n\nTerminal UI: /spawn NAME ROLE [TASK], /ask NAME TASK, /roster, /remove NAME, /entry PROVIDER/PROFILE|auto");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {

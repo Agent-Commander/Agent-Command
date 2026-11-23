@@ -114,3 +114,37 @@ fn model_pins_round_trip_through_versioned_state_and_refuse_aliases() {
     assert_eq!(stdout(&model(&["show"])), "");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn specialist_subcommands_spawn_list_status_and_remove() {
+    let root = std::env::temp_dir().join(format!("agent-cli-specialist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let base = root.join("plain");
+    std::fs::create_dir_all(&base).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agent-command"))
+            .arg("specialist")
+            .args(args)
+            .env("SUB_AUTH_DIR", root.join("state"))
+            .current_dir(&base)
+            .output()
+            .unwrap()
+    };
+    let spawned = run(&["spawn", "echo", "writer", "Draft", "notes"]);
+    assert!(spawned.status.success(), "{spawned:?}");
+    assert!(String::from_utf8_lossy(&spawned.stdout).contains("Spawned echo (writer) in directory"));
+    let listed = String::from_utf8_lossy(&run(&["list"]).stdout).into_owned();
+    assert!(
+        listed.starts_with("echo\twriter\tIDLE\tdirectory"),
+        "{listed}"
+    );
+    let status = String::from_utf8_lossy(&run(&["status", "echo"]).stdout).into_owned();
+    assert!(status.contains("task: Draft notes"), "{status}");
+    assert!(root
+        .join("state/agent-command-orchestrator-v1/workspaces/echo")
+        .is_dir());
+    assert!(run(&["remove", "echo"]).status.success());
+    assert!(!run(&["status", "echo"]).status.success());
+    assert!(!run(&["unknown"]).status.success());
+    std::fs::remove_dir_all(root).unwrap();
+}

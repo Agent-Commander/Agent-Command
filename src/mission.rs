@@ -646,7 +646,7 @@ fi
 printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
 prompt=$(cat)
 if test "$profile" = first; then
-    test "$prompt" = "Keep the finished step" || exit 7
+    case "$prompt" in *"Keep the finished step") ;; *) exit 7 ;; esac
     printf 'done\n' >> completed
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Finished the first step"}]}}'
     printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","content":"fixture-credential-never-persist"}]}}'
