@@ -66,7 +66,7 @@ impl Configuration {
         self.model == Model::Default && self.effort.is_none()
     }
 
-    fn native_model(&self) -> Option<&str> {
+    pub(crate) fn native_model(&self) -> Option<&str> {
         match &self.model {
             Model::Default => None,
             Model::Alias(alias) => Some(alias),

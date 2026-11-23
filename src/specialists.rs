@@ -1,6 +1,10 @@
 use crate::{
     auth,
     branches::{self, Branch, DiffStat},
+    catalog, native,
+    permissions::PermissionMode,
+    review::{self, ReviewLedger},
+    routing,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -131,6 +135,8 @@ pub struct Member {
     pub workspace: Option<Workspace>,
     pub changes: Option<DiffStat>,
     pub history: VecDeque<Entry>,
+    pub(crate) permission: PermissionMode,
+    pub(crate) review: ReviewLedger,
 }
 
 impl Member {
@@ -155,7 +161,16 @@ impl Member {
             workspace,
             changes: None,
             history: VecDeque::new(),
+            permission: PermissionMode::default_for_role(role),
+            review: ReviewLedger::default(),
         }
+    }
+
+    pub(crate) fn with_permission(mut self, permission: Option<PermissionMode>) -> Self {
+        if let Some(permission) = permission {
+            self.permission = permission;
+        }
+        self
     }
 
     pub fn is_commander(&self) -> bool {
@@ -207,6 +222,10 @@ struct Record {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     settled: bool,
     workspace: Option<Workspace>,
+    #[serde(default)]
+    permission: Option<PermissionMode>,
+    #[serde(default)]
+    review: ReviewLedger,
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +286,8 @@ impl Store {
         };
         member.settled = record.settled;
         member.refresh_changes();
+        member.permission = record.permission.unwrap_or(member.permission);
+        member.review = record.review;
         member.history = read_entries(&history_path(directory, &record.name))?.into();
         Ok(member)
     }
@@ -284,6 +305,8 @@ impl Store {
                     status: member.status,
                     settled: member.settled,
                     workspace: member.workspace.clone(),
+                    permission: Some(member.permission),
+                    review: member.review.clone(),
                 })
                 .collect(),
         };
@@ -336,30 +359,38 @@ impl Store {
         }
     }
 
+    pub(crate) fn isolate_for(
+        &self,
+        base: &Path,
+        name: &str,
+        topic: &str,
+        mode: PermissionMode,
+    ) -> Result<Workspace, String> {
+        let workspace = self
+            .isolate(base, name, topic)
+            .map_err(|error| format!("Cannot isolate {name}: {error}"))?;
+        if let Err(refusal) = mode.require_isolation(Some(&workspace.isolation)) {
+            let _ = release_workspace(&workspace);
+            return Err(refusal);
+        }
+        Ok(workspace)
+    }
+
+    fn catalog(&self) -> catalog::Catalog {
+        let state = auth::existing_private_state(&self.root, routing::STATE_DIRECTORY)
+            .ok()
+            .flatten();
+        catalog::Catalog::load(state.as_deref())
+    }
+
+    fn pins(&self) -> native::Pins {
+        native::load_existing(&self.root).unwrap_or_default()
+    }
+
     pub(crate) fn release(&self, member: &Member) -> io::Result<Option<String>> {
         let mut retained = None;
         if let Some(workspace) = &member.workspace {
-            match &workspace.isolation {
-                Isolation::Worktree { repository } => {
-                    branches::git(
-                        repository,
-                        &[
-                            "worktree",
-                            "remove",
-                            "--force",
-                            branches::path_text(&workspace.path)?,
-                        ],
-                    )?;
-                    retained = workspace
-                        .branch
-                        .as_ref()
-                        .filter(|branch| !branches::delete_if_merged(repository, &branch.name))
-                        .map(|branch| branch.name.clone());
-                }
-                Isolation::Directory => {
-                    remove_if_present(&workspace.path, |path| fs::remove_dir_all(path))?
-                }
-            }
+            retained = release_workspace(workspace)?;
         }
         if let Some(directory) = self.existing()? {
             remove_if_present(&history_path(&directory, &member.name), |path| {
@@ -374,6 +405,31 @@ pub(crate) fn removal_note(name: &str, retained: Option<&str>) -> String {
     match retained {
         Some(branch) => format!("Removed {name}; kept unmerged branch {branch}."),
         None => format!("Removed {name}."),
+    }
+}
+
+fn release_workspace(workspace: &Workspace) -> io::Result<Option<String>> {
+    match &workspace.isolation {
+        Isolation::Worktree { repository } => {
+            branches::git(
+                repository,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    branches::path_text(&workspace.path)?,
+                ],
+            )?;
+            Ok(workspace
+                .branch
+                .as_ref()
+                .filter(|branch| !branches::delete_if_merged(repository, &branch.name))
+                .map(|branch| branch.name.clone()))
+        }
+        Isolation::Directory => {
+            remove_if_present(&workspace.path, |path| fs::remove_dir_all(path))?;
+            Ok(None)
+        }
     }
 }
 
@@ -586,7 +642,13 @@ pub(crate) enum Command {
     Spawn {
         name: String,
         role: String,
+        mode: Option<PermissionMode>,
         task: Option<String>,
+    },
+    Review {
+        name: String,
+        focus: Option<String>,
+        next_revision: bool,
     },
     Ask {
         name: String,
@@ -616,7 +678,11 @@ pub(crate) enum Command {
     Message(String),
 }
 
-const SPAWN_USAGE: &str = "Usage: /spawn NAME ROLE [TASK]";
+const SPAWN_USAGE: &str =
+    "Usage: /spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto] [TASK]";
+const REVIEW_USAGE: &str = "Usage: /review NAME [--next-revision] [FOCUS]";
+const MODE_FLAG: &str = "--mode";
+const NEXT_REVISION_FLAG: &str = "--next-revision";
 const ASK_USAGE: &str = "Usage: /ask NAME TASK";
 const REMOVE_USAGE: &str = "Usage: /remove NAME";
 const ENTRY_USAGE: &str = "Usage: /entry PROVIDER/PROFILE or /entry auto";
@@ -673,6 +739,27 @@ fn optional(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
+fn mode_option(text: &str) -> Result<(Option<PermissionMode>, &str), String> {
+    let Some((word, rest)) = next_word(text) else {
+        return Ok((None, ""));
+    };
+    if let Some(value) = word.strip_prefix("--mode=") {
+        return Ok((Some(PermissionMode::parse(value)?), rest));
+    }
+    if word != MODE_FLAG {
+        return Ok((None, text.trim()));
+    }
+    let (value, rest) = next_word(rest).ok_or_else(|| SPAWN_USAGE.to_owned())?;
+    Ok((Some(PermissionMode::parse(value)?), rest))
+}
+
+fn flag_option<'a>(text: &'a str, flag: &str) -> (bool, &'a str) {
+    match next_word(text) {
+        Some((word, rest)) if word == flag => (true, rest),
+        _ => (false, text.trim()),
+    }
+}
+
 pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
     let input = input.trim();
     let Some((head, rest)) = next_word(input) else {
@@ -681,11 +768,22 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
     match head {
         "/spawn" => {
             let (name, rest) = next_word(rest).ok_or(SPAWN_USAGE)?;
-            let (role, task) = next_word(rest).ok_or(SPAWN_USAGE)?;
+            let (role, rest) = next_word(rest).ok_or(SPAWN_USAGE)?;
+            let (mode, task) = mode_option(rest)?;
             Ok(Command::Spawn {
                 name: name.into(),
                 role: role.into(),
+                mode,
                 task: optional(task),
+            })
+        }
+        "/review" => {
+            let (name, rest) = next_word(rest).ok_or(REVIEW_USAGE)?;
+            let (next_revision, focus) = flag_option(rest, NEXT_REVISION_FLAG);
+            Ok(Command::Review {
+                name: name.into(),
+                focus: optional(focus),
+                next_revision,
             })
         }
         "/ask" => match next_word(rest) {
@@ -870,7 +968,7 @@ pub(crate) fn summary(text: &str) -> String {
     }
 }
 
-pub(crate) const CLI_USAGE: &str = "Usage: agent-command specialist {list|spawn NAME ROLE [TASK]|status NAME|diff NAME|pr NAME [--commit]|settle NAME|unsettle NAME|remove NAME}";
+const CLI_USAGE: &str = "Usage: agent-command specialist {list|spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto] [TASK]|review NAME [--next-revision] [FOCUS]|status NAME|diff NAME|pr NAME [--commit]|settle NAME|unsettle NAME|remove NAME}";
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -914,11 +1012,12 @@ fn write_list(crew: &[Member], out: &mut impl Write) -> io::Result<()> {
         let member = &crew[index];
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             member.name,
             member.role,
             member.status.label(),
             workspace_label(member),
+            member.permission.flag(),
             branch_label(member),
             settled_label(member)
         )?;
@@ -980,15 +1079,21 @@ fn run_with(
             store.save_roster(&crew)?;
             writeln!(out, "{note}")
         }
-        ["spawn", name, role, ref task @ ..] => {
+        ["spawn", name, role, ref rest @ ..] => {
             validate_name(name, &crew).map_err(invalid)?;
-            let task = task.join(" ");
-            let topic = if task.is_empty() { role } else { task.as_str() };
-            let workspace = store.isolate(base, name, topic)?;
-            let member = Member::new(name, role, optional(&task).as_deref(), Some(workspace));
+            let rest = rest.join(" ");
+            let (mode, task) = mode_option(&rest).map_err(invalid)?;
+            let mode = mode.unwrap_or_else(|| PermissionMode::default_for_role(role));
+            let topic = if task.is_empty() { role } else { task };
+            let workspace = store
+                .isolate_for(base, name, topic, mode)
+                .map_err(invalid)?;
+            let member = Member::new(name, role, optional(task).as_deref(), Some(workspace))
+                .with_permission(Some(mode));
             writeln!(
                 out,
-                "Spawned {name} ({role}) in {}",
+                "Spawned {name} ({role}, {}) in {}",
+                mode.flag(),
                 workspace_label(&member)
             )?;
             crew.push(member);
@@ -998,9 +1103,11 @@ fn run_with(
             let member = &crew[position(&crew, name)?];
             writeln!(
                 out,
-                "{}\nrole: {}\nstatus: {}\ntask: {}\nworkspace: {}\nbranch: {}\nqueue: {}\nhistory: {} entries",
+                "{}\nrole: {}\nmode: {}\nreview: {}\nstatus: {}\ntask: {}\nworkspace: {}\nbranch: {}\nqueue: {}\nhistory: {} entries",
                 member.name,
                 member.role,
+                member.permission.flag(),
+                review_label(member),
                 member.status.label(),
                 member.mission,
                 workspace_label(member),
@@ -1013,6 +1120,10 @@ fn run_with(
             }
             Ok(())
         }
+        ["review", name, ref rest @ ..] => {
+            let index = find(&crew, name).ok_or_else(|| unknown(name))?;
+            review_from_cli(store, base, &mut crew, index, &rest.join(" "), out)
+        }
         ["remove", name] => {
             let member = crew.remove(position(&crew, name)?);
             let retained = store.release(&member)?;
@@ -1021,6 +1132,56 @@ fn run_with(
         }
         _ => Err(invalid(CLI_USAGE)),
     }
+}
+
+fn review_from_cli(
+    store: &Store,
+    base: &Path,
+    crew: &mut [Member],
+    index: usize,
+    arguments: &str,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let (next_revision, focus) = flag_option(arguments, NEXT_REVISION_FLAG);
+    let workspace = crew[index]
+        .workspace
+        .clone()
+        .ok_or_else(|| invalid(format!("{} has no isolated workspace.", crew[index].name)))?;
+    let profiles = auth::profiles(&store.root)?;
+    let signed_in = review::signed_in_providers(&profiles);
+    let plan = review::plan(
+        &mut crew[index],
+        &review::ReviewRequest {
+            focus: (!focus.is_empty()).then_some(focus),
+            next_revision,
+            signed_in: &signed_in,
+            rule_roots: &[&workspace.path, base],
+        },
+    )
+    .map_err(invalid)?;
+    store.save_roster(crew)?;
+    writeln!(
+        out,
+        "{} · round {}/{} · read-only",
+        plan.note,
+        plan.round,
+        review::MAX_REVIEW_ROUNDS
+    )?;
+    let route = review::review_route(&plan, store.catalog(), store.pins());
+    review::run_to_completion(profiles, route, workspace.path, out)
+}
+
+pub(crate) fn review_label(member: &Member) -> String {
+    format!(
+        "revision {} · round {}/{} · author {}",
+        member.review.revision,
+        member.review.rounds,
+        review::MAX_REVIEW_ROUNDS,
+        member
+            .review
+            .author
+            .map_or("unknown", |provider| provider.binary())
+    )
 }
 
 fn unknown(name: &str) -> io::Error {
@@ -1107,6 +1268,7 @@ pub(crate) mod tests {
             Command::Spawn {
                 name: "nova".into(),
                 role: "reviewer".into(),
+                mode: None,
                 task: Some("Review the patch".into())
             }
         );
@@ -1115,6 +1277,7 @@ pub(crate) mod tests {
             Command::Spawn {
                 name: "nova".into(),
                 role: "reviewer".into(),
+                mode: None,
                 task: None
             }
         );
@@ -1145,6 +1308,128 @@ pub(crate) mod tests {
         assert_eq!(parse_command("/spawn nova").unwrap_err(), SPAWN_USAGE);
         assert_eq!(parse_command("/ask nova").unwrap_err(), ASK_USAGE);
         assert_eq!(parse_command("/remove a b").unwrap_err(), REMOVE_USAGE);
+    }
+
+    #[test]
+    fn spawn_takes_an_optional_mode_and_review_takes_focus_and_next_revision() {
+        assert_eq!(
+            parse_command("/spawn bolt builder --mode worktree-auto Ship @codex it").unwrap(),
+            Command::Spawn {
+                name: "bolt".into(),
+                role: "builder".into(),
+                mode: Some(PermissionMode::WorktreeAuto),
+                task: Some("Ship @codex it".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/spawn quinn playtester --mode=read-only").unwrap(),
+            Command::Spawn {
+                name: "quinn".into(),
+                role: "playtester".into(),
+                mode: Some(PermissionMode::ReadOnly),
+                task: None
+            }
+        );
+        assert!(parse_command("/spawn x builder --mode full-access")
+            .unwrap_err()
+            .contains("Unknown permission mode full-access"));
+        assert_eq!(
+            parse_command("/spawn x builder --mode").unwrap_err(),
+            SPAWN_USAGE
+        );
+        assert_eq!(
+            parse_command("/review nova --next-revision auth flow").unwrap(),
+            Command::Review {
+                name: "nova".into(),
+                focus: Some("auth flow".into()),
+                next_revision: true
+            }
+        );
+        assert_eq!(
+            parse_command("/review nova").unwrap(),
+            Command::Review {
+                name: "nova".into(),
+                focus: None,
+                next_revision: false
+            }
+        );
+        assert_eq!(parse_command("/review").unwrap_err(), REVIEW_USAGE);
+    }
+
+    #[test]
+    fn permission_and_review_ledger_persist_and_old_rosters_use_role_defaults() {
+        let scratch = Scratch::new("ledger");
+        let store = Store::new(scratch.0.join("profiles"));
+        let mut nova = Member::new("nova", "builder", Some("Build"), None)
+            .with_permission(Some(PermissionMode::AutoAcceptEdits));
+        nova.review.record_author(auth::Provider::Claude);
+        nova.review.begin_round().unwrap();
+        store
+            .save_roster(&[Member::commander(), nova.clone()])
+            .unwrap();
+        let restored = &store.load_roster().unwrap()[0];
+        assert_eq!(restored.permission, PermissionMode::AutoAcceptEdits);
+        assert_eq!(restored.review, nova.review);
+        let roster = scratch
+            .0
+            .join("profiles")
+            .join(STATE_DIRECTORY)
+            .join(ROSTER_FILE);
+        fs::write(
+            &roster,
+            r#"{"schema":"agent-command-orchestrator-v1","specialists":[{"name":"quinn","role":"Playtester","task":"t","status":"IDLE","workspace":null}]}"#,
+        )
+        .unwrap();
+        let restored = &store.load_roster().unwrap()[0];
+        assert_eq!(restored.permission, PermissionMode::ReadOnly);
+        assert_eq!(restored.review, ReviewLedger::default());
+    }
+
+    #[test]
+    fn worktree_auto_spawns_only_into_a_git_worktree() {
+        let scratch = Scratch::new("worktree-auto");
+        let repository = scratch.0.join("repo");
+        git_repository(&repository);
+        let store = Store::new(scratch.0.join("profiles"));
+        let mut out = Vec::new();
+        run_with(
+            &store,
+            &repository,
+            &strings(&[
+                "spawn",
+                "bolt",
+                "builder",
+                "--mode",
+                "worktree-auto",
+                "Ship",
+            ]),
+            &mut out,
+        )
+        .unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Spawned bolt (builder, worktree-auto) in git worktree"));
+        let bolt = &store.load_roster().unwrap()[0];
+        assert_eq!(bolt.permission, PermissionMode::WorktreeAuto);
+        assert_eq!(bolt.mission, "Ship");
+        let plain = scratch.0.join("plain");
+        fs::create_dir(&plain).unwrap();
+        let refusal = run_with(
+            &store,
+            &plain,
+            &strings(&["spawn", "echo", "builder", "--mode=worktree-auto"]),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(refusal.to_string().contains("not an isolated git worktree"));
+        assert_eq!(store.load_roster().unwrap().len(), 1);
+        assert!(!scratch
+            .0
+            .join("profiles")
+            .join(STATE_DIRECTORY)
+            .join(DIRECTORY_FALLBACK)
+            .join("echo")
+            .exists());
     }
 
     #[test]

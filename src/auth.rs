@@ -22,7 +22,8 @@ pub(crate) enum Found {
     At(PathBuf),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Provider {
     Claude,
     Codex,
