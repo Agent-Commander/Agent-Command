@@ -14,7 +14,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-All three gates must pass before you push. CI runs them on Linux, macOS and Windows.
+All three gates must pass before you push. CI runs them on Linux, macOS and Windows; workflow rules live in [.github/CI-STANDARDS.md](.github/CI-STANDARDS.md).
 
 ## Layout
 
