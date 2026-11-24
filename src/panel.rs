@@ -27,10 +27,12 @@ pub(crate) const NO_PROVIDER_HINT: &str = "No provider connected · press F3 or 
 pub(crate) const AUTO_NAME_PLACEHOLDER: &str = "(auto from account)";
 const PANEL_MAX_WIDTH: u16 = 78;
 const PROFILE_LABEL_WIDTH: usize = 22;
-const PROFILE_ROW_CONTROLS_WIDTH: usize = 37;
+const PROFILE_ROW_CONTROLS_WIDTH: usize = 39;
 const STATUS_MAX_ROWS: usize = 3;
 const SIGNED_IN_BADGE: &str = "  ● signed in";
-const PREVIEW_BLOCKER: &str = "Connecting needs the live terminal; this is a preview.";
+pub(crate) const PREVIEW_BLOCKER: &str =
+    "Connecting or updating needs the live terminal; this is a preview.";
+pub(crate) const UPDATE_MISSION_BLOCKER: &str = "Finish the running mission before updating.";
 
 pub(crate) trait Host {
     fn found(&self, provider: Provider) -> Option<Found>;
@@ -49,7 +51,8 @@ pub(crate) trait Host {
     ) -> io::Result<Profile>;
     fn install(&mut self, plan: &Plan) -> io::Result<()>;
     fn restore(&mut self) -> io::Result<()>;
-    fn sign_out(&mut self, profile: &Profile) -> io::Result<()>;
+    fn disconnect(&mut self, profile: &Profile) -> io::Result<()>;
+    fn update(&mut self, latest: &str) -> io::Result<update::Applied>;
 }
 
 pub(crate) struct TerminalHost;
@@ -126,8 +129,12 @@ impl Host for TerminalHost {
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)
     }
 
-    fn sign_out(&mut self, profile: &Profile) -> io::Result<()> {
-        auth::succeeded(profile, auth::sign_out_quietly(profile)?)
+    fn disconnect(&mut self, profile: &Profile) -> io::Result<()> {
+        auth::disconnect(profile)
+    }
+
+    fn update(&mut self, latest: &str) -> io::Result<update::Applied> {
+        update::apply_in_app(latest)
     }
 }
 
@@ -141,9 +148,9 @@ pub(crate) enum Origin {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
     Reconnect(usize),
-    SignOut(usize),
-    ConfirmSignOut,
-    CancelSignOut,
+    Disconnect(usize),
+    ConfirmDisconnect,
+    CancelDisconnect,
     ConnectNew,
     CommanderProfile,
     CommanderMode,
@@ -213,6 +220,13 @@ pub(crate) struct ConnectForm {
     pub(crate) name: String,
     focus: usize,
     pub(crate) status: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum Subscription {
+    Found(usize),
+    Unconnected(Provider),
+    Missing(String),
 }
 
 #[derive(Debug)]
@@ -546,7 +560,7 @@ impl App {
     fn panel_actions(&self) -> Vec<Action> {
         match &self.panel {
             Some(Panel::Settings(view)) if view.confirm.is_some() => {
-                vec![Action::ConfirmSignOut, Action::CancelSignOut]
+                vec![Action::ConfirmDisconnect, Action::CancelDisconnect]
             }
             Some(Panel::Settings(view)) if view.installing.is_some() => {
                 vec![Action::ConfirmInstall, Action::CancelInstall]
@@ -554,7 +568,7 @@ impl App {
             Some(Panel::Settings(view)) => {
                 let count = self.live.as_ref().map_or(0, |live| live.profiles.len());
                 let mut actions: Vec<Action> = (0..count)
-                    .flat_map(|index| [Action::Reconnect(index), Action::SignOut(index)])
+                    .flat_map(|index| [Action::Reconnect(index), Action::Disconnect(index)])
                     .collect();
                 actions.extend(view.clis.missing().into_iter().map(Action::Install));
                 actions.extend([
@@ -645,8 +659,12 @@ impl App {
             KeyCode::Char('r' | 'R') if matches!(self.panel, Some(Panel::Connect(_))) => {
                 self.activate(Action::Recheck)
             }
-            KeyCode::Char('y' | 'Y') if self.confirming() => self.activate(Action::ConfirmSignOut),
-            KeyCode::Char('n' | 'N') if self.confirming() => self.activate(Action::CancelSignOut),
+            KeyCode::Char('y' | 'Y') if self.confirming() => {
+                self.activate(Action::ConfirmDisconnect)
+            }
+            KeyCode::Char('n' | 'N') if self.confirming() => {
+                self.activate(Action::CancelDisconnect)
+            }
             _ => {}
         }
     }
@@ -689,7 +707,7 @@ impl App {
 
     fn escape_panel(&mut self) {
         if self.confirming() {
-            return self.activate(Action::CancelSignOut);
+            return self.activate(Action::CancelDisconnect);
         }
         if self.pending_install().is_some() {
             return self.activate(Action::CancelInstall);
@@ -703,19 +721,13 @@ impl App {
     fn activate(&mut self, action: Action) {
         match action {
             Action::Reconnect(index) => self.reconnect(index),
-            Action::SignOut(index) => {
-                if let Some(Panel::Settings(view)) = &mut self.panel {
-                    view.confirm = Some(index);
-                    view.focus = 0;
-                    view.status.clear();
-                }
-            }
-            Action::ConfirmSignOut => self.confirm_sign_out(),
-            Action::CancelSignOut => {
+            Action::Disconnect(index) => self.ask_disconnect(index),
+            Action::ConfirmDisconnect => self.confirm_disconnect(),
+            Action::CancelDisconnect => {
                 if let Some(Panel::Settings(view)) = &mut self.panel {
                     view.confirm = None;
                     view.focus = 0;
-                    view.status = "Sign out cancelled.".into();
+                    view.status = "Disconnect cancelled. Nothing changed.".into();
                 }
             }
             Action::ConnectNew => self.open_connect(Origin::Settings),
@@ -980,7 +992,12 @@ impl App {
         let (outcomes, restored) = self.while_suspended(&[profile], |host, profile| {
             host.sign_in(profile).map(|()| profile.clone())
         });
-        let (_, summary) = self.summarize(&labels, outcomes, restored);
+        let (connected, summary) = self.summarize(&labels, outcomes, restored);
+        let summary = if connected {
+            summary
+        } else {
+            format!("{summary} · Disconnect removes a broken subscription.")
+        };
         self.set_panel_status(summary);
     }
 
@@ -1053,7 +1070,15 @@ impl App {
         })
     }
 
-    fn confirm_sign_out(&mut self) {
+    fn ask_disconnect(&mut self, index: usize) {
+        if let Some(Panel::Settings(view)) = &mut self.panel {
+            view.confirm = Some(index);
+            view.focus = 0;
+            view.status.clear();
+        }
+    }
+
+    fn confirm_disconnect(&mut self) {
         let Some(Panel::Settings(view)) = &mut self.panel else {
             return;
         };
@@ -1072,16 +1097,206 @@ impl App {
         else {
             return;
         };
+        let label = profile.to_string();
+        let was_commander = self.commander_override() == Some(label.clone());
         let outcome = self
             .host
             .as_mut()
             .expect("checked by connect_blocker")
-            .sign_out(&profile);
+            .disconnect(&profile);
         self.reload_profiles();
-        self.set_panel_status(match outcome {
-            Ok(()) => format!("Signed out {profile}. The profile folder is kept."),
-            Err(error) => format!("{profile}: sign-out failed: {error}"),
-        });
+        let status = match outcome {
+            Ok(()) => self.forget_profile(&label, was_commander),
+            Err(error) => format!("{label}: disconnect failed: {error}"),
+        };
+        self.set_panel_status(status);
+    }
+
+    fn commander_override(&self) -> Option<String> {
+        let live = self.live.as_ref()?;
+        live.preferred
+            .and_then(|index| live.profiles.get(index))
+            .map(ToString::to_string)
+    }
+
+    fn forget_profile(&mut self, label: &str, was_commander: bool) -> String {
+        let mut cleared = Vec::new();
+        let mut setting_changed = false;
+        for (slot, name) in [
+            (&mut self.settings.fallback_profile, "fallback profile"),
+            (&mut self.settings.text_gen_profile, "text-gen profile"),
+        ] {
+            if slot.as_deref() == Some(label) {
+                *slot = None;
+                setting_changed = true;
+                cleared.push(name);
+            }
+        }
+        let mut status = format!("Disconnected {label}. Its profile folder is removed.");
+        if was_commander {
+            cleared.push("Commander profile");
+            if let Some(Err(error)) = self.live.as_mut().map(|live| {
+                live.preferred = None;
+                live.save_override()
+            }) {
+                status.push_str(&format!(" Commander override not cleared: {error}."));
+            }
+        }
+        if !cleared.is_empty() {
+            status.push_str(&format!(" Cleared {}.", cleared.join(", ")));
+        }
+        if setting_changed {
+            if let Some(Err(error)) = self
+                .launch
+                .settings_path
+                .as_ref()
+                .map(|path| self.settings.save(path))
+            {
+                status.push_str(&format!(" Settings not saved: {error}."));
+            }
+        }
+        status
+    }
+
+    pub(crate) fn open_subscription(&mut self, index: usize, confirm: bool) {
+        self.open_settings();
+        if confirm {
+            return self.ask_disconnect(index);
+        }
+        self.focus_on(Action::Reconnect(index));
+        let label = self
+            .live
+            .as_ref()
+            .and_then(|live| live.profiles.get(index))
+            .map_or_else(String::new, ToString::to_string);
+        self.set_panel_status(format!(
+            "{label}: Reconnect signs in again; Disconnect removes it."
+        ));
+    }
+
+    fn focus_on(&mut self, action: Action) {
+        let Some(position) = self
+            .panel_actions()
+            .iter()
+            .position(|candidate| *candidate == action)
+        else {
+            return;
+        };
+        if let Some(focus) = self.focus_index() {
+            *focus = position;
+        }
+    }
+
+    pub(crate) fn find_subscription(&self, target: &str) -> Subscription {
+        let profiles = self
+            .live
+            .as_ref()
+            .map_or(&[][..], |live| live.profiles.as_slice());
+        if let Some(index) = profiles
+            .iter()
+            .position(|profile| profile.to_string() == target)
+        {
+            return Subscription::Found(index);
+        }
+        let Some(provider) = Provider::named(target) else {
+            return Subscription::Missing(format!(
+                "No subscription named {target}. Use claude, codex or PROVIDER/PROFILE."
+            ));
+        };
+        let matching: Vec<usize> = profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| profile.provider == provider)
+            .map(|(index, _)| index)
+            .collect();
+        match matching[..] {
+            [] => Subscription::Unconnected(provider),
+            [index] => Subscription::Found(index),
+            _ => Subscription::Missing(format!(
+                "{target} has {} subscriptions: {}. Name one as PROVIDER/PROFILE.",
+                matching.len(),
+                matching
+                    .iter()
+                    .map(|index| profiles[*index].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    pub(crate) fn disconnect_command(&mut self, target: Option<String>) {
+        let Some(target) = target else {
+            return self.open_settings();
+        };
+        match self.find_subscription(&target) {
+            Subscription::Found(index) => self.open_subscription(index, true),
+            Subscription::Unconnected(provider) => {
+                self.notice = format!("No {} subscription is connected.", provider.binary())
+            }
+            Subscription::Missing(reason) => self.notice = reason,
+        }
+    }
+
+    pub(crate) fn reconnect_command(&mut self, target: Option<String>) {
+        let Some(target) = target else {
+            return self.open_settings();
+        };
+        match self.find_subscription(&target) {
+            Subscription::Found(index) => {
+                self.open_settings();
+                self.focus_on(Action::Reconnect(index));
+                self.reconnect(index);
+            }
+            Subscription::Unconnected(provider) => self.open_connect_for(provider),
+            Subscription::Missing(reason) => self.notice = reason,
+        }
+    }
+
+    fn open_connect_for(&mut self, provider: Provider) {
+        self.open_connect(Origin::Direct);
+        if let Some(Panel::Connect(form)) = &mut self.panel {
+            form.chosen = [false; 2];
+        }
+        self.toggle_provider(provider);
+    }
+
+    pub(crate) fn request_update(&mut self) {
+        let Some(latest) = self.update_available.clone() else {
+            self.notice = format!(
+                "Agent Command {} is up to date, or no newer release has been found yet.",
+                update::CURRENT
+            );
+            return;
+        };
+        if let Some(blocker) = self.update_blocker() {
+            self.notice = blocker.into();
+            return;
+        }
+        let host = self.host.as_mut().expect("checked by update_blocker");
+        match host.suspend().and_then(|()| host.update(&latest)) {
+            Ok(applied) => {
+                self.exit_message = Some(update::finished_message(&latest, applied));
+                self.quit = true;
+            }
+            Err(error) => {
+                let restored = host.restore();
+                self.full_redraw = true;
+                self.notice = format!(
+                    "Update to {latest} failed: {error}. Click Update or press F6 to retry."
+                );
+                if let Err(error) = restored {
+                    self.notice
+                        .push_str(&format!(" · Terminal restore failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn update_blocker(&self) -> Option<&'static str> {
+        if self.host.is_none() || self.live.is_none() {
+            return Some(PREVIEW_BLOCKER);
+        }
+        self.mission_running().then_some(UPDATE_MISSION_BLOCKER)
     }
 
     fn toggle_update_check(&mut self) {
@@ -1145,7 +1360,7 @@ impl App {
     }
 
     fn settings_rows(&self, view: &SettingsView, width: usize) -> Vec<Row> {
-        let mut rows: Vec<Row> = vec![vec![text("PROVIDERS", Tone::Heading)]];
+        let mut rows: Vec<Row> = vec![vec![text("SUBSCRIPTIONS", Tone::Heading)]];
         if let Some(provider) = view.installing {
             rows.extend(install_prompt(provider, width));
             return rows;
@@ -1178,7 +1393,7 @@ impl App {
                         },
                         button("Reconnect", Action::Reconnect(index)),
                         text(" ", Tone::Plain),
-                        button("Sign out", Action::SignOut(index)),
+                        button("Disconnect", Action::Disconnect(index)),
                     ]);
                 }
             }
@@ -1204,16 +1419,16 @@ impl App {
                 .and_then(|live| live.profiles.get(index))
                 .map_or_else(String::new, ToString::to_string);
             rows.push(vec![text(
-                format!("Sign out {label}? The profile folder is kept."),
+                format!("Disconnect {label}? Its sign-in and profile folder are removed."),
                 Tone::Warn,
             )]);
             rows.push(vec![
-                button("Y Confirm sign out", Action::ConfirmSignOut),
+                button("Y Confirm disconnect", Action::ConfirmDisconnect),
                 text("  ", Tone::Plain),
-                button("N Cancel", Action::CancelSignOut),
+                button("N Cancel", Action::CancelDisconnect),
             ]);
         }
-        rows.push(vec![button("+ Connect new profile", Action::ConnectNew)]);
+        rows.push(vec![button("+ Connect subscription", Action::ConnectNew)]);
         rows.push(vec![]);
         rows.push(vec![
             text("Commander profile    ", Tone::Plain),

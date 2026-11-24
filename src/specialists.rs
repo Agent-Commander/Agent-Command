@@ -678,6 +678,13 @@ pub(crate) enum Command {
     SettledDrawer,
     Settings,
     Connect,
+    Update,
+    Disconnect {
+        target: Option<String>,
+    },
+    Reconnect {
+        target: Option<String>,
+    },
     Side {
         question: String,
     },
@@ -704,6 +711,9 @@ const GOAL_USAGE: &str = "Usage: /goal CRITERIA or /goal cancel";
 const DIFF_USAGE: &str = "Usage: /diff [NAME]";
 const PR_USAGE: &str = "Usage: /pr [NAME] [--commit]";
 const SETTLE_USAGE: &str = "Usage: /settle NAME or /unsettle NAME";
+pub(crate) const UPDATE_USAGE: &str = "Usage: /update";
+pub(crate) const DISCONNECT_USAGE: &str = "Usage: /disconnect [claude|codex|PROVIDER/PROFILE]";
+pub(crate) const RECONNECT_USAGE: &str = "Usage: /reconnect [claude|codex|PROVIDER/PROFILE]";
 pub(crate) const COMMIT_FLAG: &str = "--commit";
 
 fn optional_name(rest: &str, usage: &str) -> Result<Option<String>, String> {
@@ -811,6 +821,14 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
         "/roster" => Ok(Command::Roster),
         "/settings" => Ok(Command::Settings),
         "/connect" => Ok(Command::Connect),
+        "/update" if rest.is_empty() => Ok(Command::Update),
+        "/update" => Err(UPDATE_USAGE.into()),
+        "/disconnect" => Ok(Command::Disconnect {
+            target: optional_name(rest, DISCONNECT_USAGE)?,
+        }),
+        "/reconnect" => Ok(Command::Reconnect {
+            target: optional_name(rest, RECONNECT_USAGE)?,
+        }),
         "/btw" | "/side" if !rest.is_empty() => Ok(Command::Side {
             question: rest.into(),
         }),
@@ -1661,6 +1679,40 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!workspace.path.exists());
         assert!(run_with(&store, &base, &strings(&["bogus"]), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn parses_update_disconnect_and_reconnect_commands() {
+        assert_eq!(parse_command("/update").unwrap(), Command::Update);
+        assert_eq!(parse_command("/update now").unwrap_err(), UPDATE_USAGE);
+        assert_eq!(
+            parse_command("/disconnect").unwrap(),
+            Command::Disconnect { target: None }
+        );
+        assert_eq!(
+            parse_command("/disconnect codex/main").unwrap(),
+            Command::Disconnect {
+                target: Some("codex/main".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/disconnect a b").unwrap_err(),
+            DISCONNECT_USAGE
+        );
+        assert_eq!(
+            parse_command("/reconnect").unwrap(),
+            Command::Reconnect { target: None }
+        );
+        assert_eq!(
+            parse_command(" /reconnect  claude ").unwrap(),
+            Command::Reconnect {
+                target: Some("claude".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/reconnect claude extra").unwrap_err(),
+            RECONNECT_USAGE
+        );
     }
 
     #[test]

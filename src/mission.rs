@@ -89,6 +89,16 @@ impl Route {
 }
 
 impl Mission {
+    #[cfg(all(test, unix))]
+    pub(crate) fn held() -> (Self, std::sync::mpsc::Sender<Event>) {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mission = Self {
+            events,
+            cancel: Arc::default(),
+        };
+        (mission, sender)
+    }
+
     pub(crate) fn launch(profiles: Vec<Profile>, route: Route, workspace: PathBuf) -> Self {
         Self::launch_with_clock(profiles, route, workspace, usage::now)
     }

@@ -161,7 +161,10 @@ fn deck_mode(area: Rect, compact_layout: bool) -> token_burn::DeckMode {
 
 const COMPACT_DECK_MAX_ROWS: usize = 3;
 const FULL_DECK_MAX_CARDS: usize = 3;
-const UPDATE_DISMISS_HINT: &str = " ✕ F6 ";
+const UPDATE_WIDE_MIN_WIDTH: u16 = 100;
+const ABANDON_LABEL: &str = "  F4 Abandon  ";
+const SHORTCUTS: &str =
+    " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed    F7 Settled";
 
 fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
     request.units = request.units.iter().map(|unit| frame(unit)).collect();
@@ -587,8 +590,10 @@ pub struct App {
     touch_clock: u64,
     pub deck_palette: token_burn::TokenBurnPalette,
     update_receiver: Option<Receiver<String>>,
-    pub update_banner: Option<String>,
+    pub update_available: Option<String>,
     pub update_area: Rect,
+    exit_message: Option<String>,
+    deck_hits: Vec<(usize, Rect)>,
     pub settings_area: Rect,
     pub full_redraw: bool,
     panel: Option<panel::Panel>,
@@ -629,8 +634,10 @@ impl Default for App {
             touch_clock: 0,
             deck_palette: token_burn::TokenBurnPalette::default(),
             update_receiver: None,
-            update_banner: None,
+            update_available: None,
             update_area: Rect::default(),
+            exit_message: None,
+            deck_hits: Vec::new(),
             settings_area: Rect::default(),
             full_redraw: false,
             panel: None,
@@ -1349,7 +1356,7 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(latest) => {
-                self.update_banner = Some(update::one_line_notice(&latest));
+                self.update_available = Some(latest);
                 self.update_receiver = None;
             }
             Err(TryRecvError::Disconnected) => self.update_receiver = None,
@@ -1357,9 +1364,15 @@ impl App {
         }
     }
 
-    pub fn dismiss_update(&mut self) {
-        self.update_banner = None;
-        self.update_area = Rect::default();
+    fn deck_card_at(&self, point: ratatui::layout::Position) -> Option<usize> {
+        self.deck_hits
+            .iter()
+            .find(|(_, area)| area.contains(point))
+            .map(|(index, _)| *index)
+    }
+
+    pub fn take_exit_message(&mut self) -> Option<String> {
+        self.exit_message.take()
     }
 
     fn push_log(&mut self, text: String) {
@@ -1452,6 +1465,9 @@ impl App {
             specialists::Command::SettledDrawer => self.toggle_settled_drawer(),
             specialists::Command::Settings => self.open_settings(),
             specialists::Command::Connect => self.open_connect(panel::Origin::Direct),
+            specialists::Command::Update => self.request_update(),
+            specialists::Command::Disconnect { target } => self.disconnect_command(target),
+            specialists::Command::Reconnect { target } => self.reconnect_command(target),
             specialists::Command::Side { question } => self.ask_side(&question),
             specialists::Command::Goal { criteria } => self.start_goal(&criteria),
             specialists::Command::GoalCancel => self.cancel_goal(),
@@ -1761,7 +1777,7 @@ impl App {
             KeyCode::F(2) => self.select_profile(),
             KeyCode::F(3) => self.open_settings(),
             KeyCode::F(4) => self.abandon_continuation(),
-            KeyCode::F(6) => self.dismiss_update(),
+            KeyCode::F(6) => self.request_update(),
             KeyCode::F(7) => self.toggle_settled_drawer(),
             KeyCode::Tab => self.editing = !self.editing,
             KeyCode::Esc => self.editing = false,
@@ -1784,7 +1800,9 @@ impl App {
         } else if self.settings_area.contains(point) {
             self.open_settings();
         } else if self.update_area.contains(point) {
-            self.dismiss_update();
+            self.request_update();
+        } else if let Some(index) = self.deck_card_at(point) {
+            self.open_subscription(index, false);
         } else if self
             .live
             .as_ref()
@@ -1970,7 +1988,7 @@ impl App {
         };
         self.draw_menu_bar(f, a);
         let compact = a.height < 36 || a.width < 105;
-        let banner_rows = self.draw_update_banner(f, a);
+        self.deck_hits.clear();
         let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
         let mode = deck_mode(a, compact);
         let deck_rows = match mode {
@@ -1991,16 +2009,11 @@ impl App {
             token_burn::DeckMode::Full => 0,
             token_burn::DeckMode::Compact => {
                 let rows = cards.len().min(COMPACT_DECK_MAX_ROWS) as u16;
-                self.draw_deck(
-                    f,
-                    &cards,
-                    mode,
-                    r(1, 1 + banner_rows, a.width.saturating_sub(2), rows),
-                );
+                self.draw_deck(f, &cards, mode, r(1, 1, a.width.saturating_sub(2), rows));
                 rows
             }
         };
-        let top_shift = (banner_rows + deck_rows).saturating_sub(1);
+        let top_shift = deck_rows.saturating_sub(1);
         if !compact && cards.is_empty() {
             let banner = if a.width >= 105 {
                 banner()
@@ -2367,28 +2380,7 @@ impl App {
             .style(Style::default().fg(color("a1adb8"))),
             r(0, a.height.saturating_sub(2), a.width, 1),
         );
-        let shortcuts = r(0, a.height.saturating_sub(1), a.width, 1);
-        let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
-        f.render_widget(
-            Paragraph::new(
-                " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed    F7 Settled",
-            )
-            .style(style),
-            shortcuts,
-        );
-        if let Some(live) = &mut self.live {
-            live.abandon_area = if pending {
-                r(a.width.saturating_sub(14), shortcuts.y, 14, 1)
-            } else {
-                Rect::default()
-            };
-            if pending {
-                f.render_widget(
-                    Paragraph::new("  F4 Abandon  ").style(style),
-                    live.abandon_area,
-                );
-            }
-        }
+        self.draw_shortcut_bar(f, r(0, a.height.saturating_sub(1), a.width, 1), pending);
         self.draw_panel(f, a);
     }
 }
@@ -2458,26 +2450,47 @@ impl App {
         );
     }
 
-    fn draw_update_banner(&mut self, f: &mut Frame, area: Rect) -> u16 {
-        let Some(text) = &self.update_banner else {
-            self.update_area = Rect::default();
-            return 0;
+    fn draw_shortcut_bar(&mut self, f: &mut Frame, bar: Rect, pending: bool) {
+        let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
+        f.render_widget(Block::default().style(style), bar);
+        let abandon_width = if pending && self.live.is_some() {
+            text_width(ABANDON_LABEL)
+        } else {
+            0
         };
-        self.update_area = Rect::new(area.x, area.y + 1, area.width, 1).intersection(area);
+        let abandon_area = right_of(bar, bar.right(), abandon_width);
+        let update_label = self
+            .update_available
+            .as_deref()
+            .map(|latest| update_label(latest, bar.width));
+        let update_width = update_label.as_deref().map_or(0, text_width);
+        self.update_area = right_of(bar, abandon_area.x, update_width);
+        let shortcuts_width = self.update_area.x.saturating_sub(bar.x);
         f.render_widget(
-            Paragraph::new(format!("{UPDATE_DISMISS_HINT} {text}")).style(
-                Style::default()
-                    .fg(color("1b2027"))
-                    .bg(color(&self.theme.amber))
-                    .bold(),
-            ),
-            self.update_area,
+            Paragraph::new(clipped(SHORTCUTS, usize::from(shortcuts_width))).style(style),
+            Rect::new(bar.x, bar.y, shortcuts_width, bar.height),
         );
-        1
+        if let Some(label) = update_label {
+            f.render_widget(
+                Paragraph::new(label).style(
+                    Style::default()
+                        .fg(color("1b2027"))
+                        .bg(color(&self.theme.amber))
+                        .bold(),
+                ),
+                self.update_area,
+            );
+        }
+        if let Some(live) = &mut self.live {
+            live.abandon_area = abandon_area;
+            if abandon_width > 0 {
+                f.render_widget(Paragraph::new(ABANDON_LABEL).style(style), abandon_area);
+            }
+        }
     }
 
     fn draw_deck(
-        &self,
+        &mut self,
         f: &mut Frame,
         cards: &[token_burn::AccountCard],
         mode: token_burn::DeckMode,
@@ -2485,12 +2498,19 @@ impl App {
     ) {
         if mode == token_burn::DeckMode::Compact {
             token_burn::render_deck_as(mode, cards, area, f.buffer_mut(), &self.deck_palette);
+            self.deck_hits = (0..cards.len().min(usize::from(area.height)))
+                .map(|index| {
+                    let row = Rect::new(area.x, area.y + index as u16, area.width, 1);
+                    (index, row)
+                })
+                .collect();
             return;
         }
         let shown = &cards[..cards.len().min(FULL_DECK_MAX_CARDS)];
         let columns = Layout::horizontal(vec![Constraint::Fill(1); shown.len()])
             .spacing(1)
             .split(area);
+        self.deck_hits = columns.iter().copied().enumerate().collect();
         for (card, column) in shown.iter().zip(columns.iter()) {
             token_burn::render_deck_as(
                 mode,
@@ -2500,6 +2520,31 @@ impl App {
                 &self.deck_palette,
             );
         }
+    }
+}
+
+fn text_width(text: &str) -> u16 {
+    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
+}
+
+fn right_of(bar: Rect, right: u16, width: u16) -> Rect {
+    let width = width.min(right.saturating_sub(bar.x));
+    Rect::new(right - width, bar.y, width, bar.height)
+}
+
+fn clipped(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.into();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+fn update_label(latest: &str, bar_width: u16) -> String {
+    if bar_width >= UPDATE_WIDE_MIN_WIDTH {
+        format!(" Update v{latest} ")
+    } else {
+        " Update ".into()
     }
 }
 
@@ -3724,33 +3769,35 @@ esac
     }
 
     #[test]
-    fn update_banner_appears_from_an_injected_receiver_and_dismisses() {
-        for (index, (width, height)) in SIZES.into_iter().enumerate() {
+    fn update_button_appears_bottom_right_from_an_injected_receiver() {
+        for (width, height) in SIZES {
             let mut app = App::default();
             let (sender, receiver) = std::sync::mpsc::channel();
             app.watch_updates(Some(receiver));
             app.poll_update();
-            assert!(app.update_banner.is_none());
+            assert!(app.update_available.is_none());
+            let buffer = screen(&mut app, width, height);
+            assert!(!row(&buffer, height - 1).contains("Update"));
+            assert_eq!(app.update_area.width, 0);
+            let crew_before = app.crew_area;
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
+            assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
             let buffer = screen(&mut app, width, height);
-            let banner = row(&buffer, 1);
-            assert!(banner.starts_with(UPDATE_DISMISS_HINT), "{banner}");
-            assert!(
-                banner.contains("Agent Command 9.9.9 is available"),
-                "{banner}"
-            );
-            assert!(app.input_area.bottom() <= height);
-            assert!(region(&buffer, app.crew_area).contains("Commander"));
-            if index == 0 {
-                app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
-            } else {
-                let banner = app.update_area;
-                click_center(&mut app, banner);
-            }
-            assert!(app.update_banner.is_none());
-            let buffer = screen(&mut app, width, height);
+            let bar = row(&buffer, height - 1);
+            assert!(bar.ends_with(&update_label("9.9.9", width)), "{bar}");
             assert!(!row(&buffer, 1).contains("9.9.9"));
+            assert_eq!(app.crew_area, crew_before);
+            assert_eq!(app.update_area.right(), width);
+            assert!(region(&buffer, app.update_area).contains("Update"));
+            app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+            let keyboard = app.notice.clone();
+            app.notice.clear();
+            let button = app.update_area;
+            click_center(&mut app, button);
+            assert_eq!(app.notice, keyboard);
+            assert_eq!(app.notice, panel::PREVIEW_BLOCKER);
+            assert!(app.update_available.is_some() && !app.quit);
             drop(sender);
             app.poll_update();
             assert!(app.update_receiver.is_none());
@@ -3760,7 +3807,19 @@ esac
         app.watch_updates(Some(receiver));
         drop(sender);
         app.poll_update();
-        assert!(app.update_receiver.is_none() && app.update_banner.is_none());
+        assert!(app.update_receiver.is_none() && app.update_available.is_none());
+    }
+
+    #[test]
+    fn shortcut_text_is_clipped_before_the_right_side_buttons() {
+        assert_eq!(clipped("abcdef", 6), "abcdef");
+        assert_eq!(clipped("abcdef", 4), "abc…");
+        assert_eq!(clipped("abcdef", 0), "…");
+        assert_eq!(update_label("1.2.3", 80), " Update ");
+        assert_eq!(update_label("1.2.3", 120), " Update v1.2.3 ");
+        let bar = Rect::new(0, 23, 10, 1);
+        assert_eq!(right_of(bar, 10, 4), Rect::new(6, 23, 4, 1));
+        assert_eq!(right_of(bar, 3, 8), Rect::new(0, 23, 3, 1));
     }
 
     #[cfg(unix)]

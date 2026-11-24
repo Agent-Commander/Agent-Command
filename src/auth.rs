@@ -515,6 +515,39 @@ pub(crate) fn sign_out_quietly(profile: &Profile) -> io::Result<ExitStatus> {
     session(profile, "logout", Stdio::null)
 }
 
+pub(crate) fn disconnect(profile: &Profile) -> io::Result<()> {
+    let directory = profile.removable_directory()?;
+    let _ = sign_out_quietly(profile);
+    fs::remove_dir_all(&directory)
+}
+
+impl Profile {
+    fn removable_directory(&self) -> io::Result<PathBuf> {
+        validate_name(&self.name).map_err(invalid)?;
+        let parent = self.root.join(self.provider.binary());
+        let directory = parent.join(&self.name);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("No {self} profile to disconnect"),
+                ))
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() {
+            return Err(invalid("A profile must be a real directory, not a link"));
+        }
+        let inside = fs::canonicalize(&directory)?.parent() == Some(&fs::canonicalize(&parent)?);
+        if inside {
+            Ok(directory)
+        } else {
+            Err(invalid("A profile must stay inside the profile root"))
+        }
+    }
+}
+
 pub(crate) fn succeeded(profile: &Profile, status: ExitStatus) -> io::Result<()> {
     if status.success() {
         Ok(())
@@ -703,7 +736,7 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
             .first()
             .is_none_or(|value| value == "--help" || value == "-h")
     {
-        println!("agent-command auth list\nagent-command auth login {{claude|codex}} [PROFILE]\nagent-command auth {{status|logout|run}} {{claude|codex}} PROFILE [-- CLI_ARGS...]\nWithout PROFILE, login names the profile from the signed-in account's email or name.");
+        println!("agent-command auth list\nagent-command auth login {{claude|codex}} [PROFILE]\nagent-command auth {{status|logout|run}} {{claude|codex}} PROFILE [-- CLI_ARGS...]\nagent-command auth disconnect {{claude|codex}} PROFILE\nWithout PROFILE, login names the profile from the signed-in account's email or name.\nlogout signs out and keeps the profile folder; disconnect signs out if it can and removes the profile folder.");
         return Ok(());
     }
     let root = root()?;
@@ -737,6 +770,11 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         ("login", []) => {
             let profile = connect(&profile.root, provider, Some(name))?;
             println!("{profile} is signed in");
+            return Ok(());
+        }
+        ("disconnect", []) => {
+            disconnect(&profile)?;
+            println!("Disconnected {profile}. Its profile folder is removed.");
             return Ok(());
         }
         ("logout", []) => sign_out(&profile)?,
@@ -1021,10 +1059,123 @@ mod tests {
         );
     }
 
+    fn absent_provider(root: &Path, provider: Provider, name: &str) -> Profile {
+        let profile = Profile::new(root.into(), provider, name)
+            .unwrap()
+            .without_provider();
+        profile.prepare().unwrap();
+        profile
+    }
+
+    #[test]
+    fn disconnect_removes_a_broken_profile_and_keeps_its_siblings() {
+        let scratch = Scratch::new("disconnect-broken");
+        let root = scratch.0.join("profiles");
+        let broken = absent_provider(&root, Provider::Codex, "main");
+        absent_provider(&root, Provider::Codex, "work");
+        absent_provider(&root, Provider::Claude, "main");
+        fs::write(broken.directory(false).unwrap().join("auth.json"), "{}").unwrap();
+        assert!(!broken.signed_in());
+        disconnect(&broken).unwrap();
+        assert!(!root.join("codex/main").exists());
+        assert!(root.join("codex/work").is_dir());
+        assert!(root.join("claude/main").is_dir());
+        let listed: Vec<String> = profiles(&root)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(listed, ["claude/main", "codex/work"]);
+        let again = disconnect(&broken).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn disconnect_refuses_names_that_leave_the_profile_root() {
+        let scratch = Scratch::new("disconnect-traversal");
+        let root = scratch.0.join("profiles");
+        absent_provider(&root, Provider::Claude, "main");
+        let outside = scratch.directory("outside");
+        fs::write(outside.join("keep"), "").unwrap();
+        for name in ["../../outside", "..", "", "claude/../../outside"] {
+            let escaping = Profile {
+                name: name.into(),
+                ..Profile::new(root.clone(), Provider::Claude, "main").unwrap()
+            };
+            assert!(disconnect(&escaping).is_err(), "{name:?}");
+        }
+        assert!(outside.join("keep").exists());
+        assert!(root.join("claude/main").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_refuses_a_linked_profile_and_keeps_its_target() {
+        let scratch = Scratch::new("disconnect-link");
+        let root = scratch.0.join("profiles");
+        absent_provider(&root, Provider::Claude, "main");
+        let outside = scratch.directory("outside");
+        std::os::unix::fs::symlink(&outside, root.join("claude/linked")).unwrap();
+        let linked = Profile::new(root.clone(), Provider::Claude, "linked").unwrap();
+        assert!(disconnect(&linked).is_err());
+        assert!(outside.is_dir());
+    }
+
     #[cfg(unix)]
     mod enrollment {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn disconnect_signs_out_a_healthy_profile_then_removes_it() {
+            let scratch = Scratch::new("disconnect-healthy");
+            let log = scratch.0.join("logout.log");
+            let claude = fake_claude(
+                &scratch,
+                "claude",
+                "touch \"$dir/signed-in\"",
+                CLAUDE_EMAIL_STATUS,
+            );
+            let template = template(&scratch, Provider::Claude, claude);
+            let profile = enroll(&template, None, Stdio::null).unwrap();
+            assert!(profile.signed_in());
+            let logging = script(
+                &scratch,
+                "claude-logout",
+                &format!("echo \"$*\" >> '{}'\n", log.display()),
+            );
+            let profile = Profile {
+                executable: Some(logging),
+                ..profile
+            };
+            disconnect(&profile).unwrap();
+            assert_eq!(fs::read_to_string(&log).unwrap(), "auth logout\n");
+            assert!(entries(&scratch, Provider::Claude).is_empty());
+        }
+
+        #[test]
+        fn disconnect_still_removes_a_profile_whose_logout_is_refused() {
+            let scratch = Scratch::new("disconnect-refused");
+            let codex = fake_codex(&scratch, EMAIL_CLAIMS);
+            let profile = enroll(
+                &template(&scratch, Provider::Codex, codex),
+                None,
+                Stdio::null,
+            )
+            .unwrap();
+            let refusing = script(
+                &scratch,
+                "codex-refused",
+                "echo 'sign-in refused' >&2\nexit 1\n",
+            );
+            let profile = Profile {
+                executable: Some(refusing),
+                ..profile
+            };
+            assert!(!profile.signed_in());
+            disconnect(&profile).unwrap();
+            assert!(entries(&scratch, Provider::Codex).is_empty());
+        }
 
         const CLAUDE_EMAIL_STATUS: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","email":"Pilot@Example.test","orgName":"Example Org"}"#;
         const CLAUDE_ORG_STATUS: &str =
