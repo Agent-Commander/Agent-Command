@@ -425,7 +425,7 @@ mod tests {
     fn redaction_removes_tokens_and_keeps_ordinary_text() {
         let sample = "key sk-ant-api03-abcdefghijklmnop and Authorization: Bearer abc.def.ghi \
             ghp_0123456789abcdefghij jwt eyJhbGciOiJIUzI1NiJ9.e30.sig opaque \
-            0123456789abcdefABCDEF0123456789abcd version 0.2.0 claude/main TERM=xterm-256color";
+            0123456789abcdefABCDEF0123456789abcd version 0.2.0 claude/main codex/pilot@example.test TERM=xterm-256color";
         let redacted = redact(sample);
         for secret in [
             "sk-ant-api03-abcdefghijklmnop",
@@ -439,6 +439,7 @@ mod tests {
         for kept in [
             "version 0.2.0",
             "claude/main",
+            "codex/pilot@example.test",
             "TERM=xterm-256color",
             "Bearer ",
         ] {

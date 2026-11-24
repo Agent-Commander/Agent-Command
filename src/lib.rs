@@ -685,6 +685,7 @@ impl App {
                 }
             }
         }
+        self.crew[0].permission = self.settings.commander_permission;
         self.launch = launch;
         self.host = Some(host);
         self.refresh_sign_in();
@@ -1454,6 +1455,7 @@ impl App {
             specialists::Command::Side { question } => self.ask_side(&question),
             specialists::Command::Goal { criteria } => self.start_goal(&criteria),
             specialists::Command::GoalCancel => self.cancel_goal(),
+            specialists::Command::Mode { mode } => self.set_commander_mode(mode),
             specialists::Command::Message(text) => self.message_commander(text),
         }
     }
@@ -1632,8 +1634,22 @@ impl App {
         };
     }
 
+    pub(crate) fn set_commander_mode(&mut self, mode: permissions::PermissionMode) {
+        self.settings.commander_permission = mode;
+        self.crew[0].permission = mode;
+        let change = format!("Commander permissions: {}", mode.flag());
+        self.notice = match &self.launch.settings_path {
+            Some(path) => match self.settings.save(path) {
+                Ok(()) => format!("{change} (saved)."),
+                Err(error) => format!("{change} · not saved: {error}"),
+            },
+            None => format!("{change} (no config directory; not saved)."),
+        };
+    }
+
     fn message_commander(&mut self, command: String) {
         let limits = self.limit_policy();
+        let commander_mode = self.settings.commander_permission;
         let Some(live) = &mut self.live else {
             self.crew[0].mission = command.clone();
             self.push_log(format!("YOU  {command}"));
@@ -1677,6 +1693,10 @@ impl App {
                 return;
             }
         };
+        if let Err(refusal) = commander_mode.require_isolation(None) {
+            self.notice = format!("{refusal} {}", permissions::COMMANDER_MODE_USAGE);
+            return;
+        }
         let request = match routing::parse(&targeted.text) {
             Ok(request) => framed(request, |unit| {
                 specialists::commander_prompt(self.log.iter().map(String::as_str), &self.crew, unit)
@@ -1689,12 +1709,7 @@ impl App {
         self.notice = format!("Routing in {}", live.workspace.display());
         let mission = mission::Mission::launch(
             live.profiles.clone(),
-            live.route(
-                request,
-                targeted.target,
-                permissions::PermissionMode::Supervised,
-                limits,
-            ),
+            live.route(request, targeted.target, commander_mode, limits),
             live.workspace.clone(),
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
@@ -1827,6 +1842,9 @@ impl App {
             vec![
                 Line::raw("ENTRY MODEL"),
                 Line::raw(entry),
+                Line::raw(""),
+                Line::raw("PERMISSIONS"),
+                Line::raw(self.settings.commander_permission.flag()),
                 Line::raw(""),
                 Line::raw("SPECIALISTS"),
                 Line::raw(format!("{} on roster", self.crew.len() - 1)),
@@ -3061,7 +3079,7 @@ while test ! -f release; do sleep 0.01; done
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
             assert_eq!(
                 fs::read_to_string(fixture.root.join("arguments")).unwrap(),
-                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --\n"
+                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit --\n"
             );
             fs::write(state.join(native::PINS_FILE), b"{\"schema\":\"agent-command-native-pins-v1\",\"pins\":[{\"profile\":\"claude/alpha\",\"model\":\"opus\",\"effort\":null}]}").unwrap();
             let mut reopened = test_live(

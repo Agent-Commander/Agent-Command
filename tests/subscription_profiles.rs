@@ -21,14 +21,14 @@ claude)
 codex)
     dir="$CODEX_HOME"
     test -z "$CLAUDE_CONFIG_DIR" || exit 73
-    test "$2" = 'cli_auth_credentials_store="file"' || exit 74
-    test "$4" = 'forced_login_method="chatgpt"' || exit 75
+    test "$2" = "cli_auth_credentials_store='file'" || exit 74
+    test "$4" = "forced_login_method='chatgpt'" || exit 75
     shift 4
     ;;
 esac
 case "$1 $2" in
     'login status') test -f "$dir/signed-in" && echo 'Logged in using ChatGPT' >&2 ;;
-    'status --json') test -f "$dir/signed-in" && echo '{"loggedIn":true,"authMethod":"claude.ai"}' ;;
+    'status --json') test -f "$dir/signed-in" && echo '{"loggedIn":true,"authMethod":"claude.ai","email":"Pilot@Example.test"}' ;;
     'login '| 'login --claudeai') touch "$dir/signed-in" ;;
     'logout ') rm "$dir/signed-in" ;;
     '--help ') printf '%s\n' 'provider help' ;;
@@ -82,9 +82,21 @@ esac
             .status
             .success());
     }
+    let automatic = command(&["auth", "login", "claude"]);
+    assert!(automatic.status.success());
+    assert_eq!(
+        automatic.stdout,
+        b"claude/pilot@example.test is signed in\n"
+    );
+    let fallback = command(&["auth", "login", "codex"]);
+    assert!(fallback.status.success());
+    assert_eq!(fallback.stdout, b"codex/main is signed in\n");
+    assert!(command(&["auth", "status", "claude", "pilot@example.test"])
+        .status
+        .success());
     assert_eq!(
         command(&["auth", "list"]).stdout,
-        b"claude alpha\nclaude beta\ncodex alpha\ncodex beta\n"
+        b"claude alpha\nclaude beta\nclaude pilot@example.test\ncodex alpha\ncodex beta\ncodex main\n"
     );
     assert!(!workspace.join("default-claude").exists());
     assert!(!workspace.join("default-codex").exists());

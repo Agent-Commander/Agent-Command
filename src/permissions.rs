@@ -10,9 +10,13 @@ pub(crate) enum PermissionMode {
     Supervised,
     AutoAcceptEdits,
     WorktreeAuto,
+    WorkspaceAuto,
 }
 
-pub(crate) const MODE_USAGE: &str = "--mode read-only|supervised|auto-edits|worktree-auto";
+pub(crate) const MODE_USAGE: &str =
+    "--mode read-only|supervised|auto-edits|worktree-auto|workspace-auto";
+pub(crate) const COMMANDER_MODE_USAGE: &str =
+    "Usage: /mode read-only|supervised|auto-edits|workspace-auto";
 
 pub(crate) const FORBIDDEN_FLAGS: [&str; 3] = [
     "--dangerously-skip-permissions",
@@ -36,12 +40,22 @@ const CLAUDE_STREAM_ARGUMENTS: [&str; 6] = [
 const END_OF_OPTIONS: &str = "--";
 
 impl PermissionMode {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::ReadOnly,
         Self::Supervised,
         Self::AutoAcceptEdits,
         Self::WorktreeAuto,
+        Self::WorkspaceAuto,
     ];
+
+    pub(crate) const COMMANDER: [Self; 4] = [
+        Self::ReadOnly,
+        Self::Supervised,
+        Self::AutoAcceptEdits,
+        Self::WorkspaceAuto,
+    ];
+
+    pub(crate) const COMMANDER_DEFAULT: Self = Self::WorkspaceAuto;
 
     pub(crate) fn flag(self) -> &'static str {
         match self {
@@ -49,7 +63,21 @@ impl PermissionMode {
             Self::Supervised => "supervised",
             Self::AutoAcceptEdits => "auto-edits",
             Self::WorktreeAuto => "worktree-auto",
+            Self::WorkspaceAuto => "workspace-auto",
         }
+    }
+
+    pub(crate) fn parse_commander(text: &str) -> Result<Self, String> {
+        Self::COMMANDER
+            .into_iter()
+            .find(|mode| mode.flag().eq_ignore_ascii_case(text))
+            .ok_or_else(|| format!("Commander cannot use {text}. {COMMANDER_MODE_USAGE}"))
+    }
+
+    pub(crate) fn next_commander(self) -> Self {
+        let position = Self::COMMANDER.iter().position(|mode| *mode == self);
+        let next = position.map_or(0, |index| (index + 1) % Self::COMMANDER.len());
+        Self::COMMANDER[next]
     }
 
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
@@ -91,7 +119,7 @@ impl PermissionMode {
             ],
             Self::Supervised => vec!["--permission-mode", "default"],
             Self::AutoAcceptEdits => vec!["--permission-mode", "acceptEdits"],
-            Self::WorktreeAuto => vec![
+            Self::WorktreeAuto | Self::WorkspaceAuto => vec![
                 "--permission-mode",
                 "acceptEdits",
                 "--allowedTools",
@@ -103,7 +131,9 @@ impl PermissionMode {
     fn codex_sandbox(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
-            Self::Supervised | Self::AutoAcceptEdits | Self::WorktreeAuto => "workspace-write",
+            Self::Supervised | Self::AutoAcceptEdits | Self::WorktreeAuto | Self::WorkspaceAuto => {
+                "workspace-write"
+            }
         }
     }
 }
@@ -168,12 +198,14 @@ mod tests {
             joined(Provider::Claude, PermissionMode::AutoAcceptEdits),
             format!("{stream} --permission-mode acceptEdits --")
         );
-        assert_eq!(
-            joined(Provider::Claude, PermissionMode::WorktreeAuto),
-            format!(
-                "{stream} --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit --"
-            )
-        );
+        for mode in [PermissionMode::WorktreeAuto, PermissionMode::WorkspaceAuto] {
+            assert_eq!(
+                joined(Provider::Claude, mode),
+                format!(
+                    "{stream} --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit --"
+                )
+            );
+        }
     }
 
     #[test]
@@ -189,6 +221,7 @@ mod tests {
             PermissionMode::Supervised,
             PermissionMode::AutoAcceptEdits,
             PermissionMode::WorktreeAuto,
+            PermissionMode::WorkspaceAuto,
         ] {
             assert_eq!(joined(Provider::Codex, mode), expected("workspace-write"));
         }
@@ -259,6 +292,7 @@ mod tests {
             PermissionMode::ReadOnly,
             PermissionMode::Supervised,
             PermissionMode::AutoAcceptEdits,
+            PermissionMode::WorkspaceAuto,
         ] {
             assert!(mode.require_isolation(Some(&Isolation::Directory)).is_ok());
             assert!(mode.require_isolation(None).is_ok());
@@ -301,5 +335,54 @@ mod tests {
         assert!(PermissionMode::parse("full-access")
             .unwrap_err()
             .contains(MODE_USAGE));
+    }
+
+    #[test]
+    fn commander_defaults_to_workspace_auto_without_any_bypass_flag() {
+        let commander = PermissionMode::COMMANDER_DEFAULT;
+        assert_eq!(commander, PermissionMode::WorkspaceAuto);
+        assert!(commander.require_isolation(None).is_ok());
+        let claude = dispatch_arguments(Provider::Claude, commander);
+        let joined = claude.join(" ");
+        assert!(
+            joined.contains(
+                "--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit"
+            ),
+            "{joined}"
+        );
+        assert!(!joined.contains("--permission-mode default"));
+        assert!(refuse_bypass(claude.iter().map(OsStr::new)).is_ok());
+        let mut smuggled = claude.clone();
+        for flag in FORBIDDEN_FLAGS {
+            smuggled.push(flag);
+            assert!(refuse_bypass(smuggled.iter().map(OsStr::new)).is_err());
+            smuggled.pop();
+        }
+        assert_eq!(
+            serde_json::to_string(&commander).unwrap(),
+            "\"workspace-auto\""
+        );
+    }
+
+    #[test]
+    fn commander_modes_parse_cycle_and_refuse_worktree_auto() {
+        for mode in PermissionMode::COMMANDER {
+            assert_eq!(PermissionMode::parse_commander(mode.flag()).unwrap(), mode);
+        }
+        assert!(PermissionMode::parse_commander("worktree-auto")
+            .unwrap_err()
+            .contains(COMMANDER_MODE_USAGE));
+        let mut seen = Vec::new();
+        let mut mode = PermissionMode::COMMANDER_DEFAULT;
+        for _ in PermissionMode::COMMANDER {
+            mode = mode.next_commander();
+            seen.push(mode);
+        }
+        assert_eq!(seen.last(), Some(&PermissionMode::COMMANDER_DEFAULT));
+        assert_eq!(seen.len(), PermissionMode::COMMANDER.len());
+        assert_eq!(
+            PermissionMode::WorktreeAuto.next_commander(),
+            PermissionMode::ReadOnly
+        );
     }
 }

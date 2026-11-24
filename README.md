@@ -91,11 +91,21 @@ installer's directory above and uses that path for this session, saying which
 path it used. Otherwise, open a new terminal and press R. Settings > Providers
 offers the same Install button.
 
-Pick Claude, Codex or both, keep or change the profile name (`main` by
-default), and choose Connect. The TUI steps aside, the provider's sign-in runs
-in the same terminal, and the TUI returns with the new profile loaded and its
-signed-in status or failure reason. One provider is enough. Skip keeps the app
-usable and shows a hint to connect later from Settings.
+On first run every installed CLI is pre-checked. Later, `/connect` and
+Settings > Connect new profile mark providers that already have a signed-in
+profile and pre-check only installed providers that do not; when every
+installed provider is signed in, nothing is pre-checked so you pick which one
+gets another account. Leave the profile name blank (`(auto from account)`) to
+name the profile after the signed-in account's email, or its organization or
+account name when no email is available (for example `pilot@example.test`);
+type a name to override it. Names fall back to `main`, then `account-2`,
+`account-3`, when the account cannot be read. Choose Connect: the TUI steps
+aside, the provider's sign-in runs in the same terminal inside a private
+staging folder, and the TUI returns with the new profile loaded and its
+signed-in status or failure reason. A cancelled or failed sign-in leaves no
+profile behind; signing in again to an account that already has a profile
+replaces that profile only. One provider is enough. Skip keeps the app usable
+and shows a hint to connect later from Settings.
 
 ### Settings
 
@@ -107,6 +117,9 @@ Click `Settings` at the right of the top bar, press F3, or type `/settings`.
   Reconnect, and Sign out (asks for confirmation; keeps the profile folder).
 - **Commander profile**: Auto or a specific profile, the same setting as
   `/entry` and F2.
+- **Commander mode**: Commander's permission mode (`workspace-auto` by
+  default), the same setting as `/mode`, saved as `commander_permission` in
+  `settings.toml`.
 - **Check for updates on launch**: on or off, saved in `settings.toml`;
   `AGENT_COMMAND_NO_UPDATE_CHECK=1` still forces it off.
 - **Resume after limits** (`auto_resume_on_reset`, default off): when every
@@ -190,6 +203,7 @@ it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 /remove NAME                            remove a specialist and its workspace
 /settings                               open Settings (also F3 or the top-bar item)
 /connect                                connect a provider profile
+/mode MODE                              set Commander's permission mode (read-only|supervised|auto-edits|workspace-auto)
 /btw QUESTION                           ask a read-only side question (alias /side)
 /goal CRITERIA                          pin a goal and keep taking turns until GOAL_MET
 /goal cancel                            stop the pinned goal after the current turn
@@ -205,13 +219,19 @@ provider CLI's argv, never by prompt text alone, and no mode ever passes
 | Mode | Default for roles | Claude Code argv | Codex argv |
 | --- | --- | --- | --- |
 | `read-only` | Playtester, Reviewer, QA, Audit | `--permission-mode default --disallowedTools Edit,Write,NotebookEdit` | `--sandbox read-only` |
-| `supervised` | Lead, Commander, Builder, everything else | `--permission-mode default` | `--sandbox workspace-write` |
+| `supervised` | Lead, Builder, everything else | `--permission-mode default` | `--sandbox workspace-write` |
 | `auto-edits` | Copywriter, Docs, Writer, Editor | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
 | `worktree-auto` | none (explicit only) | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `--sandbox workspace-write` |
+| `workspace-auto` | Commander | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `--sandbox workspace-write` |
 
 `worktree-auto` is refused unless the specialist's workspace is an isolated
-`git worktree`, both at spawn and again at every launch. Commander always runs
-`supervised`.
+`git worktree`, both at spawn and again at every launch. `workspace-auto` runs
+in the current workspace without that check, so Commander can write files and
+run commands in `--print` mode, where Claude's `default` mode cannot ask for
+approval and denies every edit and shell command. Commander runs
+`workspace-auto` by default; the Chart Room shows its current mode under
+PERMISSIONS. Tighten it at any time with `/mode read-only`, `/mode supervised`
+or `/mode auto-edits`, or from Settings > Commander mode.
 
 ### Cross-family review
 
@@ -408,13 +428,25 @@ Keep the provider's regular login for its standalone CLI. Agent Command uses
 separate subscription profiles.
 
 ```sh
-agent-command auth login claude work
+agent-command auth login claude
 agent-command auth login codex work
 agent-command auth list
 agent-command auth status codex work
 agent-command auth run claude work -- --help
 agent-command auth logout claude work
 ```
+
+Without a profile name, `auth login` names the profile from the signed-in
+account: Claude's `auth status --json` email (or organization name), or the
+email (or name) claim in Codex's `auth.json` ID token. Tokens are never printed.
+Profile names are 1–64 characters of lowercase letters, digits and `._@+-`,
+start with a letter or digit, and never use `..`, a trailing `.` or a Windows
+device name.
+
+On Windows, Agent Command runs the provider executable it finds on PATH,
+preferring `.exe` and `.com` over npm's `.cmd` and `.bat` shims and ignoring
+extensionless shell scripts, then falls back to the documented install
+directory.
 
 Profile directories use the existing sub-auth layout under
 `~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`. On Windows, use
