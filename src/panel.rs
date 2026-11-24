@@ -24,10 +24,12 @@ use std::{
 };
 
 pub(crate) const NO_PROVIDER_HINT: &str = "No provider connected · press F3 or Settings to connect";
-pub(crate) const DEFAULT_PROFILE_NAME: &str = "main";
+pub(crate) const AUTO_NAME_PLACEHOLDER: &str = "(auto from account)";
 const PANEL_MAX_WIDTH: u16 = 78;
 const PROFILE_LABEL_WIDTH: usize = 22;
+const PROFILE_ROW_CONTROLS_WIDTH: usize = 37;
 const STATUS_MAX_ROWS: usize = 3;
+const SIGNED_IN_BADGE: &str = "  ● signed in";
 const PREVIEW_BLOCKER: &str = "Connecting needs the live terminal; this is a preview.";
 
 pub(crate) trait Host {
@@ -39,6 +41,12 @@ pub(crate) trait Host {
     fn signed_in(&self, profile: &Profile) -> bool;
     fn suspend(&mut self) -> io::Result<()>;
     fn sign_in(&mut self, profile: &Profile) -> io::Result<()>;
+    fn connect(
+        &mut self,
+        root: &Path,
+        provider: Provider,
+        name: Option<&str>,
+    ) -> io::Result<Profile>;
     fn install(&mut self, plan: &Plan) -> io::Result<()>;
     fn restore(&mut self) -> io::Result<()>;
     fn sign_out(&mut self, profile: &Profile) -> io::Result<()>;
@@ -86,6 +94,19 @@ impl Host for TerminalHost {
         auth::succeeded(profile, auth::sign_in(profile)?)
     }
 
+    fn connect(
+        &mut self,
+        root: &Path,
+        provider: Provider,
+        name: Option<&str>,
+    ) -> io::Result<Profile> {
+        println!(
+            "Signing in to {}. Follow the provider's prompts.",
+            provider_title(provider)
+        );
+        auth::connect(root, provider, name)
+    }
+
     fn install(&mut self, plan: &Plan) -> io::Result<()> {
         println!(
             "Installing {}: {}",
@@ -125,6 +146,7 @@ pub(crate) enum Action {
     CancelSignOut,
     ConnectNew,
     CommanderProfile,
+    CommanderMode,
     UpdateCheck,
     AutoResume,
     SnoozeMissions,
@@ -187,6 +209,7 @@ pub(crate) struct ConnectForm {
     clis: Clis,
     installing: Option<Provider>,
     chosen: [bool; 2],
+    signed_in: [bool; 2],
     pub(crate) name: String,
     focus: usize,
     pub(crate) status: String,
@@ -218,6 +241,20 @@ fn truncated(text: &str, width: usize) -> String {
     }
     let kept: String = text.chars().take(width.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+fn profile_label_width(profiles: &[Profile], width: usize) -> usize {
+    let longest = profiles
+        .iter()
+        .map(|profile| profile.to_string().chars().count() + 1)
+        .max()
+        .unwrap_or(0);
+    longest.clamp(
+        PROFILE_LABEL_WIDTH,
+        width
+            .saturating_sub(PROFILE_ROW_CONTROLS_WIDTH)
+            .max(PROFILE_LABEL_WIDTH),
+    )
 }
 
 fn wrapped(text: &str, width: usize, rows: usize) -> Vec<String> {
@@ -263,24 +300,26 @@ fn button(label: impl AsRef<str>, action: Action) -> Segment {
 type Row = Vec<Segment>;
 
 impl ConnectForm {
-    fn new(origin: Origin, host: Option<&dyn Host>) -> Self {
+    fn new(origin: Origin, host: Option<&dyn Host>, signed_in: [bool; 2]) -> Self {
         let mut form = Self {
             origin,
             clis: Clis::default(),
             installing: None,
             chosen: [false; 2],
-            name: DEFAULT_PROFILE_NAME.into(),
+            signed_in,
+            name: String::new(),
             focus: 0,
             status: String::new(),
         };
         form.recheck(host);
-        if let Some(first) = Provider::ALL
-            .into_iter()
-            .find(|provider| form.clis.found(*provider).is_some())
-        {
-            form.chosen[provider_slot(first)] = true;
-        }
+        form.chosen = Provider::ALL.map(|provider| {
+            form.clis.found(provider).is_some() && !signed_in[provider_slot(provider)]
+        });
         form
+    }
+
+    fn requested_name(&self) -> Option<&str> {
+        Some(self.name.trim()).filter(|name| !name.is_empty())
     }
 
     fn recheck(&mut self, host: Option<&dyn Host>) {
@@ -343,18 +382,32 @@ impl ConnectForm {
                 format!("{mark} {:<11}", provider_title(provider)),
                 Action::Toggle(provider),
             )];
+            let connected = self.signed_in[slot];
+            let badge = if connected { SIGNED_IN_BADGE } else { "" };
             row.extend(availability(
                 provider,
                 self.clis.found(provider),
-                width.saturating_sub(19),
+                width.saturating_sub(19 + badge.chars().count()),
             ));
+            if connected {
+                row.push(text(badge, Tone::Good));
+            }
             rows.push(row);
         }
         let cursor = if editing_name { "▏" } else { " " };
+        let shown = if self.name.is_empty() && !editing_name {
+            AUTO_NAME_PLACEHOLDER
+        } else {
+            self.name.as_str()
+        };
+        let name_width = width.saturating_sub(16).max(1);
         rows.push(vec![]);
         rows.push(vec![
             text("Profile name  ", Tone::Plain),
-            button(format!("{:<16}{cursor}", self.name), Action::Name),
+            button(
+                format!("{:<19}{cursor}", truncated(shown, name_width)),
+                Action::Name,
+            ),
         ]);
         rows.push(vec![]);
         if let Some(provider) = self.installing {
@@ -440,8 +493,19 @@ impl App {
     }
 
     pub(crate) fn open_connect(&mut self, origin: Origin) {
-        let form = ConnectForm::new(origin, self.host.as_deref());
+        let form = ConnectForm::new(origin, self.host.as_deref(), self.signed_in_providers());
         self.panel = Some(Panel::Connect(form));
+    }
+
+    fn signed_in_providers(&self) -> [bool; 2] {
+        Provider::ALL.map(|provider| {
+            self.live.as_ref().is_some_and(|live| {
+                live.profiles
+                    .iter()
+                    .zip(&live.signed_in)
+                    .any(|(profile, signed_in)| *signed_in && profile.provider == provider)
+            })
+        })
     }
 
     pub(crate) fn refresh_sign_in(&mut self) {
@@ -496,6 +560,7 @@ impl App {
                 actions.extend([
                     Action::ConnectNew,
                     Action::CommanderProfile,
+                    Action::CommanderMode,
                     Action::UpdateCheck,
                     Action::AutoResume,
                     Action::SnoozeMissions,
@@ -656,6 +721,12 @@ impl App {
             Action::ConnectNew => self.open_connect(Origin::Settings),
             Action::CommanderProfile => {
                 self.select_profile();
+                let notice = std::mem::take(&mut self.notice);
+                self.set_panel_status(notice);
+            }
+            Action::CommanderMode => {
+                let mode = self.settings.commander_permission.next_commander();
+                self.set_commander_mode(mode);
                 let notice = std::mem::take(&mut self.notice);
                 self.set_panel_status(notice);
             }
@@ -861,9 +932,9 @@ impl App {
         let Some(Panel::Connect(form)) = &self.panel else {
             return;
         };
-        let name = form.name.trim().to_owned();
+        let name = form.requested_name().map(str::to_owned);
         let chosen = form.chosen_providers();
-        if let Err(rule) = auth::validate_name(&name) {
+        if let Some(Err(rule)) = name.as_deref().map(auth::validate_name) {
             return self.set_panel_status(rule.into());
         }
         if chosen.is_empty() {
@@ -877,11 +948,7 @@ impl App {
             .as_ref()
             .and_then(|live| live.profile_root.clone())
             .expect("checked by connect_blocker");
-        let profiles: Vec<Profile> = chosen
-            .into_iter()
-            .filter_map(|provider| Profile::new(root.clone(), provider, &name).ok())
-            .collect();
-        let (connected, summary) = self.sign_in_all(&profiles);
+        let (connected, summary) = self.connect_all(&root, &chosen, name.as_deref());
         let origin = form_origin(&self.panel);
         if connected && origin == Some(Origin::Onboarding) {
             self.panel = None;
@@ -909,18 +976,39 @@ impl App {
         else {
             return;
         };
-        let (_, summary) = self.sign_in_all(&[profile]);
+        let labels = [profile.to_string()];
+        let (outcomes, restored) = self.while_suspended(&[profile], |host, profile| {
+            host.sign_in(profile).map(|()| profile.clone())
+        });
+        let (_, summary) = self.summarize(&labels, outcomes, restored);
         self.set_panel_status(summary);
     }
 
-    fn sign_in_all(&mut self, profiles: &[Profile]) -> (bool, String) {
+    fn connect_all(
+        &mut self,
+        root: &Path,
+        providers: &[Provider],
+        name: Option<&str>,
+    ) -> (bool, String) {
+        let labels: Vec<String> = providers
+            .iter()
+            .map(|provider| format!("{}/{}", provider.binary(), name.unwrap_or("(auto)")))
+            .collect();
+        let (outcomes, restored) = self.while_suspended(providers, |host, provider| {
+            host.connect(root, *provider, name)
+        });
+        self.summarize(&labels, outcomes, restored)
+    }
+
+    fn while_suspended<T>(
+        &mut self,
+        items: &[T],
+        mut run: impl FnMut(&mut dyn Host, &T) -> io::Result<Profile>,
+    ) -> (Vec<io::Result<Profile>>, io::Result<()>) {
         let host = self.host.as_mut().expect("checked by connect_blocker");
-        let outcomes: Vec<io::Result<()>> = match host.suspend() {
-            Ok(()) => profiles
-                .iter()
-                .map(|profile| host.sign_in(profile))
-                .collect(),
-            Err(error) => profiles
+        let outcomes = match host.suspend() {
+            Ok(()) => items.iter().map(|item| run(host.as_mut(), item)).collect(),
+            Err(error) => items
                 .iter()
                 .map(|_| Err(io::Error::new(error.kind(), error.to_string())))
                 .collect(),
@@ -928,20 +1016,26 @@ impl App {
         let restored = host.restore();
         self.full_redraw = true;
         self.reload_profiles();
+        (outcomes, restored)
+    }
+
+    fn summarize(
+        &self,
+        labels: &[String],
+        outcomes: Vec<io::Result<Profile>>,
+        restored: io::Result<()>,
+    ) -> (bool, String) {
         let mut connected = false;
-        let mut parts: Vec<String> = profiles
+        let mut parts: Vec<String> = labels
             .iter()
             .zip(outcomes)
-            .map(|(profile, outcome)| {
-                let label = profile.to_string();
-                match outcome {
-                    Err(error) => format!("{label}: sign-in failed: {error}"),
-                    Ok(()) if self.is_signed_in(&label) => {
-                        connected = true;
-                        format!("{label} signed in")
-                    }
-                    Ok(()) => format!("{label}: sign-in did not complete"),
+            .map(|(pending, outcome)| match outcome {
+                Err(error) => format!("{pending}: sign-in failed: {error}"),
+                Ok(profile) if self.is_signed_in(&profile.to_string()) => {
+                    connected = true;
+                    format!("{profile} signed in")
                 }
+                Ok(profile) => format!("{profile}: sign-in did not complete"),
             })
             .collect();
         if let Err(error) = restored {
@@ -1066,14 +1160,14 @@ impl App {
             }
             None => rows.push(vec![text("Preview: profiles are not loaded.", Tone::Muted)]),
             Some((profiles, signed_in)) => {
+                let label_width = profile_label_width(profiles, width);
                 for (index, profile) in profiles.iter().enumerate() {
                     let active = signed_in.get(index).copied().unwrap_or(false);
                     rows.push(vec![
                         text(
                             format!(
-                                "{:<width$}",
-                                truncated(&profile.to_string(), PROFILE_LABEL_WIDTH - 1),
-                                width = PROFILE_LABEL_WIDTH
+                                "{:<label_width$}",
+                                truncated(&profile.to_string(), label_width - 1),
                             ),
                             Tone::Plain,
                         ),
@@ -1124,6 +1218,13 @@ impl App {
         rows.push(vec![
             text("Commander profile    ", Tone::Plain),
             button(self.commander_profile_label(), Action::CommanderProfile),
+        ]);
+        rows.push(vec![
+            text("Commander mode       ", Tone::Plain),
+            button(
+                self.settings.commander_permission.flag(),
+                Action::CommanderMode,
+            ),
         ]);
         let mut updates = vec![
             text("Check for updates    ", Tone::Plain),

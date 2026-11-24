@@ -84,6 +84,13 @@ impl Configuration {
     }
 
     pub(crate) fn arguments(&self) -> Vec<String> {
+        let toml_value = |value: &str| {
+            if value.contains(['\'', '\n', '\r']) {
+                format!("{value:?}")
+            } else {
+                format!("'{value}'")
+            }
+        };
         let mut arguments = Vec::new();
         match self.provider {
             Provider::Claude => {
@@ -96,12 +103,12 @@ impl Configuration {
             }
             Provider::Codex => {
                 if let Some(model) = self.native_model() {
-                    arguments.extend(["-c".to_owned(), format!("model=\"{model}\"")]);
+                    arguments.extend(["-c".to_owned(), format!("model={}", toml_value(model))]);
                 }
                 if let Some(effort) = &self.effort {
                     arguments.extend([
                         "-c".to_owned(),
-                        format!("model_reasoning_effort=\"{effort}\""),
+                        format!("model_reasoning_effort={}", toml_value(effort)),
                     ]);
                 }
             }
@@ -1269,9 +1276,9 @@ exit 3
             codex[1].arguments(),
             [
                 "-c",
-                "model=\"gpt-6.2-sol\"",
+                "model='gpt-6.2-sol'",
                 "-c",
-                "model_reasoning_effort=\"high\""
+                "model_reasoning_effort='high'"
             ]
         );
         assert_eq!(codex[1].benchmark().unwrap().slug, "gpt-6-2-sol");

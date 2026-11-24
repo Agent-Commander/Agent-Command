@@ -685,11 +685,14 @@ pub(crate) enum Command {
         criteria: String,
     },
     GoalCancel,
+    Mode {
+        mode: PermissionMode,
+    },
     Message(String),
 }
 
 const SPAWN_USAGE: &str =
-    "Usage: /spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto] [TASK]";
+    "Usage: /spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto|workspace-auto] [TASK]";
 const REVIEW_USAGE: &str = "Usage: /review NAME [--next-revision] [FOCUS]";
 const MODE_FLAG: &str = "--mode";
 const NEXT_REVISION_FLAG: &str = "--next-revision";
@@ -836,6 +839,12 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
         "/settle" => parse_settle(rest, true),
         "/unsettle" => parse_settle(rest, false),
         "/settled" if rest.is_empty() => Ok(Command::SettledDrawer),
+        "/mode" => match next_word(rest) {
+            Some((mode, "")) => Ok(Command::Mode {
+                mode: PermissionMode::parse_commander(mode)?,
+            }),
+            _ => Err(crate::permissions::COMMANDER_MODE_USAGE.into()),
+        },
         _ => Ok(Command::Message(input.into())),
     }
 }

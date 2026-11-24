@@ -138,7 +138,8 @@ pub(crate) fn external_mode(requested: PermissionMode) -> PermissionMode {
         PermissionMode::ReadOnly => PermissionMode::ReadOnly,
         PermissionMode::Supervised
         | PermissionMode::AutoAcceptEdits
-        | PermissionMode::WorktreeAuto => PermissionMode::Supervised,
+        | PermissionMode::WorktreeAuto
+        | PermissionMode::WorkspaceAuto => PermissionMode::Supervised,
     }
 }
 
@@ -849,6 +850,7 @@ pub(crate) mod tests {
             (PermissionMode::Supervised, PermissionMode::Supervised),
             (PermissionMode::AutoAcceptEdits, PermissionMode::Supervised),
             (PermissionMode::WorktreeAuto, PermissionMode::Supervised),
+            (PermissionMode::WorkspaceAuto, PermissionMode::Supervised),
         ] {
             assert_eq!(external_mode(requested), granted);
         }

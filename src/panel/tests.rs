@@ -16,6 +16,7 @@ struct Script {
     signed: BTreeSet<String>,
     installed: [bool; 2],
     refuse_sign_in: bool,
+    accounts: [Option<&'static str>; 2],
     adopted: [Option<PathBuf>; 2],
     absent_programs: Vec<&'static str>,
     home: Option<PathBuf>,
@@ -114,6 +115,29 @@ impl Host for FakeHost {
         profile.prepare()?;
         script.signed.insert(profile.to_string());
         Ok(())
+    }
+
+    fn connect(
+        &mut self,
+        root: &Path,
+        provider: Provider,
+        name: Option<&str>,
+    ) -> io::Result<Profile> {
+        let mut script = self.0.borrow_mut();
+        script.calls.push(format!(
+            "connect {} {}",
+            provider.binary(),
+            name.unwrap_or("auto")
+        ));
+        if script.refuse_sign_in {
+            return Err(io::Error::other("claude exited with exit code: 130"));
+        }
+        let account = script.accounts[provider_slot(provider)];
+        let chosen = auth::chosen_name(root, provider, name, account).map_err(io::Error::other)?;
+        let profile = Profile::new(root.into(), provider, &chosen).map_err(io::Error::other)?;
+        profile.prepare()?;
+        script.signed.insert(profile.to_string());
+        Ok(profile)
     }
 
     fn restore(&mut self) -> io::Result<()> {
@@ -251,7 +275,7 @@ fn onboarding_opens_only_when_no_profile_is_signed_in() {
         assert!(text.contains("✓ claude on PATH"), "{text}");
         assert_inside(&signed_out, width, height);
         if let Some(Panel::Connect(form)) = &signed_out.panel {
-            assert_eq!(form.name, DEFAULT_PROFILE_NAME);
+            assert!(form.name.is_empty());
             assert_eq!(form.chosen_providers(), [Provider::Claude]);
         }
 
@@ -301,8 +325,9 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
             press(&mut app, KeyCode::Tab);
             press(&mut app, KeyCode::Tab);
             assert!(app.editing_name());
-            press(&mut app, KeyCode::Backspace);
-            press(&mut app, KeyCode::Char('x'));
+            for c in "maix".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
             assert!(matches!(&app.panel, Some(Panel::Connect(form)) if form.name == "maix"));
             press(&mut app, KeyCode::Backspace);
             press(&mut app, KeyCode::Char('n'));
@@ -311,10 +336,12 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
             let connect = hit(&app, Action::Connect);
             click(&mut app, connect);
         }
-        assert_eq!(
-            host.0.borrow().calls,
-            ["suspend", "sign_in claude/main", "restore"]
-        );
+        let expected = if index == 0 {
+            "connect claude main"
+        } else {
+            "connect claude auto"
+        };
+        assert_eq!(host.0.borrow().calls, ["suspend", expected, "restore"]);
         assert!(app.full_redraw);
         assert!(app.panel.is_none());
         assert_eq!(app.notice, "claude/main signed in");
@@ -347,11 +374,12 @@ fn failed_sign_in_keeps_the_form_open_with_the_reason() {
         click(&mut app, connect);
         assert_eq!(
             host.0.borrow().calls,
-            ["suspend", "sign_in claude/main", "restore"]
+            ["suspend", "connect claude auto", "restore"]
         );
         assert_eq!(origin(&app), Some(Origin::Onboarding));
         let text = screen(&render(&mut app, width, height));
-        assert!(text.contains("claude/main: sign-in failed"), "{text}");
+        assert!(text.contains("claude/(auto): sign-in failed"), "{text}");
+        assert!(host.profiles(&sandbox.profiles()).unwrap().is_empty());
     }
 }
 
@@ -843,4 +871,219 @@ fn a_failed_install_shows_the_reason_and_leaves_the_app_usable() {
         app.submit();
         assert!(matches!(app.panel, Some(Panel::Settings(_))));
     }
+}
+
+#[cfg(unix)]
+fn chosen(app: &App) -> Vec<Provider> {
+    match &app.panel {
+        Some(Panel::Connect(form)) => form.chosen_providers(),
+        _ => panic!("Connect is not open"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn onboarding_pre_checks_every_installed_cli_and_shows_the_auto_name() {
+    for (width, height) in SIZES {
+        let sandbox = Sandbox::new(&format!("onboarding-both-{width}"));
+        let mut app = launched(&sandbox, &fake([true, true], &[]));
+        assert_eq!(origin(&app), Some(Origin::Onboarding));
+        assert_eq!(chosen(&app), Provider::ALL);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("[x] Claude Code"), "{text}");
+        assert!(text.contains("[x] Codex CLI"), "{text}");
+        assert!(text.contains(AUTO_NAME_PLACEHOLDER), "{text}");
+        assert!(!text.contains("● signed in"), "{text}");
+        assert_inside(&app, width, height);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_pre_checks_only_installed_providers_that_are_not_signed_in() {
+    for (width, height) in SIZES {
+        let sandbox = Sandbox::new(&format!("connect-unconnected-{width}"));
+        existing(&sandbox, Provider::Claude, "work");
+        let host = fake([true, true], &["claude/work"]);
+        let mut app = launched(&sandbox, &host);
+        assert!(app.panel.is_none());
+        app.input = "/connect".into();
+        app.submit();
+        assert_eq!(chosen(&app), [Provider::Codex]);
+        let text = screen(&render(&mut app, width, height));
+        let claude_row = text
+            .lines()
+            .find(|line| line.contains("Claude Code"))
+            .unwrap();
+        assert!(claude_row.contains("[ ] Claude Code"), "{claude_row}");
+        assert!(claude_row.contains("● signed in"), "{claude_row}");
+        let codex_row = text
+            .lines()
+            .find(|line| line.contains("Codex CLI"))
+            .unwrap();
+        assert!(codex_row.contains("[x] Codex CLI"), "{codex_row}");
+        assert!(!codex_row.contains("● signed in"), "{codex_row}");
+        assert_inside(&app, width, height);
+        press(&mut app, KeyCode::Esc);
+
+        app.open_settings();
+        render(&mut app, width, height);
+        let area = hit(&app, Action::ConnectNew);
+        click(&mut app, area);
+        assert_eq!(origin(&app), Some(Origin::Settings));
+        assert_eq!(chosen(&app), [Provider::Codex]);
+        render(&mut app, width, height);
+        let area = hit(&app, Action::Toggle(Provider::Claude));
+        click(&mut app, area);
+        assert_eq!(chosen(&app), Provider::ALL);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_leaves_every_box_unchecked_when_all_installed_providers_are_signed_in() {
+    let sandbox = Sandbox::new("connect-all-signed");
+    existing(&sandbox, Provider::Claude, "work");
+    existing(&sandbox, Provider::Codex, "work");
+    let host = fake([true, true], &["claude/work", "codex/work"]);
+    let mut app = launched(&sandbox, &host);
+    app.open_connect(Origin::Direct);
+    assert!(chosen(&app).is_empty());
+    app.activate(Action::Connect);
+    assert_eq!(status(&app), "Pick Claude, Codex or both.");
+    assert!(host.0.borrow().calls.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_names_profiles_from_the_signed_in_account() {
+    for (width, height) in SIZES {
+        let sandbox = Sandbox::new(&format!("connect-auto-{width}"));
+        let host = fake([true, true], &[]);
+        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example")];
+        let mut app = launched(&sandbox, &host);
+        render(&mut app, width, height);
+        let area = hit(&app, Action::Connect);
+        click(&mut app, area);
+        assert_eq!(
+            host.0.borrow().calls,
+            [
+                "suspend",
+                "connect claude auto",
+                "connect codex auto",
+                "restore"
+            ]
+        );
+        assert!(app.panel.is_none());
+        assert_eq!(
+            app.notice,
+            "claude/pilot@example.test signed in · codex/pilot-example signed in"
+        );
+        let labels = app.profile_labels();
+        assert_eq!(labels, ["claude/pilot@example.test", "codex/pilot-example"]);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("pilot"), "{text}");
+        press(&mut app, KeyCode::F(3));
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("claude/pilot@example.test"), "{text}");
+        assert_inside(&app, width, height);
+        app.panel = None;
+        app.input = "/entry claude/pilot@example.test".into();
+        app.submit();
+        assert_eq!(
+            app.notice,
+            "Entry model: claude/pilot@example.test (override)"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_typed_profile_name_overrides_the_account_name() {
+    let sandbox = Sandbox::new("connect-custom");
+    let host = fake([true, false], &[]);
+    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None];
+    let mut app = launched(&sandbox, &host);
+    if let Some(Panel::Connect(form)) = &mut app.panel {
+        form.name = "work".into();
+    }
+    app.activate(Action::Connect);
+    assert_eq!(app.notice, "claude/work signed in");
+}
+
+#[test]
+fn commander_mode_cycles_from_settings_and_persists() {
+    for (index, (width, height)) in SIZES.into_iter().enumerate() {
+        let sandbox = Sandbox::new(&format!("commander-mode-{width}"));
+        let host = fake([true, true], &[]);
+        let mut app = preview(&host, sandbox.launch(None));
+        assert_eq!(
+            app.settings.commander_permission,
+            crate::permissions::PermissionMode::WorkspaceAuto
+        );
+        app.open_settings();
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("Commander mode"), "{text}");
+        assert!(text.contains("workspace-auto"), "{text}");
+        if index == 0 {
+            while app.focused_action() != Some(Action::CommanderMode) {
+                press(&mut app, KeyCode::Down);
+            }
+            press(&mut app, KeyCode::Enter);
+        } else {
+            let area = hit(&app, Action::CommanderMode);
+            click(&mut app, area);
+        }
+        assert!(
+            status(&app).contains("Commander permissions: read-only (saved)."),
+            "{}",
+            status(&app)
+        );
+        let saved = settings::Settings::load(&sandbox.0.join("config/settings.toml")).unwrap();
+        assert_eq!(
+            saved.commander_permission,
+            crate::permissions::PermissionMode::ReadOnly
+        );
+        let reopened = preview(&host, sandbox.launch(None));
+        assert_eq!(
+            reopened.settings.commander_permission,
+            crate::permissions::PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            reopened.crew[0].permission,
+            crate::permissions::PermissionMode::ReadOnly
+        );
+    }
+}
+
+#[test]
+fn mode_command_sets_and_persists_the_commander_permission() {
+    let sandbox = Sandbox::new("mode-command");
+    let host = fake([true, true], &[]);
+    let mut app = preview(&host, sandbox.launch(None));
+    app.panel = None;
+    app.input = "/mode supervised".into();
+    app.submit();
+    assert_eq!(app.notice, "Commander permissions: supervised (saved).");
+    assert!(app.input.is_empty());
+    let saved = settings::Settings::load(&sandbox.0.join("config/settings.toml")).unwrap();
+    assert_eq!(
+        saved.commander_permission,
+        crate::permissions::PermissionMode::Supervised
+    );
+    app.input = "/mode worktree-auto".into();
+    app.submit();
+    assert!(app
+        .notice
+        .contains(crate::permissions::COMMANDER_MODE_USAGE));
+    assert_eq!(
+        app.settings.commander_permission,
+        crate::permissions::PermissionMode::Supervised
+    );
+    app.input = "/mode".into();
+    app.submit();
+    assert_eq!(app.notice, crate::permissions::COMMANDER_MODE_USAGE);
+    let text = screen(&render(&mut app, 120, 40));
+    assert!(text.contains("PERMISSIONS"), "{text}");
+    assert!(text.contains("supervised"), "{text}");
 }

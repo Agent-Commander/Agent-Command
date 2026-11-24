@@ -1,3 +1,4 @@
+use crate::permissions::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -21,6 +22,7 @@ pub(crate) struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text_gen_profile: Option<String>,
     pub(crate) goal_turn_cap: u32,
+    pub(crate) commander_permission: PermissionMode,
 }
 
 pub(crate) const DEFAULT_GOAL_TURN_CAP: u32 = 10;
@@ -35,6 +37,7 @@ impl Default for Settings {
             fallback_profile: None,
             text_gen_profile: None,
             goal_turn_cap: DEFAULT_GOAL_TURN_CAP,
+            commander_permission: PermissionMode::COMMANDER_DEFAULT,
         }
     }
 }
@@ -138,7 +141,7 @@ mod tests {
         off.save(&path).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "check_for_updates = false\nauto_resume_on_reset = false\nsnooze_limited_missions = false\ngoal_turn_cap = 10\n"
+            "check_for_updates = false\nauto_resume_on_reset = false\nsnooze_limited_missions = false\ngoal_turn_cap = 10\ncommander_permission = \"workspace-auto\"\n"
         );
         assert_eq!(Settings::load(&path).unwrap(), off);
         fs::write(&path, "check_for_updates = false\n").unwrap();
@@ -178,12 +181,14 @@ mod tests {
             fallback_profile: Some("codex/backup".into()),
             text_gen_profile: Some("claude/light".into()),
             goal_turn_cap: 4,
+            commander_permission: PermissionMode::ReadOnly,
         };
         configured.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("auto_resume_on_reset = true"));
         assert!(text.contains("fallback_profile = \"codex/backup\""));
         assert!(text.contains("text_gen_profile = \"claude/light\""));
+        assert!(text.contains("commander_permission = \"read-only\""));
         assert_eq!(Settings::load(&path).unwrap(), configured);
         fs::write(&path, "fallback_token = \"x\"").unwrap();
         assert_eq!(

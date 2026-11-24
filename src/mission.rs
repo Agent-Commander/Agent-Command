@@ -1642,7 +1642,7 @@ rmdir running.lock
         let starts = std::fs::read_to_string(fixture.root.join("starts")).unwrap();
         assert_eq!(
             starts,
-            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
+            "beta|-c cli_auth_credentials_store='file' -c forced_login_method='chatgpt' -c model='gpt-6.2-sol' -c model_reasoning_effort='high' -a never exec --json --skip-git-repo-check --sandbox workspace-write -|Routed work\n\
 alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --|Routed work\n"
         );
         let below = vec![coding_row("claude", "claude-opus-5-5-high", 50.0)];
@@ -1706,7 +1706,7 @@ alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format st
         }
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("starts")).unwrap(),
-            "beta|-c cli_auth_credentials_store=\"file\" -c forced_login_method=\"chatgpt\" -c model=\"gpt-6.2-sol\" -c model_reasoning_effort=\"high\" -a never exec --json --skip-git-repo-check --sandbox read-only -|Routed work\n\
+            "beta|-c cli_auth_credentials_store='file' -c forced_login_method='chatgpt' -c model='gpt-6.2-sol' -c model_reasoning_effort='high' -a never exec --json --skip-git-repo-check --sandbox read-only -|Routed work\n\
 alpha|--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode default --disallowedTools Edit,Write,NotebookEdit --|Routed work\n"
         );
         let mission = Mission::launch(profiles, route("@astra"), fixture.root.clone());
