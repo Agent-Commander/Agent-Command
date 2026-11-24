@@ -22,6 +22,8 @@ struct Script {
     home: Option<PathBuf>,
     installs: Option<Landing>,
     install_failure: Option<&'static str>,
+    update_failure: Option<&'static str>,
+    disconnect_failure: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,11 +147,23 @@ impl Host for FakeHost {
         Ok(())
     }
 
-    fn sign_out(&mut self, profile: &Profile) -> io::Result<()> {
+    fn disconnect(&mut self, profile: &Profile) -> io::Result<()> {
         let mut script = self.0.borrow_mut();
-        script.calls.push(format!("sign_out {profile}"));
+        script.calls.push(format!("disconnect {profile}"));
+        if let Some(reason) = script.disconnect_failure {
+            return Err(io::Error::other(reason));
+        }
         script.signed.remove(&profile.to_string());
-        Ok(())
+        auth::disconnect(profile)
+    }
+
+    fn update(&mut self, latest: &str) -> io::Result<update::Applied> {
+        let mut script = self.0.borrow_mut();
+        script.calls.push(format!("update {latest}"));
+        match script.update_failure {
+            Some(reason) => Err(io::Error::other(reason)),
+            None => Ok(update::Applied::Installed),
+        }
     }
 }
 
@@ -453,8 +467,8 @@ fn settings_opens_from_the_top_bar_f3_and_slash_command() {
             let text = screen(&render(&mut app, width, height));
             for expected in [
                 "Settings",
-                "PROVIDERS",
-                "+ Connect new profile",
+                "SUBSCRIPTIONS",
+                "+ Connect subscription",
                 "Commander profile",
                 "Check for updates",
                 &format!("Version   {}", update::CURRENT),
@@ -496,31 +510,70 @@ fn connect_command_opens_the_connect_flow() {
 }
 
 #[cfg(unix)]
+fn labels(app: &App) -> Vec<String> {
+    app.profile_labels()
+}
+
+#[cfg(unix)]
+fn send(app: &mut App, command: &str) {
+    app.input = command.into();
+    app.submit();
+}
+
+#[cfg(unix)]
+fn confirming_index(app: &App) -> Option<usize> {
+    match &app.panel {
+        Some(Panel::Settings(view)) => view.confirm,
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
 #[test]
-fn sign_out_needs_confirmation_and_keeps_the_profile_folder() {
+fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() {
     for (index, (width, height)) in SIZES.into_iter().enumerate() {
-        let sandbox = Sandbox::new(&format!("sign-out-{width}"));
+        let sandbox = Sandbox::new(&format!("disconnect-{width}"));
+        existing(&sandbox, Provider::Claude, "main");
         existing(&sandbox, Provider::Codex, "work");
-        let host = fake([true, true], &["codex/work"]);
+        let settings_path = sandbox.0.join("config/settings.toml");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            "fallback_profile = \"codex/work\"\ntext_gen_profile = \"codex/work\"\n",
+        )
+        .unwrap();
+        let host = fake([true, true], &["claude/main"]);
         let mut app = launched(&sandbox, &host);
+        app.live.as_mut().unwrap().preferred = Some(1);
+        app.live.as_ref().unwrap().save_override().unwrap();
+        assert!(screen(&render(&mut app, width, height)).contains("codex"));
+        assert_eq!(app.deck_hits.len(), 2);
         press(&mut app, KeyCode::F(3));
-        render(&mut app, width, height);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("SUBSCRIPTIONS"), "{text}");
+        assert!(text.contains("○ signed out"), "{text}");
+        assert!(text.contains(" Disconnect "), "{text}");
+        assert_inside(&app, width, height);
         let ask = |app: &mut App| {
             if index == 0 {
-                press(app, KeyCode::Down);
+                for _ in 0..3 {
+                    press(app, KeyCode::Down);
+                }
                 press(app, KeyCode::Enter);
             } else {
-                let sign_out = hit(app, Action::SignOut(0));
-                click(app, sign_out);
+                let disconnect = hit(app, Action::Disconnect(1));
+                click(app, disconnect);
             }
         };
         ask(&mut app);
         let text = screen(&render(&mut app, width, height));
-        assert!(text.contains("Sign out codex/work?"), "{text}");
-        assert!(host.0.borrow().calls.is_empty());
+        assert!(text.contains("Disconnect codex/work?"), "{text}");
+        assert!(text.contains("Y Confirm disconnect"), "{text}");
+        assert_inside(&app, width, height);
         press(&mut app, KeyCode::Esc);
         assert!(host.0.borrow().calls.is_empty());
-        assert!(matches!(app.panel, Some(Panel::Settings(_))));
+        assert!(status(&app).contains("Disconnect cancelled"));
+        assert!(sandbox.profiles().join("codex/work").is_dir());
 
         render(&mut app, width, height);
         ask(&mut app);
@@ -528,14 +581,359 @@ fn sign_out_needs_confirmation_and_keeps_the_profile_folder() {
         if index == 0 {
             press(&mut app, KeyCode::Char('y'));
         } else {
-            let confirm = hit(&app, Action::ConfirmSignOut);
+            let confirm = hit(&app, Action::ConfirmDisconnect);
             click(&mut app, confirm);
         }
-        assert_eq!(host.0.borrow().calls, ["sign_out codex/work"]);
+        assert_eq!(host.0.borrow().calls, ["disconnect codex/work"]);
+        assert!(!sandbox.profiles().join("codex/work").exists());
+        assert_eq!(labels(&app), ["claude/main"]);
+        let summary = status(&app);
+        assert!(summary.contains("Disconnected codex/work"), "{summary}");
+        assert!(
+            summary.contains("Cleared fallback profile, text-gen profile, Commander profile."),
+            "{summary}"
+        );
+        let saved = settings::Settings::load(&settings_path).unwrap();
+        assert_eq!(saved.fallback_profile, None);
+        assert_eq!(saved.text_gen_profile, None);
+        assert_eq!(app.live.as_ref().unwrap().preferred, None);
         let text = screen(&render(&mut app, width, height));
-        assert!(text.contains("○ signed out"), "{text}");
-        assert!(text.contains("Signed out codex/work"), "{text}");
-        assert!(sandbox.profiles().join("codex/work").is_dir());
+        assert!(!text.contains("│ codex/work"), "{text}");
+        assert!(!app.panel_actions().contains(&Action::Disconnect(1)));
+        press(&mut app, KeyCode::Esc);
+        let text = screen(&render(&mut app, width, height));
+        assert!(!text.contains("codex"), "{text}");
+        assert_eq!(app.deck_hits.len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_disconnect_keeps_the_profile_and_says_why() {
+    let sandbox = Sandbox::new("disconnect-failure");
+    existing(&sandbox, Provider::Codex, "main");
+    let host = fake([true, true], &["codex/main"]);
+    host.0.borrow_mut().disconnect_failure = Some("profile folder is busy");
+    let mut app = launched(&sandbox, &host);
+    send(&mut app, "/disconnect codex");
+    assert_eq!(confirming_index(&app), Some(0));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(status(&app).contains("codex/main: disconnect failed: profile folder is busy"));
+    assert_eq!(labels(&app), ["codex/main"]);
+    assert!(sandbox.profiles().join("codex/main").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn reconnect_restores_and_reloads_after_a_refused_sign_in_then_succeeds() {
+    for (index, (width, height)) in SIZES.into_iter().enumerate() {
+        let sandbox = Sandbox::new(&format!("reconnect-{width}"));
+        existing(&sandbox, Provider::Codex, "main");
+        let host = fake([true, true], &["claude/other"]);
+        host.0.borrow_mut().refuse_sign_in = true;
+        let mut app = launched(&sandbox, &host);
+        app.panel = None;
+        press(&mut app, KeyCode::F(3));
+        render(&mut app, width, height);
+        let reconnect = |app: &mut App| {
+            if index == 0 {
+                press(app, KeyCode::Enter);
+            } else {
+                let button = hit(app, Action::Reconnect(0));
+                click(app, button);
+            }
+        };
+        reconnect(&mut app);
+        assert_eq!(
+            host.0.borrow().calls,
+            ["suspend", "sign_in codex/main", "restore"]
+        );
+        let failure = status(&app);
+        assert!(failure.contains("sign-in failed"), "{failure}");
+        assert!(
+            failure.contains("Disconnect removes a broken subscription"),
+            "{failure}"
+        );
+        assert!(app.full_redraw);
+        assert_eq!(app.live.as_ref().unwrap().signed_in, [false]);
+
+        host.0.borrow_mut().refuse_sign_in = false;
+        render(&mut app, width, height);
+        reconnect(&mut app);
+        assert!(
+            status(&app).contains("codex/main signed in"),
+            "{}",
+            status(&app)
+        );
+        assert_eq!(app.live.as_ref().unwrap().signed_in, [true]);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("● signed in"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn disconnect_and_reconnect_commands_target_one_subscription() {
+    let sandbox = Sandbox::new("subscription-commands");
+    existing(&sandbox, Provider::Claude, "main");
+    existing(&sandbox, Provider::Codex, "a");
+    existing(&sandbox, Provider::Codex, "b");
+    let host = fake([true, true], &["claude/main", "codex/a"]);
+    let mut app = launched(&sandbox, &host);
+
+    send(&mut app, "/disconnect");
+    assert!(matches!(app.panel, Some(Panel::Settings(_))));
+    assert_eq!(app.focused_action(), Some(Action::Reconnect(0)));
+    assert_eq!(confirming_index(&app), None);
+    press(&mut app, KeyCode::Esc);
+
+    send(&mut app, "/disconnect codex");
+    assert!(app.panel.is_none());
+    assert!(
+        app.notice
+            .contains("codex has 2 subscriptions: codex/a, codex/b"),
+        "{}",
+        app.notice
+    );
+    send(&mut app, "/disconnect gemini");
+    assert!(app.notice.contains("No subscription named gemini"));
+    send(&mut app, "/reconnect codex");
+    assert!(app.panel.is_none() && app.notice.contains("Name one as PROVIDER/PROFILE"));
+    assert!(host.0.borrow().calls.is_empty());
+
+    send(&mut app, "/disconnect codex/b");
+    assert_eq!(confirming_index(&app), Some(2));
+    let text = screen(&render(&mut app, 80, 24));
+    assert!(text.contains("Disconnect codex/b?"), "{text}");
+    press(&mut app, KeyCode::Char('n'));
+    assert!(host.0.borrow().calls.is_empty());
+    press(&mut app, KeyCode::Esc);
+
+    send(&mut app, "/disconnect claude");
+    assert_eq!(confirming_index(&app), Some(0));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(host.0.borrow().calls, ["disconnect claude/main"]);
+    assert_eq!(labels(&app), ["codex/a", "codex/b"]);
+    press(&mut app, KeyCode::Esc);
+
+    send(&mut app, "/disconnect claude");
+    assert!(app.notice.contains("No claude subscription is connected"));
+    send(&mut app, "/reconnect claude");
+    assert_eq!(origin(&app), Some(Origin::Direct));
+    assert_eq!(chosen(&app), [Provider::Claude]);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.panel.is_none());
+
+    host.0.borrow_mut().calls.clear();
+    send(&mut app, "/reconnect codex/b");
+    assert_eq!(
+        host.0.borrow().calls,
+        ["suspend", "sign_in codex/b", "restore"]
+    );
+    assert!(matches!(app.panel, Some(Panel::Settings(_))));
+    assert_eq!(app.focused_action(), Some(Action::Reconnect(1)));
+    assert!(
+        status(&app).contains("codex/b signed in"),
+        "{}",
+        status(&app)
+    );
+    press(&mut app, KeyCode::Esc);
+
+    send(&mut app, "/reconnect");
+    assert!(matches!(app.panel, Some(Panel::Settings(_))));
+}
+
+#[cfg(unix)]
+#[test]
+fn clicking_a_deck_card_opens_settings_on_that_subscription() {
+    for (width, height) in SIZES {
+        let sandbox = Sandbox::new(&format!("deck-click-{width}"));
+        existing(&sandbox, Provider::Claude, "main");
+        existing(&sandbox, Provider::Codex, "work");
+        let host = fake([true, true], &["claude/main", "codex/work"]);
+        let mut app = launched(&sandbox, &host);
+        render(&mut app, width, height);
+        let card = app.deck_hits[1].1;
+        assert!(card.width > 0 && card.right() <= width && card.bottom() <= height);
+        app.click(card.x + card.width / 2, card.y + card.height / 2);
+        assert!(matches!(app.panel, Some(Panel::Settings(_))));
+        assert_eq!(app.focused_action(), Some(Action::Reconnect(1)));
+        assert!(status(&app).contains("codex/work: Reconnect signs in again"));
+        let text = screen(&render(&mut app, width, height));
+        assert!(
+            text.contains("Reconnect") && text.contains("Disconnect"),
+            "{text}"
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.focused_action(), Some(Action::Disconnect(1)));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(confirming_index(&app), Some(1));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+
+        render(&mut app, width, height);
+        let card = app.deck_hits[0].1;
+        app.click(card.x, card.y);
+        assert_eq!(app.focused_action(), Some(Action::Reconnect(0)));
+        assert!(host.0.borrow().calls.is_empty());
+    }
+}
+
+fn last_row(buffer: &Buffer) -> String {
+    row(buffer, buffer.area.height - 1)
+}
+
+fn detected(app: &mut App, latest: &str) -> std::sync::mpsc::Sender<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.watch_updates(Some(receiver));
+    app.poll_update();
+    sender.send(latest.into()).unwrap();
+    app.poll_update();
+    sender
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Trigger {
+    Click,
+    Key,
+    Command,
+}
+
+#[cfg(unix)]
+fn trigger_update(app: &mut App, trigger: Trigger) {
+    match trigger {
+        Trigger::Click => {
+            let button = app.update_area;
+            click(app, button);
+        }
+        Trigger::Key => press(app, KeyCode::F(6)),
+        Trigger::Command => send(app, "/update"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_button_runs_the_host_updater_and_stays_for_a_retry_after_failure() {
+    for (width, height) in SIZES {
+        for trigger in [Trigger::Click, Trigger::Key, Trigger::Command] {
+            let sandbox = Sandbox::new(&format!("update-{width}"));
+            existing(&sandbox, Provider::Claude, "main");
+            let host = fake([true, true], &["claude/main"]);
+            let mut app = launched(&sandbox, &host);
+            let text = last_row(&render(&mut app, width, height));
+            assert!(!text.contains("Update"), "{text}");
+            assert_eq!(app.update_area.width, 0);
+            send(&mut app, "/update");
+            assert!(app.notice.contains("is up to date"), "{}", app.notice);
+            press(&mut app, KeyCode::F(6));
+            assert!(host.0.borrow().calls.is_empty());
+
+            let _sender = detected(&mut app, "9.9.9");
+            render(&mut app, width, height);
+            host.0.borrow_mut().update_failure = Some("checksum mismatch");
+            trigger_update(&mut app, trigger);
+            assert_eq!(
+                host.0.borrow().calls,
+                ["suspend", "update 9.9.9", "restore"]
+            );
+            assert!(!app.quit);
+            assert!(
+                app.notice.contains(
+                    "Update to 9.9.9 failed: checksum mismatch. Click Update or press F6 to retry."
+                ),
+                "{}",
+                app.notice
+            );
+            assert!(app.full_redraw);
+            let text = last_row(&render(&mut app, width, height));
+            assert!(text.contains("Update"), "{text}");
+
+            host.0.borrow_mut().update_failure = None;
+            host.0.borrow_mut().calls.clear();
+            trigger_update(&mut app, trigger);
+            assert_eq!(host.0.borrow().calls, ["suspend", "update 9.9.9"]);
+            assert!(app.quit);
+            let message = app.take_exit_message().unwrap();
+            assert!(message.contains("updated to 9.9.9"), "{message}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_is_refused_while_a_mission_runs() {
+    let sandbox = Sandbox::new("update-busy");
+    existing(&sandbox, Provider::Claude, "main");
+    let host = fake([true, true], &["claude/main"]);
+    let mut app = launched(&sandbox, &host);
+    let _sender = detected(&mut app, "9.9.9");
+    let (mission, _events) = crate::mission::Mission::held();
+    app.live
+        .as_mut()
+        .unwrap()
+        .runs
+        .push(crate::Run::new(crate::COMMANDER, mission, false));
+    render(&mut app, 120, 40);
+    for trigger in [Trigger::Click, Trigger::Key, Trigger::Command] {
+        app.notice.clear();
+        trigger_update(&mut app, trigger);
+        assert_eq!(app.notice, UPDATE_MISSION_BLOCKER);
+    }
+    assert!(host.0.borrow().calls.is_empty());
+    assert!(!app.quit);
+    assert!(app.update_available.is_some());
+}
+
+#[test]
+fn update_is_refused_in_preview() {
+    let host = fake([true, true], &[]);
+    let mut app = preview(&host, LaunchConfig::default());
+    app.panel = None;
+    let _sender = detected(&mut app, "9.9.9");
+    let text = last_row(&render(&mut app, 80, 24));
+    assert!(text.ends_with(" Update "), "{text}");
+    let button = app.update_area;
+    click(&mut app, button);
+    assert_eq!(app.notice, PREVIEW_BLOCKER);
+    assert!(host.0.borrow().calls.is_empty());
+}
+
+#[test]
+fn update_button_sits_bottom_right_and_left_of_abandon_at_both_sizes() {
+    for (width, height) in SIZES {
+        let mut app = App::from_live(crate::Live::new(std::env::temp_dir(), Vec::new(), None));
+        let text = last_row(&render(&mut app, width, height));
+        assert!(!text.contains("Update"), "{text}");
+        let crew_before = app.crew_area;
+        let _sender = detected(&mut app, "9.9.9");
+        let buffer = render(&mut app, width, height);
+        let text = last_row(&buffer);
+        let label = if width >= 100 {
+            " Update v9.9.9 "
+        } else {
+            " Update "
+        };
+        assert!(text.ends_with(label), "{text}");
+        assert!(text.starts_with(" ^Q Quit"), "{text}");
+        assert_eq!(app.update_area.y, height - 1);
+        assert_eq!(app.update_area.right(), width);
+        assert_eq!(usize::from(app.update_area.width), label.chars().count());
+        assert_eq!(app.crew_area, crew_before);
+
+        let bar = Rect::new(0, height - 1, width, 1);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| app.draw_shortcut_bar(f, bar, true))
+            .unwrap();
+        let text = last_row(terminal.backend().buffer());
+        assert!(text.ends_with(&format!("{label}  F4 Abandon  ")), "{text}");
+        let abandon = app.live.as_ref().unwrap().abandon_area;
+        assert_eq!(abandon.right(), width);
+        assert_eq!(app.update_area.right(), abandon.x);
+        assert_eq!(text.contains('…'), width < 100, "{text}");
+        let shortcuts: String = text.chars().take(usize::from(app.update_area.x)).collect();
+        assert!(!shortcuts.contains("Update"), "{shortcuts}");
     }
 }
 

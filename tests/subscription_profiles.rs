@@ -109,5 +109,30 @@ esac
     assert!(!command(&["auth", "login", "codex", "link"])
         .status
         .success());
+    let broken = command(&["auth", "disconnect", "codex", "beta"]);
+    assert!(broken.status.success());
+    assert_eq!(
+        broken.stdout,
+        b"Disconnected codex/beta. Its profile folder is removed.\n"
+    );
+    assert!(!profiles.join("codex/beta").exists());
+    assert!(command(&["auth", "disconnect", "claude", "alpha"])
+        .status
+        .success());
+    assert!(!profiles.join("claude/alpha").exists());
+    assert!(!command(&["auth", "disconnect", "claude", "alpha"])
+        .status
+        .success());
+    assert!(!command(&["auth", "disconnect", "codex", "../alpha"])
+        .status
+        .success());
+    assert!(!command(&["auth", "disconnect", "codex", "link"])
+        .status
+        .success());
+    assert!(profiles.join("codex/alpha").is_dir());
+    assert_eq!(
+        command(&["auth", "list"]).stdout,
+        b"claude beta\nclaude pilot@example.test\ncodex alpha\ncodex main\n"
+    );
     fs::remove_dir_all(workspace).unwrap();
 }

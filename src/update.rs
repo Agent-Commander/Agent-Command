@@ -93,6 +93,95 @@ fn apply(latest: Option<&str>) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Applied {
+    Installed,
+    HandedOff,
+}
+
+pub(crate) fn finished_message(latest: &str, applied: Applied) -> String {
+    match applied {
+        Applied::Installed => {
+            format!("Agent Command updated to {latest}. Run agent-command to open the new version.")
+        }
+        Applied::HandedOff => format!(
+            "Agent Command {latest} is installing in a new PowerShell window and opens when it finishes."
+        ),
+    }
+}
+
+pub(crate) fn apply_in_app(latest: &str) -> io::Result<Applied> {
+    if cfg!(debug_assertions) {
+        return Err(io::Error::other(DEVELOPMENT_REFUSAL));
+    }
+    if cfg!(windows) {
+        let script = windows_updater_script(std::process::id(), custom_dir().as_deref());
+        return hand_off(&script).map(|()| Applied::HandedOff);
+    }
+    if install(latest) {
+        Ok(Applied::Installed)
+    } else {
+        Err(io::Error::other("the installer did not finish"))
+    }
+}
+
+pub(crate) fn windows_updater_script(pid: u32, dir: Option<&Path>) -> String {
+    format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; {}",
+        command(true, dir)
+    )
+}
+
+fn windows_launcher(script: &str) -> String {
+    format!(
+        "Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{}'",
+        encoded_command(script)
+    )
+}
+
+fn encoded_command(script: &str) -> String {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64(&bytes)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = chunk.iter().enumerate().fold(0u32, |value, (index, byte)| {
+            value | u32::from(*byte) << (16 - 8 * index)
+        });
+        for position in 0..4 {
+            if position <= chunk.len() {
+                let sextet = (value >> (18 - 6 * position)) & 0x3f;
+                encoded.push(char::from(ALPHABET[sextet as usize]));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
+}
+
+fn hand_off(script: &str) -> io::Result<()> {
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(windows_launcher(script))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "the PowerShell updater did not start ({status})"
+                )))
+            }
+        })
+}
+
 pub fn one_line_notice(latest: &str) -> String {
     notice(latest)
         .lines()
@@ -229,6 +318,58 @@ mod tests {
         assert!(!line.contains('\n'));
         assert!(line.starts_with("Agent Command 9.9.9 is available"));
         assert!(line.contains(INSTALLER));
+    }
+
+    #[test]
+    fn windows_updater_waits_for_this_process_then_runs_the_official_installer() {
+        let script = windows_updater_script(4242, None);
+        assert!(
+            script.starts_with("Wait-Process -Id 4242 -ErrorAction SilentlyContinue; "),
+            "{script}"
+        );
+        assert!(
+            script.ends_with(&format!("irm {INSTALLER}.ps1 | iex")),
+            "{script}"
+        );
+        assert_eq!(
+            format!("{INSTALLER}.ps1"),
+            "https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install.ps1"
+        );
+        let custom = windows_updater_script(7, Some(Path::new(r"C:\Tools\it's here")));
+        assert!(
+            custom.contains(r"$env:AGENT_COMMAND_INSTALL_DIR = 'C:\Tools\it''s here'; irm "),
+            "{custom}"
+        );
+        assert!(custom.find("Wait-Process") < custom.find("AGENT_COMMAND_INSTALL_DIR"));
+    }
+
+    #[test]
+    fn windows_launcher_passes_the_script_as_an_encoded_command() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(encoded_command("ab"), "YQBiAA==");
+        let launcher = windows_launcher(&windows_updater_script(1, None));
+        assert!(launcher.starts_with("Start-Process powershell -ArgumentList "));
+        assert!(launcher.contains("'-EncodedCommand','"));
+        assert!(!launcher.contains('|') && !launcher.contains('"'));
+    }
+
+    #[test]
+    fn finished_messages_name_the_new_version() {
+        assert!(finished_message("9.9.9", Applied::Installed).contains("updated to 9.9.9"));
+        assert!(finished_message("9.9.9", Applied::HandedOff).contains("PowerShell window"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn in_app_update_refuses_in_development_builds() {
+        assert_eq!(
+            apply_in_app("9.9.9").unwrap_err().to_string(),
+            DEVELOPMENT_REFUSAL
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ The command is `agent-command`, so tools already named `agent` are unaffected. I
 
 The installers download the latest published release. Re-running the installer updates the app. Close an existing instance before updating on Windows.
 
-At launch, release builds check once for a newer release in the background and show a one-line banner; press F6 or click it to dismiss. Nothing installs automatically. Run `agent-command update` to install a newer release (on Windows it prints the PowerShell command). Turn the launch check off in Settings, or set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip it regardless of Settings. Development builds never check.
+At launch, release builds check once for a newer release in the background. When one is found, an amber **Update** button appears at the bottom right of the shortcut bar (` Update v1.2.3 `, or ` Update ` on narrow terminals); it stays hidden while checking and when you are up to date. Nothing installs automatically. Click Update, press F6, or type `/update` to install it: on macOS and Linux the TUI steps aside, runs the checksum-verified `install.sh` (keeping a custom `AGENT_COMMAND_INSTALL_DIR`), then exits so you can start the new version; on Windows it opens a PowerShell window that waits for Agent Command to close, runs the official `install.ps1` (which verifies the SHA-256 and replaces `agent-command.exe`), and launches the new version. Updating is refused while a mission is running. If the update fails, the TUI returns with the reason and the button stays for a retry. Outside the TUI, run `agent-command update` (on Windows it prints the PowerShell command). Turn the launch check off in Settings, or set `AGENT_COMMAND_NO_UPDATE_CHECK=1` to skip it regardless of Settings. Development builds never check.
 
 ## Uninstall
 
@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/
 irm https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/uninstall.ps1 | iex
 ```
 
-Sign-ins and app data are kept: profiles in `~/.local/share/sub-auth` (or `SUB_AUTH_DIR`) and `theme.toml` stay where they are. To sign out, run `agent-command auth logout PROVIDER PROFILE` before uninstalling. If you also installed with Cargo, run `cargo uninstall agent-command`. Close Agent Command first on Windows.
+Sign-ins and app data are kept: profiles in `~/.local/share/sub-auth` (or `SUB_AUTH_DIR`) and `theme.toml` stay where they are. To sign out, run `agent-command auth logout PROVIDER PROFILE` before uninstalling, or `agent-command auth disconnect PROVIDER PROFILE` to also remove that profile folder. If you also installed with Cargo, run `cargo uninstall agent-command`. Close Agent Command first on Windows.
 
 Optional theme overrides use `AGENT_COMMAND_THEME`, or `agent-command/theme.toml` under `XDG_CONFIG_HOME`, Windows `APPDATA`, or `~/.config`. Settings are saved in `settings.toml` in that same `agent-command` directory.
 
@@ -88,11 +88,11 @@ Install says what is needed and links the docs instead of running. If the
 installer fails, the reason is shown and the app stays usable. If the new
 executable is not yet on this terminal's PATH, Agent Command checks the
 installer's directory above and uses that path for this session, saying which
-path it used. Otherwise, open a new terminal and press R. Settings > Providers
+path it used. Otherwise, open a new terminal and press R. Settings > Subscriptions
 offers the same Install button.
 
 On first run every installed CLI is pre-checked. Later, `/connect` and
-Settings > Connect new profile mark providers that already have a signed-in
+Settings > Connect subscription mark providers that already have a signed-in
 profile and pre-check only installed providers that do not; when every
 installed provider is signed in, nothing is pre-checked so you pick which one
 gets another account. Leave the profile name blank (`(auto from account)`) to
@@ -113,8 +113,21 @@ Click `Settings` at the right of the top bar, press F3, or type `/settings`.
 `/connect` opens the connect flow directly. Esc closes; mouse and keyboard
 (↑ ↓ Tab, Enter) both work. Settings lists:
 
-- **Providers**: every profile with its signed-in status, Connect new profile,
-  Reconnect, and Sign out (asks for confirmation; keeps the profile folder).
+- **Subscriptions**: every Claude and Codex profile with its signed-in status,
+  Reconnect, Disconnect and `+ Connect subscription`. Reconnect steps aside for
+  the provider's sign-in, then reloads the profile and its deck card; it works
+  on healthy profiles and on ones whose sign-in was refused, and a failure
+  shows the reason. Disconnect asks `Y Confirm disconnect` / `N Cancel`, then
+  signs the profile out if it can (a broken or signed-out profile still
+  disconnects), removes its folder under the profile root, clears any
+  Commander override, fallback or text-gen slot that pointed at it, and
+  removes it from Settings and the deck at once.
+  Click any card in the Token Burn deck to open Settings on that
+  subscription's Reconnect and Disconnect.
+  `/disconnect PROVIDER/PROFILE` opens that confirmation and
+  `/reconnect PROVIDER/PROFILE` signs that profile in again; a bare `claude` or
+  `codex` works when that provider has exactly one subscription, and
+  `/reconnect` for a provider with none opens Connect with it checked.
 - **Commander profile**: Auto or a specific profile, the same setting as
   `/entry` and F2.
 - **Commander mode**: Commander's permission mode (`workspace-auto` by
@@ -203,6 +216,9 @@ it with `/entry PROVIDER/PROFILE` (or `/entry auto`) or F2.
 /remove NAME                            remove a specialist and its workspace
 /settings                               open Settings (also F3 or the top-bar item)
 /connect                                connect a provider profile
+/disconnect [PROVIDER[/PROFILE]]        disconnect a subscription (asks to confirm); no argument opens Settings
+/reconnect [PROVIDER[/PROFILE]]         sign a subscription in again; no argument opens Settings
+/update                                 install the newer release (also F6 or the bottom-right Update button)
 /mode MODE                              set Commander's permission mode (read-only|supervised|auto-edits|workspace-auto)
 /btw QUESTION                           ask a read-only side question (alias /side)
 /goal CRITERIA                          pin a goal and keep taking turns until GOAL_MET
@@ -434,6 +450,7 @@ agent-command auth list
 agent-command auth status codex work
 agent-command auth run claude work -- --help
 agent-command auth logout claude work
+agent-command auth disconnect codex work
 ```
 
 Without a profile name, `auth login` names the profile from the signed-in
@@ -452,7 +469,10 @@ Profile directories use the existing sub-auth layout under
 `~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`. On Windows, use
 an NTFS directory so Agent Command can enforce user-only access. The
 provider handles browser sign-in and manages its own session in that profile.
-Logout keeps the named profile directory and its settings.
+Logout keeps the named profile directory and its settings. Disconnect signs
+out if the provider allows it, then removes the profile directory; it still
+removes a broken or signed-out profile and refuses names or links that would
+leave the profile root.
 
 Open `agent-command` from the workspace where the mission should run. By
 default, missions use the highest-ranked eligible profile (Auto). Press F2 or
@@ -460,8 +480,9 @@ click the profile row to cycle Auto and a saved override for each profile.
 Enter a mission and press Enter or click Send. The status and assistant output appear
 in the mission panel and ship's log. Commander runs one mission at a time;
 specialists run alongside it. Add, reconnect
-or sign out profiles from Settings (F3) or `/connect` without restarting; the
-CLI `auth login` and `auth logout` run the same sign-in and sign-out code.
+or disconnect profiles from Settings (F3), a deck card, `/connect`,
+`/reconnect` or `/disconnect` without restarting; the CLI `auth login` and
+`auth disconnect` run the same sign-in and disconnect code.
 
 ### Subscription usage in the terminal
 
