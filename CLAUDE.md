@@ -14,7 +14,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Run all three gates before every push. CI repeats them on Linux, macOS and Windows.
+Run all three gates before every push. CI repeats them on Linux, macOS and Windows; see [.github/CI-STANDARDS.md](.github/CI-STANDARDS.md) before editing workflows.
 
 ## Layout
 

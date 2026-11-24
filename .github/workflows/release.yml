@@ -6,6 +6,9 @@ on:
     paths: ['install/**', '.github/workflows/release.yml']
 permissions:
   contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
     strategy:
@@ -24,6 +27,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --bin agent-command --target ${{ matrix.target }}
@@ -59,7 +65,7 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
