@@ -359,6 +359,12 @@ impl Store {
         )
     }
 
+    pub(crate) fn ledger_path_for_workspace(&self, workspace: &Path) -> io::Result<PathBuf> {
+        Ok(self
+            .directory()?
+            .join(format!("ledger-{}.json", workspace_hash(workspace))))
+    }
+
     pub(crate) fn load_transcript_for_workspace(
         &self,
         workspace: &Path,
@@ -2209,14 +2215,18 @@ pub(crate) mod tests {
         store
             .append_history("nova", &Entry::now("nova  working".into()))
             .unwrap();
+        let workspace = scratch.0.join("work");
         store
-            .append_commander(&Entry::now("YOU  hello".into()))
+            .append_commander_for_workspace(&workspace, &Entry::now("YOU  hello".into()))
             .unwrap();
         let crew = store.load_roster().unwrap();
         assert_eq!(crew.len(), 1);
         assert_eq!(crew[0].status, Status::Error);
         assert_eq!(crew[0].history[0].text, "nova  working");
-        assert_eq!(store.load_commander().unwrap()[0].text, "YOU  hello");
+        assert_eq!(
+            store.load_commander_for_workspace(&workspace).unwrap()[0].text,
+            "YOU  hello"
+        );
         let roster = scratch
             .0
             .join("profiles")

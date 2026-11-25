@@ -1698,10 +1698,11 @@ fn build_transcript_lines_with_activity(
                 action: TranscriptHitAction::ToggleExpand { entry_index: start },
             });
             if expanded {
-                for sub_idx in start..idx {
+                for (sub_idx, entry) in transcript.entries.iter().enumerate().take(idx).skip(start)
+                {
                     render_single_entry(
                         sub_idx,
-                        &transcript.entries[sub_idx],
+                        entry,
                         max_width,
                         theme,
                         active_spinner,

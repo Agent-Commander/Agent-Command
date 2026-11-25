@@ -1,3 +1,9 @@
+use std::{os::unix::process::CommandExt, process::Command};
+
+pub(super) fn own_group(command: &mut Command) -> &mut Command {
+    command.process_group(0)
+}
+
 pub(super) fn kill_tree(pid: u32) {
     if pid == 0 {
         return;

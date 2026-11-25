@@ -271,6 +271,7 @@ pub struct Composer {
     history_scratch: String,
     drafts: HashMap<String, DraftSnapshot>,
     running: bool,
+    target: Option<String>,
     queued_messages: VecDeque<String>,
     last_area: Rect,
 }
@@ -295,6 +296,7 @@ impl Composer {
             history_scratch: String::new(),
             drafts: HashMap::new(),
             running: false,
+            target: None,
             queued_messages: VecDeque::new(),
             last_area: Rect::default(),
         }
@@ -326,6 +328,10 @@ impl Composer {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    pub fn set_target(&mut self, target: Option<String>) {
+        self.target = target;
     }
 
     pub fn set_running(&mut self, running: bool) {
@@ -982,10 +988,16 @@ impl Composer {
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible_h);
         if self.text.is_empty() {
-            let placeholder = if self.running {
-                "Type a follow-up (Enter: Queue · Ctrl+Enter: Steer)…"
-            } else {
-                "Ask Commander anything… (/ commands · @ files/models · ! shell)"
+            let placeholder = match &self.target {
+                Some(name) => {
+                    format!("Give {name} a task… (/ commands · @ files/models · ! shell)")
+                }
+                None if self.running => {
+                    "Type a follow-up (Enter: Queue · Ctrl+Enter: Steer)…".to_owned()
+                }
+                None => {
+                    "Ask Commander anything… (/ commands · @ files/models · ! shell)".to_owned()
+                }
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -995,7 +1007,7 @@ impl Composer {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    truncate_to_width(placeholder, text_w),
+                    truncate_to_width(&placeholder, text_w),
                     Style::default().fg(theme.subtle),
                 ),
             ]));

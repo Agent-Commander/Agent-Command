@@ -287,31 +287,27 @@ impl App {
         }
     }
 
-    pub fn update_pill_text(&self, bar_width: u16) -> String {
+    pub fn update_button_visible(&self) -> bool {
+        self.update_available.is_some()
+            || matches!(
+                self.update_state,
+                UpdateState::Available { .. } | UpdateState::Downloading { .. }
+            )
+    }
+
+    pub fn update_button_label(&self, bar_width: u16) -> Option<String> {
         if let UpdateState::Downloading { pct } = &self.update_state {
-            return format!("⬇ Updating {pct}%");
+            return Some(format!("⬇ Updating {pct}%"));
         }
-        if let Some(latest) = self.update_available.as_deref() {
-            return if bar_width >= 100 {
-                format!("⬆ Update v{latest} (F6)")
-            } else {
-                format!("⬆ Update v{latest}")
-            };
-        }
-        match &self.update_state {
-            UpdateState::Available { tag, .. } => {
-                let ver = tag.trim_start_matches('v');
-                if bar_width >= 100 {
-                    format!("⬆ Update v{ver} (F6)")
-                } else {
-                    format!("⬆ Update v{ver}")
-                }
-            }
-            UpdateState::Idle | UpdateState::UpToDate { .. } if bar_width < 75 => {
-                "↻ Update".to_owned()
-            }
-            other => other.pill_label(),
-        }
+        let version = self
+            .update_available
+            .clone()
+            .or_else(|| self.update_state.available_version().map(str::to_owned))?;
+        Some(if bar_width >= 100 {
+            format!("⬆ Update v{version} (F6)")
+        } else {
+            format!("⬆ Update v{version}")
+        })
     }
 
     pub fn connection_summary(&self, provider: Provider) -> (bool, String) {
@@ -542,6 +538,7 @@ impl App {
                 self.persist_commander_transcript();
             }
             AppEvent::WorkerWake(result) => {
+                self.note_worker_wake(&result);
                 let status = if result.is_error {
                     DelegationStatus::Failed
                 } else {
@@ -581,12 +578,14 @@ impl App {
                 .effective_soul_path()
                 .map(crate::soul::SoulStore::new)
                 .or_else(crate::soul::SoulStore::from_env);
+            let ask_user = bridge::AskUserBroker::new(false);
+            live.ask_user = Some(ask_user.clone());
             let config = bridge::BridgeSessionConfig {
                 workspace_root: live.workspace.clone(),
                 profile_root: root,
                 soul,
                 catalog: bridge::ExternalToolCatalog::new(),
-                ask_user: bridge::AskUserBroker::new(false),
+                ask_user,
                 wake_queue: bridge::WakeQueue::new(),
                 shutdown: Arc::new(AtomicBool::new(false)),
             };
@@ -842,8 +841,11 @@ impl App {
         let items = crate::tui::build_palette_items(
             &self.crew,
             profiles,
-            self.rail_open,
-            self.update_available.as_deref(),
+            crate::tui::PaletteState {
+                rail_open: self.rail_open,
+                left_panel_open: self.left_panel_visible(),
+                update_available: self.update_available.as_deref(),
+            },
         );
         self.palette.set_items(items);
         self.palette.open();
@@ -859,6 +861,13 @@ impl App {
                 }
                 self.editing = true;
             }
+            "view.left" => {
+                self.toggle_left_panel();
+                self.editing = true;
+            }
+            "view.tab.chat" => self.set_view_tab(crate::tui::tabs::ViewTab::Chat),
+            "view.tab.inbox" => self.set_view_tab(crate::tui::tabs::ViewTab::Inbox),
+            "view.tab.ledger" => self.set_view_tab(crate::tui::tabs::ViewTab::Ledger),
             "settings.open" => self.open_settings(),
             "transcript.copy" => self.copy_latest_reply(),
             "update.trigger" => self.request_update(),
@@ -1021,6 +1030,8 @@ impl App {
             "\n### Shortcuts\n\n\
              - `Ctrl+P` / `Ctrl+K` — Fuzzy command palette\n\
              - `Ctrl+B` — Toggle collapsible right rail\n\
+             - `F8` / `Ctrl+\\` — Toggle left panel · `Shift+Tab` focus it\n\
+             - `Alt+1` / `Alt+2` / `Alt+3` — Chat / Inbox / Ledger tabs\n\
              - `Ctrl+E` — Expand or collapse thinking / tool card\n\
              - `Ctrl+Y` — Copy latest reply (host clipboard + OSC 52)\n\
              - `Shift+Enter` / `Alt+Enter` / `Ctrl+J` — Multiline newline\n\
@@ -1282,6 +1293,10 @@ impl App {
                 DiffModalAction::Closed => self.editing = true,
                 DiffModalAction::None => {}
             }
+            return;
+        }
+
+        if self.handle_view_key(key) {
             return;
         }
 
@@ -1634,6 +1649,15 @@ impl App {
             return;
         }
         if let Some((_, hit)) = self
+            .left_hits
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, x, y))
+            .copied()
+        {
+            self.handle_tab_hit(hit);
+            return;
+        }
+        if let Some((_, hit)) = self
             .rail_hits
             .iter()
             .find(|(rect, _)| rect_contains(*rect, x, y))
@@ -1654,7 +1678,16 @@ impl App {
                 RailHit::OpenDiff => self.open_diff_viewer(None),
                 RailHit::OpenPr => self.open_pr(None, false),
                 RailHit::OpenSettings => self.open_settings(),
-                RailHit::OpenConnect(_) => self.open_settings(),
+                RailHit::OpenConnect(provider) => {
+                    match self.live.as_ref().and_then(|live| {
+                        live.profiles
+                            .iter()
+                            .position(|profile| profile.provider == provider)
+                    }) {
+                        Some(index) => self.open_subscription(index, false),
+                        None => self.open_settings(),
+                    }
+                }
             }
             return;
         }
@@ -1664,6 +1697,9 @@ impl App {
             return;
         }
 
+        if self.view_tab != crate::tui::tabs::ViewTab::Chat {
+            return;
+        }
         let name = self.crew[self.selected].name.clone();
         let hit_action = if name == specialists::COMMANDER {
             self.scroll.hit_test(x, y).cloned()
@@ -1701,40 +1737,10 @@ impl App {
                 self.notice = "Dismissed connection prompt.".into();
             }
             TranscriptHitAction::AllowProdGate { req_id } => {
-                let run_name = self
-                    .live
-                    .as_mut()
-                    .and_then(|live| live.pending_prod_gates.remove(&req_id))
-                    .unwrap_or_else(|| thread_name.to_owned());
-                if let Some(live) = &self.live {
-                    if let Some(pos) = live.run_position(&run_name) {
-                        let _ = live.runs[pos]
-                            .mission
-                            .respond_permission(&req_id, true, None);
-                    }
-                }
-                self.transcript_for_mut(&run_name)
-                    .resolve_prod_gate(&req_id);
-                self.notice = "Allowed ProdGate action.".into();
+                self.resolve_prod_gate(&req_id, thread_name, true);
             }
             TranscriptHitAction::DenyProdGate { req_id } => {
-                let run_name = self
-                    .live
-                    .as_mut()
-                    .and_then(|live| live.pending_prod_gates.remove(&req_id))
-                    .unwrap_or_else(|| thread_name.to_owned());
-                if let Some(live) = &self.live {
-                    if let Some(pos) = live.run_position(&run_name) {
-                        let _ = live.runs[pos].mission.respond_permission(
-                            &req_id,
-                            false,
-                            Some("User denied destructive action via ProdGate."),
-                        );
-                    }
-                }
-                self.transcript_for_mut(&run_name)
-                    .resolve_prod_gate(&req_id);
-                self.notice = "Denied ProdGate action.".into();
+                self.resolve_prod_gate(&req_id, thread_name, false);
             }
             TranscriptHitAction::SelectDelegation { worker } => {
                 if let Some(idx) = specialists::find(&self.crew, &worker) {
