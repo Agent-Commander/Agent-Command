@@ -791,7 +791,9 @@ fn clicking_a_deck_card_opens_settings_on_that_subscription() {
     }
 }
 
+#[cfg(unix)]
 const DECK_WIDTH: u16 = 140;
+#[cfg(unix)]
 const DECK_HEIGHT: u16 = 40;
 
 fn last_row(buffer: &Buffer) -> String {
