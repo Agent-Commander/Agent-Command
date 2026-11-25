@@ -1,12 +1,16 @@
 use super::*;
 use crate::settings::LaunchConfig;
 #[cfg(unix)]
-use crate::Live;
+use crate::{tui::render::RailHit, Live};
 use crossterm::event::KeyModifiers;
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 use std::{cell::RefCell, collections::BTreeSet, ffi::OsString, fs, path::PathBuf, rc::Rc};
 
 const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
+#[cfg(unix)]
+const RAIL_SIZES: [(u16, u16); 2] = [(100, 30), (120, 40)];
+#[cfg(unix)]
+const RAIL_WIDTH: u16 = 100;
 const COMMAND_WIDTH: usize = PANEL_MAX_WIDTH as usize - 6;
 
 #[derive(Default)]
@@ -316,10 +320,13 @@ fn skip_leaves_the_app_usable_with_a_one_line_hint() {
         }
         assert!(app.panel.is_none());
         let buffer = render(&mut app, width, height);
-        assert!(row(&buffer, height - 2).contains(NO_PROVIDER_HINT));
+        assert_eq!(app.notice, NO_PROVIDER_HINT);
+        let footer = row(&buffer, height - 1);
+        assert!(footer.contains("No provider connected"), "{footer}");
         app.notice.clear();
         let buffer = render(&mut app, width, height);
-        assert!(row(&buffer, height - 2).contains(NO_PROVIDER_HINT));
+        let top = row(&buffer, 0);
+        assert!(top.contains("Commander [No provider]"), "{top}");
         app.input = "Hello".into();
         app.submit();
         assert!(app.notice.contains(NO_PROVIDER_HINT), "{}", app.notice);
@@ -335,9 +342,9 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
         if index == 0 {
-            press(&mut app, KeyCode::Tab);
-            press(&mut app, KeyCode::Tab);
-            press(&mut app, KeyCode::Tab);
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Tab);
+            }
             assert!(app.editing_name());
             for c in "maix".chars() {
                 press(&mut app, KeyCode::Char(c));
@@ -364,7 +371,7 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
         assert_eq!(live.profiles[0].to_string(), "claude/main");
         assert_eq!(live.signed_in, [true]);
         let text = screen(&render(&mut app, width, height));
-        assert!(text.contains("claude · main"), "{text}");
+        assert!(text.contains("Commander [Claude · main]"), "{text}");
         assert!(!text.contains(NO_PROVIDER_HINT));
         press(&mut app, KeyCode::F(3));
         let text = screen(&render(&mut app, width, height));
@@ -556,8 +563,13 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         let mut app = launched(&sandbox, &host);
         app.live.as_mut().unwrap().preferred = Some(1);
         app.live.as_ref().unwrap().save_override().unwrap();
-        assert!(screen(&render(&mut app, width, height)).contains("codex"));
-        assert_eq!(app.deck_hits.len(), 2);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("Commander [Codex · work]"), "{text}");
+        assert_eq!(labels(&app), ["claude/main", "codex/work"]);
+        assert_eq!(
+            connection_rows(&app),
+            if width >= RAIL_WIDTH { 3 } else { 0 }
+        );
         press(&mut app, KeyCode::F(3));
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("SUBSCRIPTIONS"), "{text}");
@@ -612,8 +624,18 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         assert!(!app.panel_actions().contains(&Action::Disconnect(1)));
         press(&mut app, KeyCode::Esc);
         let text = screen(&render(&mut app, width, height));
-        assert!(!text.contains("codex"), "{text}");
-        assert_eq!(app.deck_hits.len(), 1);
+        assert!(
+            !text.contains("codex/work") && !text.contains("Codex · work"),
+            "{text}"
+        );
+        assert_eq!(labels(&app), ["claude/main"]);
+        if width >= RAIL_WIDTH {
+            let codex = rail_row(&app, Provider::Codex);
+            click(&mut app, codex);
+            assert!(matches!(app.panel, Some(Panel::Settings(_))));
+            assert!(!app.panel_actions().contains(&Action::Disconnect(1)));
+            press(&mut app, KeyCode::Esc);
+        }
     }
 }
 
@@ -705,8 +727,8 @@ fn disconnect_and_reconnect_commands_target_one_subscription() {
         "{}",
         app.notice
     );
-    send(&mut app, "/disconnect gemini");
-    assert!(app.notice.contains("No subscription named gemini"));
+    send(&mut app, "/disconnect ghost");
+    assert!(app.notice.contains("No subscription named ghost"));
     send(&mut app, "/reconnect codex");
     assert!(app.panel.is_none() && app.notice.contains("Name one as PROVIDER/PROFILE"));
     assert!(host.0.borrow().calls.is_empty());
@@ -756,14 +778,14 @@ fn disconnect_and_reconnect_commands_target_one_subscription() {
 #[cfg(unix)]
 #[test]
 fn clicking_a_deck_card_opens_settings_on_that_subscription() {
-    for (width, height) in SIZES {
+    for (width, height) in RAIL_SIZES {
         let sandbox = Sandbox::new(&format!("deck-click-{width}"));
         existing(&sandbox, Provider::Claude, "main");
         existing(&sandbox, Provider::Codex, "work");
         let host = fake([true, true], &["claude/main", "codex/work"]);
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
-        let card = app.deck_hits[1].1;
+        let card = rail_row(&app, Provider::Codex);
         assert!(card.width > 0 && card.right() <= width && card.bottom() <= height);
         app.click(card.x + card.width / 2, card.y + card.height / 2);
         assert!(matches!(app.panel, Some(Panel::Settings(_))));
@@ -782,11 +804,28 @@ fn clicking_a_deck_card_opens_settings_on_that_subscription() {
         press(&mut app, KeyCode::Esc);
 
         render(&mut app, width, height);
-        let card = app.deck_hits[0].1;
+        let card = rail_row(&app, Provider::Claude);
         app.click(card.x, card.y);
         assert_eq!(app.focused_action(), Some(Action::Reconnect(0)));
         assert!(host.0.borrow().calls.is_empty());
     }
+}
+
+#[cfg(unix)]
+fn connection_rows(app: &App) -> usize {
+    app.rail_hits
+        .iter()
+        .filter(|(_, hit)| matches!(hit, RailHit::OpenConnect(_)))
+        .count()
+}
+
+#[cfg(unix)]
+fn rail_row(app: &App, provider: Provider) -> Rect {
+    app.rail_hits
+        .iter()
+        .find(|(_, hit)| *hit == RailHit::OpenConnect(provider))
+        .map(|(rect, _)| *rect)
+        .unwrap_or_else(|| panic!("no rail row for {provider:?}"))
 }
 
 fn last_row(buffer: &Buffer) -> String {
@@ -1351,7 +1390,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
     for (width, height) in SIZES {
         let sandbox = Sandbox::new(&format!("connect-auto-{width}"));
         let host = fake([true, true], &[]);
-        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example")];
+        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example"), None];
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
         let area = hit(&app, Action::Connect);
@@ -1393,7 +1432,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
 fn a_typed_profile_name_overrides_the_account_name() {
     let sandbox = Sandbox::new("connect-custom");
     let host = fake([true, false], &[]);
-    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None];
+    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None, None];
     let mut app = launched(&sandbox, &host);
     if let Some(Panel::Connect(form)) = &mut app.panel {
         form.name = "work".into();

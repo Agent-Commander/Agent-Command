@@ -662,6 +662,17 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
+    pub(crate) const READ_PROMPT: &str = r#"read_prompt() {
+    case "$*" in
+        *"--input-format stream-json"*)
+            IFS= read -r line
+            line=${line#*'"text":"'}
+            line=${line%'","type":"text"}'*}
+            printf '%b' "$(printf '%s' "$line" | sed 's/\\"/"/g')" ;;
+        *) cat ;;
+    esac
+}"#;
+
     pub(crate) struct Fixture {
         pub(crate) root: PathBuf,
         pub(crate) executable: PathBuf,
@@ -672,7 +683,7 @@ pub(crate) mod tests {
             let root = std::env::temp_dir().join(format!("ac-{name}-{}", std::process::id()));
             fs::create_dir(&root).unwrap();
             let executable = root.join("provider");
-            fs::write(&executable, format!("#!/bin/sh\n{script}")).unwrap();
+            fs::write(&executable, format!("#!/bin/sh\n{READ_PROMPT}\n{script}")).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             Self { root, executable }
         }

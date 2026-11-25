@@ -425,6 +425,7 @@ impl WarmSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        process_tree::own_group(&mut command);
 
         let mut child = command.spawn()?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
@@ -2196,6 +2197,7 @@ fn run(
         Some(next) => next.claim.start(next.profile, workspace, &prompt)?,
         None => prompt,
     };
+    process_tree::own_group(&mut command);
     let mut child = command.spawn().inspect_err(|error| {
         let code = classify_health(&[], Some(error));
         let _ = norm_sender.send(NormalizedEvent::TurnFinished {
@@ -2789,7 +2791,7 @@ mod engine_tests {
             cmd.args(["-c", "sleep 20"]);
             cmd
         };
-        let mut child = command
+        let mut child = process_tree::own_group(&mut command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3068,7 +3070,7 @@ if test "$1" = auth; then
     exit
 fi
 printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 if test "$profile" = first; then
     case "$prompt" in *"Keep the finished step") ;; *) exit 7 ;; esac
     printf 'done\n' >> completed
@@ -3198,7 +3200,7 @@ for arg; do
     fi
 done
 printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 if ! test -f "$work/.git/limited"; then
     : > "$work/.git/limited"
     printf 'done\n' >> completed
@@ -3570,8 +3572,9 @@ fi
                 .unwrap();
             assert!(
                 child.status.success(),
-                "{}",
-                String::from_utf8_lossy(&child.stdout)
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
             );
             assert!(Claim::pending(&profiles, &workspace).unwrap().is_none());
             assert!(claim
@@ -3611,21 +3614,31 @@ fi
             Profile::named_fixture(&root, Provider::Claude, name, PathBuf::from(&executable))
         });
         let mut app = crate::App::live(workspace);
-        app.live.as_mut().unwrap().profiles = profiles.into();
+        let live = app.live.as_mut().unwrap();
+        live.profiles = profiles.into();
+        live.pending = Claim::pending(&live.profiles, &live.workspace).unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        let notice: String = (0..80).map(|x| buffer[(x, 22)].symbol()).collect();
-        assert!(notice.contains("Interrupted continuation pending"));
+        let notice: String = (0..80).map(|x| buffer[(x, 23)].symbol()).collect();
+        assert!(
+            notice.contains("Interrupted cont") && notice.contains("F4 Abandon"),
+            "{notice}"
+        );
         if std::env::var("AC_RECOVERY_TEST_ACTION").unwrap() == "abandon" {
             let button = app.live.as_ref().unwrap().abandon_area;
             app.click(button.x, button.y);
             assert!(app.notice.contains("abandoned"));
             return;
         }
-        app.input = "Keep the finished step".into();
-        app.click(app.send_area.x, app.send_area.y);
+        app.click(app.input_area.x + 1, app.input_area.y + 1);
+        assert!(app.editing);
+        app.composer.set_text("Keep the finished step");
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while app.mission_running() {
             assert!(std::time::Instant::now() < deadline);
@@ -3799,7 +3812,7 @@ case "$1" in
     -c) if test "$5" = login; then printf '%s\n' 'Logged in using ChatGPT' >&2; exit; fi ;;
 esac
 mkdir running.lock || exit 5
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 profile=${CLAUDE_CONFIG_DIR##*/}
 test -n "$CLAUDE_CONFIG_DIR" || profile=${CODEX_HOME##*/}
 printf '%s|%s|%s\n' "$profile" "$*" "$prompt" >> starts

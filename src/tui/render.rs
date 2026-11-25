@@ -180,6 +180,8 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
         && !app.palette.is_open()
         && !app.diff_modal.is_open()
         && app.panel.is_none();
+    let target = (app.selected > 0).then(|| app.crew[app.selected].name.clone());
+    app.composer.set_target(target);
     app.composer
         .render(frame, composer_area, composer_focused, &palette);
 
@@ -408,6 +410,22 @@ fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette
     }
 
     let selected_key = app.crew[app.selected].name.clone();
+    if let Some(banner) = app.collapsed_snooze(&selected_key) {
+        let mut collapsed = markdown::Transcript::new();
+        collapsed.push(markdown::TranscriptEntry::SystemNotice {
+            level: markdown::NoticeLevel::Warning,
+            text: banner.to_owned(),
+        });
+        markdown::render_transcript_with_activity(
+            frame,
+            content_area,
+            &collapsed,
+            &mut markdown::ScrollState::new(),
+            palette,
+            None,
+        );
+        return;
+    }
     let activity = app.active_live_activity(&selected_key);
     if selected_key == specialists::COMMANDER {
         markdown::render_transcript_with_activity(

@@ -1678,7 +1678,16 @@ impl App {
                 RailHit::OpenDiff => self.open_diff_viewer(None),
                 RailHit::OpenPr => self.open_pr(None, false),
                 RailHit::OpenSettings => self.open_settings(),
-                RailHit::OpenConnect(_) => self.open_settings(),
+                RailHit::OpenConnect(provider) => {
+                    match self.live.as_ref().and_then(|live| {
+                        live.profiles
+                            .iter()
+                            .position(|profile| profile.provider == provider)
+                    }) {
+                        Some(index) => self.open_subscription(index, false),
+                        None => self.open_settings(),
+                    }
+                }
             }
             return;
         }

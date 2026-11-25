@@ -5,6 +5,10 @@ use std::{
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+pub(super) fn own_group(command: &mut Command) -> &mut Command {
+    command
+}
+
 pub(super) fn kill_tree(pid: u32) {
     if pid == 0 {
         return;
