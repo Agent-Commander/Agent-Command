@@ -166,9 +166,10 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(String::from_utf8_lossy(&reviewed.stderr).contains("no recorded changes"));
     let playtester = run(&["spawn", "quinn", "playtester"]);
     assert!(String::from_utf8_lossy(&playtester.stdout).contains("(playtester, read-only)"));
-    assert!(root
+    assert!(!root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
-        .is_dir());
+        .exists());
+    assert!(status.contains(&base.canonicalize().unwrap().display().to_string()));
     let diff = run(&["diff", "echo"]);
     assert!(!diff.status.success());
     assert!(String::from_utf8_lossy(&diff.stderr).contains("plain directory"));
@@ -184,6 +185,7 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(!run(&["settle", "echo"]).status.success());
     assert!(run(&["unsettle", "echo"]).status.success());
     assert!(run(&["remove", "echo"]).status.success());
+    assert!(base.is_dir());
     assert!(!run(&["status", "echo"]).status.success());
     assert!(!run(&["unknown"]).status.success());
     std::fs::remove_dir_all(root).unwrap();
@@ -267,9 +269,10 @@ fn mcp_stdio_binary_answers_initialize_tools_and_refuses_traversal() {
     assert!(line(2).contains("delegate_task"));
     assert!(line(3).contains("-32602"));
     assert!(line(4).contains("\"isError\":false"));
-    assert!(root
+    assert!(!root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
-        .is_dir());
+        .exists());
+    assert!(base.is_dir());
     std::fs::remove_dir_all(root).unwrap();
 }
 
