@@ -557,6 +557,7 @@ pub struct App {
     update_receiver: Option<Receiver<String>>,
     pub update_available: Option<String>,
     pub update_state: update::UpdateState,
+    pub(crate) manual_update_check: bool,
     pub update_area: Rect,
     exit_message: Option<String>,
     pub(crate) relaunch_executable: Option<PathBuf>,
@@ -633,6 +634,7 @@ impl Default for App {
             update_receiver: None,
             update_available: None,
             update_state: update::UpdateState::Idle,
+            manual_update_check: false,
             update_area: Rect::default(),
             exit_message: None,
             relaunch_executable: None,
@@ -3279,7 +3281,7 @@ esac
             let buffer = screen(&mut app, width, height);
             assert!(app.update_area.width > 0);
             assert_eq!(app.update_area.right(), width);
-            assert!(row(&buffer, height - 1).contains(update::CURRENT));
+            assert!(row(&buffer, height - 1).contains("Checking…"));
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
             assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
@@ -3311,16 +3313,62 @@ esac
     #[test]
     fn update_pill_adapts_across_states_and_widths() {
         let mut app = App::default();
-        assert!(app.update_pill_text(80).contains(update::CURRENT));
+        assert_eq!(app.update_pill_text(60), "↻ Update");
+        assert_eq!(
+            app.update_pill_text(80),
+            format!("↻ Update · v{}", update::CURRENT)
+        );
         app.update_state = update::UpdateState::Checking;
-        assert!(app.update_pill_text(120).contains("checking"));
+        assert_eq!(app.update_pill_text(120), "↻ Checking…");
         app.update_state = update::UpdateState::UpToDate {
             current: update::CURRENT.to_owned(),
         };
-        assert!(app.update_pill_text(120).contains("✓"));
+        assert_eq!(app.update_pill_text(74), "↻ Update");
+        assert_eq!(
+            app.update_pill_text(120),
+            format!("↻ Update · v{}", update::CURRENT)
+        );
+        app.update_state = update::UpdateState::Failed("offline".into());
+        assert_eq!(app.update_pill_text(60), "↻ Update (retry)");
+        assert_eq!(app.update_pill_text(120), "↻ Update (retry)");
         app.update_available = Some("1.2.3".into());
         assert_eq!(app.update_pill_text(80), "⬆ Update v1.2.3");
         assert_eq!(app.update_pill_text(120), "⬆ Update v1.2.3 (F6)");
+        app.update_state = update::UpdateState::Downloading { pct: 42 };
+        assert_eq!(app.update_pill_text(120), "⬇ Updating 42%");
+    }
+
+    #[test]
+    fn manual_update_check_reports_clear_feedback_when_completed() {
+        let mut app = App {
+            manual_update_check: true,
+            update_state: update::UpdateState::Checking,
+            ..App::default()
+        };
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+        ));
+        assert!(!app.manual_update_check);
+        assert_eq!(app.notice, format!("Up to date (v{})", update::CURRENT));
+
+        app.manual_update_check = true;
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: update::CURRENT.to_owned(),
+            },
+        ));
+        assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+        assert!(app.notice.contains("Update v0.9.0 available"));
+
+        app.manual_update_check = true;
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::Failed("network offline".into()),
+        ));
+        assert!(app.update_available.is_none());
+        assert!(app.notice.contains("network offline"));
     }
 
     #[test]

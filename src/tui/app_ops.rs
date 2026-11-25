@@ -23,7 +23,7 @@ use crate::{
         events::{self, AppEvent, ChangedFile},
         render::{FocusBannerHit, RailHit, WelcomeHit},
     },
-    update::{self, UpdateState},
+    update::UpdateState,
     usage, App,
 };
 
@@ -179,6 +179,9 @@ impl App {
     }
 
     pub fn update_pill_text(&self, bar_width: u16) -> String {
+        if let UpdateState::Downloading { pct } = &self.update_state {
+            return format!("⬇ Updating {pct}%");
+        }
         if let Some(latest) = self.update_available.as_deref() {
             return if bar_width >= 100 {
                 format!("⬆ Update v{latest} (F6)")
@@ -195,8 +198,8 @@ impl App {
                     format!("⬆ Update v{ver}")
                 }
             }
-            UpdateState::Failed(_) if bar_width < 92 => {
-                format!("v{} · retry", update::CURRENT)
+            UpdateState::Idle | UpdateState::UpToDate { .. } if bar_width < 75 => {
+                "↻ Update".to_owned()
             }
             other => other.pill_label(),
         }
@@ -295,6 +298,7 @@ impl App {
     }
 
     pub(crate) fn trigger_live_update_check(&mut self) {
+        self.manual_update_check = true;
         self.update_state = UpdateState::Checking;
         self.notice = "Checking GitHub releases…".into();
         if let Some(tx) = &self.bg_tx {
@@ -330,7 +334,7 @@ impl App {
         }
     }
 
-    fn apply_background_event(&mut self, event: AppEvent) {
+    pub(crate) fn apply_background_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::AuthDetected {
                 detections,
@@ -365,6 +369,18 @@ impl App {
                     self.update_available = Some(ver.to_owned());
                 } else {
                     self.update_available = None;
+                }
+                if std::mem::take(&mut self.manual_update_check) {
+                    self.notice = match &state {
+                        UpdateState::UpToDate { current } => format!("Up to date (v{current})"),
+                        UpdateState::Available { tag, .. } => {
+                            format!("Update {tag} available — press F6 or click Update")
+                        }
+                        UpdateState::Failed(err) => format!("Update check failed: {err}"),
+                        UpdateState::Idle
+                        | UpdateState::Checking
+                        | UpdateState::Downloading { .. } => String::new(),
+                    };
                 }
                 self.update_state = state;
             }

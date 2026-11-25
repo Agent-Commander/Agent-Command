@@ -226,25 +226,61 @@ fn command_palette_and_diff_viewer_work_via_keyboard_and_mouse() {
 #[test]
 fn bottom_right_update_pill_is_always_visible_across_states() {
     let mut app = App::default();
-    for state in [
-        UpdateState::Checking,
-        UpdateState::UpToDate {
-            current: update::CURRENT.to_owned(),
-        },
-        UpdateState::Failed("offline".into()),
-        UpdateState::Available {
-            tag: "v0.9.0".into(),
-            current: update::CURRENT.to_owned(),
-        },
+    let footer_bg = app.ui_palette.surface;
+    for (state, expected_narrow, expected_wide) in [
+        (
+            UpdateState::Idle,
+            "↻ Update",
+            format!("↻ Update · v{}", update::CURRENT),
+        ),
+        (
+            UpdateState::Checking,
+            "↻ Checking…",
+            "↻ Checking…".to_owned(),
+        ),
+        (
+            UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+            "↻ Update",
+            format!("↻ Update · v{}", update::CURRENT),
+        ),
+        (
+            UpdateState::Failed("offline".into()),
+            "↻ Update (retry)",
+            "↻ Update (retry)".to_owned(),
+        ),
+        (
+            UpdateState::Downloading { pct: 50 },
+            "⬇ Updating 50%",
+            "⬇ Updating 50%".to_owned(),
+        ),
+        (
+            UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: update::CURRENT.to_owned(),
+            },
+            "⬆ Update v0.9.0",
+            "⬆ Update v0.9.0 (F6)".to_owned(),
+        ),
     ] {
         app.update_state = state;
-        for (w, h) in [(80, 24), (120, 40)] {
+        for (w, h) in [(60, 20), (80, 24), (120, 40)] {
             let buf = render(&mut app, w, h);
             assert!(app.update_area.width > 0);
             assert_eq!(app.update_area.right(), w);
             assert_eq!(app.update_area.y, h - 1);
             let pill = text(&buf, app.update_area);
-            assert!(!pill.trim().is_empty());
+            let expected = if w < 75 {
+                expected_narrow
+            } else if w >= 100 {
+                expected_wide.as_str()
+            } else {
+                expected_wide.trim_end_matches(" (F6)")
+            };
+            assert_eq!(pill.trim(), expected, "{w}x{h}: {pill}");
+            let cell = &buf[(app.update_area.x, app.update_area.y)];
+            assert_ne!(cell.bg, footer_bg, "{w}x{h} button must contrast footer bg");
         }
     }
 }

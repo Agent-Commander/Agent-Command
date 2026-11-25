@@ -947,18 +947,30 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
     }
 
     let pill_style = match &app.update_state {
-        UpdateState::Available { .. } => Style::default()
-            .fg(palette.bg)
-            .bg(palette.warning)
-            .add_modifier(Modifier::BOLD),
         UpdateState::Downloading { .. } => Style::default()
             .fg(palette.bg)
             .bg(palette.accent)
             .add_modifier(Modifier::BOLD),
-        UpdateState::Failed(_) => Style::default().fg(palette.warning).bg(palette.surface_alt),
-        UpdateState::Idle | UpdateState::Checking | UpdateState::UpToDate { .. } => {
-            Style::default().fg(palette.muted).bg(palette.surface_alt)
-        }
+        UpdateState::Available { .. } => Style::default()
+            .fg(palette.bg)
+            .bg(palette.warning)
+            .add_modifier(Modifier::BOLD),
+        _ if app.update_available.is_some() => Style::default()
+            .fg(palette.bg)
+            .bg(palette.warning)
+            .add_modifier(Modifier::BOLD),
+        UpdateState::Failed(_) => Style::default()
+            .fg(palette.warning)
+            .bg(palette.selection_bg)
+            .add_modifier(Modifier::BOLD),
+        UpdateState::Checking => Style::default()
+            .fg(palette.accent_soft)
+            .bg(palette.selection_bg)
+            .add_modifier(Modifier::BOLD),
+        UpdateState::Idle | UpdateState::UpToDate { .. } => Style::default()
+            .fg(palette.selection_fg)
+            .bg(palette.selection_bg)
+            .add_modifier(Modifier::BOLD),
     };
     frame.render_widget(
         Paragraph::new(pill_label).style(pill_style),

@@ -832,10 +832,11 @@ fn update_button_runs_the_host_updater_and_stays_for_a_retry_after_failure() {
             let host = fake([true, true], &["claude/main"]);
             let mut app = launched(&sandbox, &host);
             let text = last_row(&render(&mut app, width, height));
-            assert!(!text.contains("Update"), "{text}");
-            assert_eq!(app.update_area.width, 0);
+            assert!(text.contains("Update"), "{text}");
+            assert!(app.update_area.width > 0);
             send(&mut app, "/update");
-            assert!(app.notice.contains("is up to date"), "{}", app.notice);
+            assert_eq!(app.update_state, update::UpdateState::Checking);
+            assert!(app.notice.contains("Checking"), "{}", app.notice);
             press(&mut app, KeyCode::F(6));
             assert!(host.0.borrow().calls.is_empty());
 

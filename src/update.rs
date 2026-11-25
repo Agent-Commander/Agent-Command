@@ -38,14 +38,14 @@ pub enum UpdateState {
 impl UpdateState {
     pub fn pill_label(&self) -> String {
         match self {
-            Self::Idle => format!("v{CURRENT}"),
-            Self::Checking => format!("v{CURRENT} · checking…"),
-            Self::UpToDate { current } => format!("v{current} ✓"),
+            Self::Idle => format!("↻ Update · v{CURRENT}"),
+            Self::Checking => "↻ Checking…".to_owned(),
+            Self::UpToDate { current } => format!("↻ Update · v{current}"),
             Self::Available { tag, .. } => {
                 format!("⬆ Update v{} (F6)", tag.trim_start_matches('v'))
             }
-            Self::Downloading { pct } => format!("Updating… {pct}%"),
-            Self::Failed(_) => format!("v{CURRENT} · update check offline (retry)"),
+            Self::Downloading { pct } => format!("⬇ Updating {pct}%"),
+            Self::Failed(_) => "↻ Update (retry)".to_owned(),
         }
     }
 
@@ -541,24 +541,34 @@ mod tests {
             evaluate_release_check(Err(io::Error::other("offline")), "0.2.2"),
             UpdateState::Failed(_)
         ));
-        assert!(UpdateState::Checking.pill_label().contains("checking"));
-        assert!(UpdateState::UpToDate {
-            current: "0.2.2".into()
-        }
-        .pill_label()
-        .contains("v0.2.2 ✓"));
-        assert!(UpdateState::Available {
-            tag: "v0.3.0".into(),
-            current: "0.2.2".into()
-        }
-        .pill_label()
-        .contains("Update v0.3.0"));
-        assert!(UpdateState::Downloading { pct: 45 }
-            .pill_label()
-            .contains("45%"));
-        assert!(UpdateState::Failed("net".into())
-            .pill_label()
-            .contains("offline"));
+        assert_eq!(
+            UpdateState::Idle.pill_label(),
+            format!("↻ Update · v{CURRENT}")
+        );
+        assert_eq!(UpdateState::Checking.pill_label(), "↻ Checking…");
+        assert_eq!(
+            UpdateState::UpToDate {
+                current: "0.2.2".into()
+            }
+            .pill_label(),
+            "↻ Update · v0.2.2"
+        );
+        assert_eq!(
+            UpdateState::Available {
+                tag: "v0.3.0".into(),
+                current: "0.2.2".into()
+            }
+            .pill_label(),
+            "⬆ Update v0.3.0 (F6)"
+        );
+        assert_eq!(
+            UpdateState::Downloading { pct: 45 }.pill_label(),
+            "⬇ Updating 45%"
+        );
+        assert_eq!(
+            UpdateState::Failed("net".into()).pill_label(),
+            "↻ Update (retry)"
+        );
     }
 
     #[test]
