@@ -11,13 +11,11 @@ use crate::{
     auth::Provider,
     markdown::{self, UiPalette},
     specialists::{self, RosterRow, Status},
-    tui::{events::ChangedFile, provider_short_name},
+    tui::{events::ChangedFile, provider_short_name, side_panel, views::ActiveTab},
     update::UpdateState,
     App,
 };
 
-const RAIL_MIN_WIDTH: u16 = 100;
-const RAIL_WIDTH: u16 = 34;
 const ABANDON_LABEL: &str = " F4 Abandon ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,11 +43,11 @@ pub enum WelcomeHit {
     DismissWelcome,
 }
 
-fn display_width(text: &str) -> usize {
+pub(crate) fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }
 
-fn truncate_width(text: &str, max_width: usize) -> String {
+pub(crate) fn truncate_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
@@ -72,11 +70,11 @@ fn truncate_width(text: &str, max_width: usize) -> String {
     out
 }
 
-fn text_u16(text: &str) -> u16 {
+pub(crate) fn text_u16(text: &str) -> u16 {
     u16::try_from(display_width(text)).unwrap_or(u16::MAX)
 }
 
-fn right_slice(bar: Rect, right_edge: u16, width: u16) -> Rect {
+pub(crate) fn right_slice(bar: Rect, right_edge: u16, width: u16) -> Rect {
     let clamped = width.min(right_edge.saturating_sub(bar.x));
     Rect::new(
         right_edge.saturating_sub(clamped),
@@ -97,21 +95,23 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
     app.rail_hits.clear();
     app.focus_banner_hits.clear();
     app.welcome_hits.clear();
+    app.views.hits.clear();
+    app.views.last_width = area.width;
 
     if area.width < 12 || area.height < 6 {
+        app.update_area = Rect::default();
         return;
     }
 
-    let show_rail = app.rail_open && area.width >= RAIL_MIN_WIDTH;
-    let main_w = if show_rail {
-        area.width.saturating_sub(RAIL_WIDTH)
-    } else {
-        area.width
-    };
+    let plan = app.column_plan(area.width);
+    app.views.left_panel_visible = plan.left > 0;
+    if plan.left == 0 {
+        app.views.left_panel_focused = false;
+    }
     let max_composer_h = area.height.saturating_sub(6).clamp(3, 9);
     let composer_h = app
         .composer
-        .desired_total_height(main_w)
+        .desired_total_height(area.width)
         .min(max_composer_h);
 
     let vertical = Layout::vertical([
@@ -129,19 +129,24 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
 
     draw_top_bar(app, frame, top_bar_area, &palette);
 
-    let (canvas_area, rail_area) = if show_rail {
-        let cols = Layout::horizontal([Constraint::Min(24), Constraint::Length(RAIL_WIDTH)])
-            .split(body_area);
-        (cols[0], Some(cols[1]))
-    } else {
-        app.crew_area = Rect::default();
-        (body_area, None)
-    };
+    let cols = Layout::horizontal([
+        Constraint::Length(plan.left),
+        Constraint::Min(24),
+        Constraint::Length(plan.rail),
+    ])
+    .split(body_area);
+    let (left_area, canvas_area, rail_area) = (cols[0], cols[1], cols[2]);
+
+    if plan.left > 0 {
+        side_panel::draw_left_panel(app, frame, left_area, &palette);
+    }
 
     draw_canvas(app, frame, canvas_area, &palette);
 
-    if let Some(rail) = rail_area {
-        draw_right_rail(app, frame, rail, &palette);
+    if plan.rail > 0 {
+        draw_right_rail(app, frame, rail_area, &palette);
+    } else {
+        app.crew_area = Rect::default();
     }
 
     let composer_area = Rect::new(
@@ -157,6 +162,8 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
 
     let composer_focused = app.editing
         && !app.rail_focused
+        && !app.left_panel_focused()
+        && !app.view_focused()
         && !app.palette.is_open()
         && !app.diff_modal.is_open()
         && app.panel.is_none();
@@ -258,6 +265,26 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
         used += brand_w;
     }
 
+    let mut pill_area = None;
+    let pills_w = usize::from(side_panel::tab_pills_width(app));
+    if !app.left_panel_visible() && left_budget > used + pills_w + 1 {
+        pill_area = Some(Rect::new(bar.x + used as u16 + 1, bar.y, pills_w as u16, 1));
+        spans.push(Span::styled(
+            " ".repeat(pills_w + 1),
+            Style::default().bg(bg),
+        ));
+        used += pills_w + 1;
+        if let Some(glyph) = side_panel::compact_usage_span(app) {
+            let w = glyph.width() + 1;
+            if used + w <= left_budget {
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+                let style = glyph.style.bg(bg);
+                spans.push(glyph.style(style));
+                used += w;
+            }
+        }
+    }
+
     let repo_seg = format!(" · {workspace_name}{branch_part}");
     let repo_w = display_width(&repo_seg);
     if used + repo_w <= left_budget {
@@ -326,12 +353,27 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
         Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
         left_area,
     );
+    if let Some(area) = pill_area {
+        side_panel::draw_tab_pills(app, frame, area, palette);
+    }
 }
 
 fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette) {
     if area.width == 0 || area.height == 0 {
         app.transcript_area = Rect::default();
         return;
+    }
+
+    match app.active_tab() {
+        ActiveTab::Inbox => {
+            app.transcript_area = Rect::default();
+            return side_panel::draw_inbox_view(app, frame, area, palette);
+        }
+        ActiveTab::Ledger => {
+            app.transcript_area = Rect::default();
+            return side_panel::draw_ledger_view(app, frame, area, palette);
+        }
+        ActiveTab::Chat => {}
     }
 
     let mut content_area = area;
@@ -910,17 +952,25 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
         .as_ref()
         .is_some_and(|live| live.pending.is_some() && !live.running(specialists::COMMANDER));
 
-    let raw_pill = app.update_pill_text(bar.width);
-    let pill_label = format!(" {raw_pill} ");
-    let pill_w = text_u16(&pill_label);
-    app.update_area = right_slice(bar, bar.right(), pill_w);
+    let pill_label = app
+        .update_pill_text(bar.width)
+        .map(|raw| format!(" {raw} "));
+    app.update_area = match &pill_label {
+        Some(label) => right_slice(bar, bar.right(), text_u16(label)),
+        None => Rect::default(),
+    };
+    let right_edge = if pill_label.is_some() {
+        app.update_area.x
+    } else {
+        bar.right()
+    };
 
     let abandon_w = if pending_continuation {
         text_u16(ABANDON_LABEL)
     } else {
         0
     };
-    let abandon_rect = right_slice(bar, app.update_area.x, abandon_w);
+    let abandon_rect = right_slice(bar, right_edge, abandon_w);
     if let Some(live) = &mut app.live {
         live.abandon_area = abandon_rect;
     }
@@ -961,34 +1011,21 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
         );
     }
 
-    let pill_style = match &app.update_state {
-        UpdateState::Downloading { .. } => Style::default()
-            .fg(palette.bg)
-            .bg(palette.accent)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Available { .. } => Style::default()
-            .fg(palette.bg)
-            .bg(palette.warning)
-            .add_modifier(Modifier::BOLD),
-        _ if app.update_available.is_some() => Style::default()
-            .fg(palette.bg)
-            .bg(palette.warning)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Failed(_) => Style::default()
-            .fg(palette.warning)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Checking => Style::default()
-            .fg(palette.accent_soft)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Idle | UpdateState::UpToDate { .. } => Style::default()
-            .fg(palette.selection_fg)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
+    let Some(pill_label) = pill_label else {
+        return;
+    };
+    let pill_bg = if matches!(app.update_state, UpdateState::Downloading { .. }) {
+        palette.accent
+    } else {
+        palette.warning
     };
     frame.render_widget(
-        Paragraph::new(pill_label).style(pill_style),
+        Paragraph::new(pill_label).style(
+            Style::default()
+                .fg(palette.bg)
+                .bg(pill_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         app.update_area,
     );
 }

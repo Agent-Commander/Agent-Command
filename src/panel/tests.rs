@@ -557,7 +557,8 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         app.live.as_mut().unwrap().preferred = Some(1);
         app.live.as_ref().unwrap().save_override().unwrap();
         assert!(screen(&render(&mut app, width, height)).contains("codex"));
-        assert_eq!(app.deck_hits.len(), 2);
+        render(&mut app, DECK_WIDTH, DECK_HEIGHT);
+        assert_eq!(app.deck_hits().len(), 2);
         press(&mut app, KeyCode::F(3));
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("SUBSCRIPTIONS"), "{text}");
@@ -613,7 +614,8 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         press(&mut app, KeyCode::Esc);
         let text = screen(&render(&mut app, width, height));
         assert!(!text.contains("codex"), "{text}");
-        assert_eq!(app.deck_hits.len(), 1);
+        render(&mut app, DECK_WIDTH, DECK_HEIGHT);
+        assert_eq!(app.deck_hits().len(), 1);
     }
 }
 
@@ -762,8 +764,8 @@ fn clicking_a_deck_card_opens_settings_on_that_subscription() {
         existing(&sandbox, Provider::Codex, "work");
         let host = fake([true, true], &["claude/main", "codex/work"]);
         let mut app = launched(&sandbox, &host);
-        render(&mut app, width, height);
-        let card = app.deck_hits[1].1;
+        render(&mut app, width.max(DECK_WIDTH), height);
+        let card = app.deck_hits()[1].1;
         assert!(card.width > 0 && card.right() <= width && card.bottom() <= height);
         app.click(card.x + card.width / 2, card.y + card.height / 2);
         assert!(matches!(app.panel, Some(Panel::Settings(_))));
@@ -781,13 +783,16 @@ fn clicking_a_deck_card_opens_settings_on_that_subscription() {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
 
-        render(&mut app, width, height);
-        let card = app.deck_hits[0].1;
+        render(&mut app, width.max(DECK_WIDTH), height);
+        let card = app.deck_hits()[0].1;
         app.click(card.x, card.y);
         assert_eq!(app.focused_action(), Some(Action::Reconnect(0)));
         assert!(host.0.borrow().calls.is_empty());
     }
 }
+
+const DECK_WIDTH: u16 = 140;
+const DECK_HEIGHT: u16 = 40;
 
 fn last_row(buffer: &Buffer) -> String {
     row(buffer, buffer.area.height - 1)
@@ -832,11 +837,14 @@ fn update_button_runs_the_host_updater_and_stays_for_a_retry_after_failure() {
             let host = fake([true, true], &["claude/main"]);
             let mut app = launched(&sandbox, &host);
             let text = last_row(&render(&mut app, width, height));
-            assert!(text.contains("Update"), "{text}");
-            assert!(app.update_area.width > 0);
+            assert!(!text.contains("Update"), "{text}");
+            assert_eq!(app.update_area, Rect::default());
             send(&mut app, "/update");
             assert_eq!(app.update_state, update::UpdateState::Checking);
             assert!(app.notice.contains("Checking"), "{}", app.notice);
+            let text = last_row(&render(&mut app, width, height));
+            assert!(!text.contains("Update"), "{text}");
+            assert_eq!(app.update_area, Rect::default());
             press(&mut app, KeyCode::F(6));
             assert!(host.0.borrow().calls.is_empty());
 
@@ -911,13 +919,22 @@ fn update_is_refused_in_preview() {
 }
 
 #[test]
-fn update_button_sits_bottom_right_and_left_of_abandon_at_both_sizes() {
+fn update_button_is_hidden_until_a_newer_release_then_sits_bottom_right() {
     for (width, height) in SIZES {
         let mut app = App::from_live(crate::Live::new(std::env::temp_dir(), Vec::new(), None));
-        let text = last_row(&render(&mut app, width, height));
-        assert!(text.contains(update::CURRENT), "{text}");
-        assert_eq!(app.update_area.y, height - 1);
-        assert_eq!(app.update_area.right(), width);
+        for state in [
+            update::UpdateState::Idle,
+            update::UpdateState::Checking,
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+            update::UpdateState::Failed("offline".into()),
+        ] {
+            app.update_state = state;
+            let text = last_row(&render(&mut app, width, height));
+            assert!(!text.contains("Update") && !text.contains('↻'), "{text}");
+            assert_eq!(app.update_area, Rect::default());
+        }
 
         let _sender = detected(&mut app, "9.9.9");
         let buffer = render(&mut app, width, height);
@@ -1351,7 +1368,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
     for (width, height) in SIZES {
         let sandbox = Sandbox::new(&format!("connect-auto-{width}"));
         let host = fake([true, true], &[]);
-        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example")];
+        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example"), None];
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
         let area = hit(&app, Action::Connect);
@@ -1393,7 +1410,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
 fn a_typed_profile_name_overrides_the_account_name() {
     let sandbox = Sandbox::new("connect-custom");
     let host = fake([true, false], &[]);
-    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None];
+    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None, None];
     let mut app = launched(&sandbox, &host);
     if let Some(Panel::Connect(form)) = &mut app.panel {
         form.name = "work".into();

@@ -13,6 +13,7 @@ pub mod github;
 mod goal;
 mod http;
 mod install;
+pub mod ledger;
 pub mod markdown;
 mod mcp;
 pub mod mission;
@@ -600,6 +601,8 @@ pub struct App {
     pub(crate) specialist_scrolls: HashMap<String, markdown::ScrollState>,
     pub rail_open: bool,
     pub rail_focused: bool,
+    pub left_panel_open: bool,
+    pub(crate) views: tui::views::ViewState,
     pub show_welcome: bool,
     pub github_status: github::GitHubAuthStatus,
     pub auth_detections: Vec<auth::AuthDetection>,
@@ -677,6 +680,8 @@ impl Default for App {
             specialist_scrolls: HashMap::new(),
             rail_open: true,
             rail_focused: false,
+            left_panel_open: true,
+            views: tui::views::ViewState::default(),
             show_welcome: false,
             github_status: github::GitHubAuthStatus::default(),
             auth_detections: Vec::new(),
@@ -1146,6 +1151,7 @@ impl App {
     fn cancel_goal(&mut self) {
         self.notice = match self.goal.take() {
             Some(goal) => {
+                self.views.goal_cancelled = true;
                 let message = format!(
                     "Goal cancelled on {} after {} of {} turns.",
                     goal.member, goal.turns, goal.cap
@@ -2127,6 +2133,7 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         self.selected = self.selected.min(self.crew.len().saturating_sub(1));
+        self.sync_views();
         tui::render::draw_single_canvas(self, f);
     }
 }
@@ -2674,7 +2681,7 @@ while test ! -f release; do sleep 0.01; done
                 .load_pins()
                 .unwrap()
                 .starts_with("Cannot read model pins"));
-            assert_eq!(reopened.pin_label(0), "no model pin");
+            assert_eq!(reopened.pin_label(0), None);
         }
     }
 
@@ -2852,6 +2859,20 @@ esac
 "#;
 
     #[cfg(unix)]
+    fn side_answers(app: &App) -> Vec<String> {
+        app.transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                markdown::TranscriptEntry::AssistantMarkdown {
+                    speaker, markdown, ..
+                } if speaker == "Side Q&A (/btw)" => Some(markdown.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn side_chat_answers_without_interrupting_the_running_mission() {
         use auth::Provider;
@@ -2866,19 +2887,12 @@ esac
         wait_for(&mut app, |app| app.crew[0].status == Status::Running);
         send(&mut app, "/btw Where are we?");
         assert!(app.input.is_empty());
-        wait_for(&mut app, |app| app.side_answers.len() >= 2);
+        wait_for(&mut app, |app| !side_answers(app).is_empty());
         assert!(app.mission_running());
         assert_eq!(app.crew[0].status, Status::Running);
-        let feed: Vec<String> = app
-            .feed_entries()
-            .into_iter()
-            .map(|(_, text)| text.to_owned())
-            .collect();
-        assert!(
-            feed.contains(&"BTW  Q: Where are we?".to_owned()),
-            "{feed:?}"
-        );
-        assert!(feed.contains(&"BTW  Side answer: still on step 2".to_owned()));
+        let answers = side_answers(&app);
+        assert!(answers[0].contains("**Q:** Where are we?"), "{answers:?}");
+        assert!(answers[0].contains("Side answer: still on step 2"));
         assert!(!app.log.iter().any(|line| line.starts_with("BTW")));
         fs::write(workspace.join("release"), "").unwrap();
         wait_for(&mut app, |app| app.crew[0].status == Status::Done);
@@ -2920,18 +2934,14 @@ esac
         assert!(app
             .notice
             .starts_with("Snoozed: claude/alpha limit resets at"));
-        let expanded = app.feed_entries().len();
-        assert!(expanded > 1);
-        app.settings.snooze_limited_missions = true;
-        let collapsed = app.feed_entries();
-        assert_eq!(collapsed.len(), 1);
-        assert!(collapsed[0].1.starts_with("SNOOZED  Snoozed: claude/alpha"));
+        let buffer = screen(&mut app, 140, 40);
+        let crew = region(&buffer, app.crew_area);
+        assert!(crew.contains("SNOOZED"), "{crew}");
         send(&mut app, "Another task");
         assert!(app.notice.contains("snoozed until its limit resets"));
         app.handle_event(COMMANDER, mission::Event::Continuing { from: 0, to: 0 });
         assert_eq!(app.status(0), "RUNNING");
         assert_eq!(app.notice, "Reset passed: resumed on claude/alpha");
-        assert!(app.feed_entries().len() > 1);
         app.handle_event(
             COMMANDER,
             mission::Event::Snoozed {
@@ -2959,10 +2969,14 @@ esac
             app.goal.as_ref().map(goal::Goal::status).as_deref(),
             Some("turn 1/10 · ship the release")
         );
+        screen(&mut app, 140, 40);
         assert!(app
-            .goal_lines(COMMANDER)
+            .ledger()
+            .entries()
             .iter()
-            .any(|line| line.to_string() == "turn 1/10 · ship the release"));
+            .any(|entry| entry.kind == ledger::TaskKind::Goal
+                && entry.title == "Goal: ship the release (1/10)"
+                && entry.status == ledger::TaskStatus::Running));
         wait_for(&mut app, |app| app.goal.is_none() && !app.mission_running());
         assert!(
             app.log.contains(
@@ -3084,7 +3098,7 @@ esac
             if keyboard {
                 app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             } else {
-                app.click(app.crew_area.x, app.crew_area.y + app.crew_row_height + 1);
+                app.click(app.crew_area.x, app.crew_area.y + 1);
             }
             assert_eq!(app.selected, 1);
             let buffer = screen(&mut app, width, height);
@@ -3315,9 +3329,10 @@ esac
             app.poll_update();
             assert!(app.update_available.is_none());
             let buffer = screen(&mut app, width, height);
-            assert!(app.update_area.width > 0);
-            assert_eq!(app.update_area.right(), width);
-            assert!(row(&buffer, height - 1).contains("Checking…"));
+            assert_eq!(app.update_area, Rect::default());
+            assert!(!row(&buffer, height - 1).contains("Update"));
+            app.click(width - 2, height - 1);
+            assert!(app.notice.is_empty(), "{}", app.notice);
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
             assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
@@ -3347,31 +3362,38 @@ esac
     }
 
     #[test]
-    fn update_pill_adapts_across_states_and_widths() {
+    fn update_pill_only_exists_once_a_newer_release_is_detected() {
         let mut app = App::default();
-        assert_eq!(app.update_pill_text(60), "↻ Update");
-        assert_eq!(
-            app.update_pill_text(80),
-            format!("↻ Update · v{}", update::CURRENT)
-        );
-        app.update_state = update::UpdateState::Checking;
-        assert_eq!(app.update_pill_text(120), "↻ Checking…");
-        app.update_state = update::UpdateState::UpToDate {
+        for state in [
+            update::UpdateState::Idle,
+            update::UpdateState::Checking,
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+            update::UpdateState::Failed("offline".into()),
+        ] {
+            app.update_state = state;
+            assert!(!app.newer_release_detected());
+            for width in [60, 80, 120] {
+                assert_eq!(app.update_pill_text(width), None);
+            }
+        }
+        app.update_state = update::UpdateState::Available {
+            tag: "v2.0.0".into(),
             current: update::CURRENT.to_owned(),
         };
-        assert_eq!(app.update_pill_text(74), "↻ Update");
-        assert_eq!(
-            app.update_pill_text(120),
-            format!("↻ Update · v{}", update::CURRENT)
-        );
+        assert!(app.newer_release_detected());
+        assert_eq!(app.update_pill_text(80).as_deref(), Some("⬆ Update v2.0.0"));
         app.update_state = update::UpdateState::Failed("offline".into());
-        assert_eq!(app.update_pill_text(60), "↻ Update (retry)");
-        assert_eq!(app.update_pill_text(120), "↻ Update (retry)");
         app.update_available = Some("1.2.3".into());
-        assert_eq!(app.update_pill_text(80), "⬆ Update v1.2.3");
-        assert_eq!(app.update_pill_text(120), "⬆ Update v1.2.3 (F6)");
+        assert!(app.newer_release_detected());
+        assert_eq!(app.update_pill_text(80).as_deref(), Some("⬆ Update v1.2.3"));
+        assert_eq!(
+            app.update_pill_text(120).as_deref(),
+            Some("⬆ Update v1.2.3 (F6)")
+        );
         app.update_state = update::UpdateState::Downloading { pct: 42 };
-        assert_eq!(app.update_pill_text(120), "⬇ Updating 42%");
+        assert_eq!(app.update_pill_text(120).as_deref(), Some("⬇ Updating 42%"));
     }
 
     #[test]
@@ -3804,42 +3826,34 @@ esac
         let palette = app.deck_palette;
 
         let compact = screen(&mut app, 80, 24);
-        let [known_row, fresh_row, held_row] = [1, 2, 3].map(|y| row(&compact, y));
-        assert!(known_row.contains("claude · known"), "{known_row}");
-        assert!(
-            known_row.contains("64%") && known_row.contains("12%"),
-            "{known_row}"
-        );
-        assert!(known_row.contains("↻ 2h") || known_row.contains("↻ 1h 59m"));
-        assert!(fresh_row.contains("claude · fresh") && fresh_row.contains("--"));
-        assert!(fresh_row.contains("↻ -"), "{fresh_row}");
-        assert!(held_row.contains("claude · held") && held_row.contains("0%"));
-        let (x, y) = cell_at(&compact, "--").unwrap();
-        assert_eq!((y, compact[(x, y)].fg), (2, palette.unknown));
-        let (x, y) = cell_at(&compact, " - ").unwrap();
-        assert_eq!(compact[(x, y)].bg, palette.unknown);
-        let (x, y) = cell_at(&compact, "↻ -").unwrap();
-        assert_eq!(compact[(x, y)].fg, palette.muted);
-        assert!(app.crew_area.y > 3 && app.input_area.bottom() <= 24);
+        let top = row(&compact, 0);
+        assert!(top.contains("◕ 64%"), "{top}");
+        let (x, y) = cell_at(&compact, "◕ 64%").unwrap();
+        assert_eq!((y, compact[(x, y)].fg), (0, palette.healthy));
+        assert!(app.input_area.bottom() <= 24);
 
-        let full = screen(&mut app, 120, 40);
-        let deck = region(&full, Rect::new(0, 2, 120, token_burn::FULL_CARD_HEIGHT));
+        let full = screen(&mut app, 140, 40);
+        let deck = region(&full, Rect::new(0, 1, 30, 30));
         for expected in [
-            "claude · known",
-            "claude · fresh",
-            "claude · held",
-            "64%",
-            "12%",
-            "▸ provider default · unscored",
-            "▸ latched",
+            "Claude · known",
+            "Claude · fresh",
+            "Claude · held",
+            "64% left",
+            "5h 64% · 7d 12%",
+            "unreported",
+            "0% left",
         ] {
             assert!(deck.contains(expected), "{expected}\n{deck}");
         }
-        assert_eq!(full[(3, 2)].symbol(), "╭");
-        let (x, y) = cell_at(&full, "--").unwrap();
+        let (x, y) = cell_at(&full, "64% left").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.healthy);
+        let (x, y) = cell_at(&full, "0% left").unwrap();
+        assert_eq!(full[(x, y)].fg, palette.depleted);
+        let (x, y) = cell_at(&full, "unreported").unwrap();
         assert_eq!(full[(x, y)].fg, palette.unknown);
-        let (x, y) = cell_at(&full, "▸ latched").unwrap();
+        let (x, y) = cell_at(&full, "↻ -").unwrap();
         assert_eq!(full[(x, y)].fg, palette.muted);
+        assert_eq!(app.deck_hits().len(), 3);
         assert!(app.input_area.bottom() <= 40);
     }
 
@@ -4065,7 +4079,7 @@ esac
             if index == 0 {
                 app.key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
             } else {
-                let header = 2 * app.crew_row_height;
+                let header = 1;
                 app.click(app.crew_area.x + 1, app.crew_area.y + header + 1);
             }
             let buffer = screen(&mut app, width, height);

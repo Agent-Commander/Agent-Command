@@ -287,31 +287,27 @@ impl App {
         }
     }
 
-    pub fn update_pill_text(&self, bar_width: u16) -> String {
+    pub fn newer_release_detected(&self) -> bool {
+        self.update_available.is_some()
+            || matches!(
+                self.update_state,
+                UpdateState::Available { .. } | UpdateState::Downloading { .. }
+            )
+    }
+
+    pub fn update_pill_text(&self, bar_width: u16) -> Option<String> {
         if let UpdateState::Downloading { pct } = &self.update_state {
-            return format!("⬇ Updating {pct}%");
+            return Some(format!("⬇ Updating {pct}%"));
         }
-        if let Some(latest) = self.update_available.as_deref() {
-            return if bar_width >= 100 {
-                format!("⬆ Update v{latest} (F6)")
-            } else {
-                format!("⬆ Update v{latest}")
-            };
-        }
-        match &self.update_state {
-            UpdateState::Available { tag, .. } => {
-                let ver = tag.trim_start_matches('v');
-                if bar_width >= 100 {
-                    format!("⬆ Update v{ver} (F6)")
-                } else {
-                    format!("⬆ Update v{ver}")
-                }
-            }
-            UpdateState::Idle | UpdateState::UpToDate { .. } if bar_width < 75 => {
-                "↻ Update".to_owned()
-            }
-            other => other.pill_label(),
-        }
+        let latest = self
+            .update_available
+            .as_deref()
+            .or_else(|| self.update_state.available_version())?;
+        Some(if bar_width >= 100 {
+            format!("⬆ Update v{latest} (F6)")
+        } else {
+            format!("⬆ Update v{latest}")
+        })
     }
 
     pub fn connection_summary(&self, provider: Provider) -> (bool, String) {
@@ -450,6 +446,7 @@ impl App {
                 profiles,
             } => {
                 self.auth_detections = detections;
+                self.views.profile_tiers.clear();
                 if let Some(live) = &mut self.live {
                     if !profiles.is_empty() {
                         live.reset_profiles(profiles);
@@ -542,6 +539,7 @@ impl App {
                 self.persist_commander_transcript();
             }
             AppEvent::WorkerWake(result) => {
+                self.record_wake(result.clone());
                 let status = if result.is_error {
                     DelegationStatus::Failed
                 } else {
@@ -842,7 +840,10 @@ impl App {
         let items = crate::tui::build_palette_items(
             &self.crew,
             profiles,
-            self.rail_open,
+            crate::tui::PaletteToggles {
+                rail_open: self.rail_open,
+                left_panel_open: self.left_panel_visible(),
+            },
             self.update_available.as_deref(),
         );
         self.palette.set_items(items);
@@ -859,6 +860,10 @@ impl App {
                 }
                 self.editing = true;
             }
+            "view.left_panel" => self.toggle_left_panel(),
+            "tab.chat" => self.switch_tab(crate::tui::views::ActiveTab::Chat),
+            "tab.inbox" => self.switch_tab(crate::tui::views::ActiveTab::Inbox),
+            "tab.ledger" => self.switch_tab(crate::tui::views::ActiveTab::Ledger),
             "settings.open" => self.open_settings(),
             "transcript.copy" => self.copy_latest_reply(),
             "update.trigger" => self.request_update(),
@@ -903,7 +908,8 @@ impl App {
             }
             _ => {}
         }
-        if self.panel.is_none() && !self.diff_modal.is_open() {
+        let stays_in_view = id.starts_with("tab.") && id != "tab.chat";
+        if self.panel.is_none() && !self.diff_modal.is_open() && !stays_in_view {
             self.editing = true;
         }
     }
@@ -1021,6 +1027,7 @@ impl App {
             "\n### Shortcuts\n\n\
              - `Ctrl+P` / `Ctrl+K` — Fuzzy command palette\n\
              - `Ctrl+B` — Toggle collapsible right rail\n\
+             - `F8` / `Ctrl+\\` — Toggle left panel · `Alt+1/2/3` — Chat / Inbox / Ledger\n\
              - `Ctrl+E` — Expand or collapse thinking / tool card\n\
              - `Ctrl+Y` — Copy latest reply (host clipboard + OSC 52)\n\
              - `Shift+Enter` / `Alt+Enter` / `Ctrl+J` — Multiline newline\n\
@@ -1300,6 +1307,10 @@ impl App {
             }
         }
 
+        if self.handle_tab_shortcut(key) {
+            return;
+        }
+
         if ctrl && !alt {
             match key.code {
                 KeyCode::Char('p') => {
@@ -1354,6 +1365,16 @@ impl App {
             }
         }
 
+        if self.views.view_focused && key.code == KeyCode::Esc && !self.autocomplete.is_open() {
+            self.switch_tab(crate::tui::views::ActiveTab::Chat);
+            return;
+        }
+        if self.views.left_panel_focused && key.code == KeyCode::Esc {
+            self.views.left_panel_focused = false;
+            self.editing = true;
+            return;
+        }
+
         match key.code {
             KeyCode::F(2) => return self.select_profile(),
             KeyCode::F(3) => return self.open_settings(),
@@ -1404,13 +1425,15 @@ impl App {
                     }
                     return;
                 }
-                if self.rail_open {
-                    self.rail_focused = !self.rail_focused;
-                    self.editing = !self.rail_focused;
+                if self.cycle_focus() {
                     return;
                 }
             }
             _ => {}
+        }
+
+        if self.handle_left_panel_key(key) || self.handle_view_key(key) {
+            return;
         }
 
         if self.rail_focused {
@@ -1634,6 +1657,16 @@ impl App {
             return;
         }
         if let Some((_, hit)) = self
+            .views
+            .hits
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, x, y))
+            .copied()
+        {
+            self.handle_tab_hit(hit);
+            return;
+        }
+        if let Some((_, hit)) = self
             .rail_hits
             .iter()
             .find(|(rect, _)| rect_contains(*rect, x, y))
@@ -1660,6 +1693,8 @@ impl App {
         }
         if self.input_area.contains(point) {
             self.rail_focused = false;
+            self.views.left_panel_focused = false;
+            self.views.view_focused = false;
             self.editing = true;
             return;
         }
@@ -1678,7 +1713,7 @@ impl App {
         }
     }
 
-    fn handle_transcript_hit(&mut self, thread_name: &str, action: TranscriptHitAction) {
+    pub(crate) fn handle_transcript_hit(&mut self, thread_name: &str, action: TranscriptHitAction) {
         match action {
             TranscriptHitAction::ToggleExpand { entry_index } => {
                 self.transcript_for_mut(thread_name)

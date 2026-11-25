@@ -475,7 +475,7 @@ impl Profile {
         Self::named_fixture(root, provider, "fixture", executable)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn named_fixture(
         root: &Path,
         provider: Provider,

@@ -271,6 +271,17 @@ impl Store {
         auth::private_state_directory(&self.directory()?, name)
     }
 
+    pub(crate) fn ledger_path(&self, workspace: &Path) -> io::Result<PathBuf> {
+        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+        let tag: String = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let stem = crate::ledger::LEDGER_FILE.trim_end_matches(".json");
+        Ok(self.directory()?.join(format!("{stem}-{tag}.json")))
+    }
+
     pub(crate) fn load_roster(&self) -> io::Result<Vec<Member>> {
         let Some(directory) = self.existing()? else {
             return Ok(Vec::new());
@@ -2210,13 +2221,19 @@ pub(crate) mod tests {
             .append_history("nova", &Entry::now("nova  working".into()))
             .unwrap();
         store
-            .append_commander(&Entry::now("YOU  hello".into()))
+            .append_commander_for_workspace(scratch.0.as_path(), &Entry::now("YOU  hello".into()))
             .unwrap();
         let crew = store.load_roster().unwrap();
         assert_eq!(crew.len(), 1);
         assert_eq!(crew[0].status, Status::Error);
         assert_eq!(crew[0].history[0].text, "nova  working");
-        assert_eq!(store.load_commander().unwrap()[0].text, "YOU  hello");
+        assert_eq!(
+            store
+                .load_commander_for_workspace(scratch.0.as_path())
+                .unwrap()[0]
+                .text,
+            "YOU  hello"
+        );
         let roster = scratch
             .0
             .join("profiles")

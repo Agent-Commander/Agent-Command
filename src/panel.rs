@@ -513,6 +513,17 @@ impl App {
         self.panel = Some(Panel::Settings(SettingsView::new(self.host.as_deref())));
     }
 
+    pub(crate) fn open_settings_for_profile(&mut self, profile: usize) {
+        self.open_settings();
+        let target = self
+            .panel_actions()
+            .iter()
+            .position(|action| *action == Action::Reconnect(profile));
+        if let (Some(Panel::Settings(view)), Some(index)) = (&mut self.panel, target) {
+            view.focus = index;
+        }
+    }
+
     pub(crate) fn open_connect(&mut self, origin: Origin) {
         let form = ConnectForm::new(origin, self.host.as_deref(), self.signed_in_providers());
         self.panel = Some(Panel::Connect(form));
@@ -610,7 +621,7 @@ impl App {
         }
     }
 
-    fn focused_action(&self) -> Option<Action> {
+    pub(crate) fn focused_action(&self) -> Option<Action> {
         let focus = match &self.panel {
             Some(Panel::Settings(view)) => view.focus,
             Some(Panel::Connect(form)) => form.focus,

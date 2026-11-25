@@ -2,6 +2,8 @@ pub mod app_ops;
 pub mod diff_modal;
 pub mod events;
 pub mod render;
+pub mod side_panel;
+pub mod views;
 
 use std::{fs, path::Path};
 
@@ -30,12 +32,52 @@ pub fn map_tool_kind(kind: mission::ToolKind) -> markdown::ToolKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaletteToggles {
+    pub rail_open: bool,
+    pub left_panel_open: bool,
+}
+
+fn view_palette_items(left_panel_open: bool) -> Vec<PaletteItem> {
+    let mut items = vec![PaletteItem {
+        id: "view.left_panel".into(),
+        category: "View".into(),
+        label: if left_panel_open {
+            "Hide Left Panel".into()
+        } else {
+            "Show Left Panel".into()
+        },
+        detail: "Toggle Views, Usage rings, and Workspace panel".into(),
+        shortcut: "F8".into(),
+        suggested: true,
+    }];
+    for (tab, shortcut) in views::ActiveTab::ALL
+        .into_iter()
+        .zip(["Alt+1", "Alt+2", "Alt+3"])
+    {
+        items.push(PaletteItem {
+            id: format!("tab.{}", tab.label().to_ascii_lowercase()),
+            category: "View".into(),
+            label: format!("Switch to {}", tab.label()),
+            detail: match tab {
+                views::ActiveTab::Chat => "Conversation with Commander and specialists".into(),
+                views::ActiveTab::Inbox => "Approvals, interruptions and finished work".into(),
+                views::ActiveTab::Ledger => "Persistent task ledger for this workspace".into(),
+            },
+            shortcut: shortcut.into(),
+            suggested: tab != views::ActiveTab::Chat,
+        });
+    }
+    items
+}
+
 pub fn build_palette_items(
     crew: &[Member],
     profiles: &[auth::Profile],
-    rail_open: bool,
+    toggles: PaletteToggles,
     update_available: Option<&str>,
 ) -> Vec<PaletteItem> {
+    let rail_open = toggles.rail_open;
     let mut items = vec![
         PaletteItem {
             id: "view.diff".into(),
@@ -57,6 +99,9 @@ pub fn build_palette_items(
             shortcut: "Ctrl+B".into(),
             suggested: true,
         },
+    ];
+    items.extend(view_palette_items(toggles.left_panel_open));
+    items.extend([
         PaletteItem {
             id: "settings.open".into(),
             category: "Accounts".into(),
@@ -164,7 +209,7 @@ pub fn build_palette_items(
             shortcut: "Ctrl+Q".into(),
             suggested: false,
         },
-    ];
+    ]);
 
     for profile in profiles {
         items.push(PaletteItem {

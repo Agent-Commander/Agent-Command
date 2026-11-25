@@ -59,10 +59,10 @@ impl Default for TokenBurnPalette {
             depleted: rgb(0xff4d5e),
             unknown: rgb(0x5d6570),
             reset_hour: rgb(0x3ddc97),
-            reset_six_hours: rgb(0xf5b041),
-            reset_day: rgb(0x5ab0ff),
-            reset_later: rgb(0xc792ff),
-            reset_due: rgb(0xff6b3d),
+            reset_six_hours: rgb(0xffbc26),
+            reset_day: rgb(0x44adff),
+            reset_later: rgb(0xb680ff),
+            reset_due: rgb(0x7c8591),
         }
     }
 }
@@ -493,6 +493,291 @@ pub fn render_deck_as(
     }
 }
 
+pub const RING_COLS: u16 = 8;
+pub const RING_ROWS: u16 = 4;
+pub const RING_TILE_MIN_WIDTH: u16 = RING_COLS + 12;
+const BRAILLE_BASE: u32 = 0x2800;
+const BRAILLE_BITS: [[u32; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+const SINGLE_BAND: f64 = 2.0;
+const DUAL_BAND: f64 = 1.6;
+const DUAL_GAP: f64 = 1.0;
+const RIM_MARGIN: f64 = 0.2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RingLayout {
+    Single(Option<f64>),
+    Dual { outer: f64, inner: f64 },
+}
+
+impl RingLayout {
+    pub fn for_windows(primary: Option<f64>, secondary: Option<f64>) -> Self {
+        match (clamp_percent(primary), clamp_percent(secondary)) {
+            (Some(outer), Some(inner)) => Self::Dual { outer, inner },
+            (Some(only), None) | (None, Some(only)) => Self::Single(Some(only)),
+            (None, None) => Self::Single(None),
+        }
+    }
+
+    pub fn headline(self) -> Option<f64> {
+        match self {
+            Self::Single(value) => value,
+            Self::Dual { outer, .. } => Some(outer),
+        }
+    }
+
+    fn bands(self, radius: f64) -> Vec<RingBand> {
+        match self {
+            Self::Single(value) => vec![RingBand {
+                outer_radius: radius,
+                inner_radius: radius - SINGLE_BAND,
+                remaining: value,
+                kind: DotKind::OuterFill,
+            }],
+            Self::Dual { outer, inner } => {
+                let inner_outer_radius = radius - DUAL_BAND - DUAL_GAP;
+                vec![
+                    RingBand {
+                        outer_radius: radius,
+                        inner_radius: radius - DUAL_BAND,
+                        remaining: Some(outer),
+                        kind: DotKind::OuterFill,
+                    },
+                    RingBand {
+                        outer_radius: inner_outer_radius,
+                        inner_radius: inner_outer_radius - DUAL_BAND,
+                        remaining: Some(inner),
+                        kind: DotKind::InnerFill,
+                    },
+                ]
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DotKind {
+    OuterFill,
+    InnerFill,
+    Track,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RingBand {
+    outer_radius: f64,
+    inner_radius: f64,
+    remaining: Option<f64>,
+    kind: DotKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingCell {
+    pub symbol: char,
+    pub kind: Option<DotKind>,
+}
+
+pub fn clockwise_fraction(dx: f64, dy: f64) -> f64 {
+    let angle = dx.atan2(-dy);
+    let turn = std::f64::consts::TAU;
+    ((angle + turn) % turn) / turn
+}
+
+fn classify_dot(bands: &[RingBand], dx: f64, dy: f64) -> Option<DotKind> {
+    let distance = dx.hypot(dy);
+    let band = bands
+        .iter()
+        .find(|band| distance <= band.outer_radius && distance >= band.inner_radius)?;
+    let swept = band
+        .remaining
+        .is_some_and(|percent| clockwise_fraction(dx, dy) < percent / 100.0);
+    Some(if swept { band.kind } else { DotKind::Track })
+}
+
+fn dominant_kind(counts: &[(DotKind, usize)]) -> Option<DotKind> {
+    counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .max_by(|(a_kind, a_count), (b_kind, b_count)| {
+            a_count.cmp(b_count).then_with(|| b_kind.cmp(a_kind))
+        })
+        .map(|(kind, _)| *kind)
+}
+
+pub fn ring_cells(layout: RingLayout, cols: u16, rows: u16) -> Vec<Vec<RingCell>> {
+    let dots_wide = f64::from(cols) * 2.0;
+    let dots_tall = f64::from(rows) * 4.0;
+    let radius = dots_wide.min(dots_tall) / 2.0 - RIM_MARGIN;
+    let bands = layout.bands(radius);
+    (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| braille_cell(&bands, col, row, dots_wide, dots_tall))
+                .collect()
+        })
+        .collect()
+}
+
+fn braille_cell(bands: &[RingBand], col: u16, row: u16, wide: f64, tall: f64) -> RingCell {
+    let mut bits = 0u32;
+    let mut counts = [
+        (DotKind::OuterFill, 0usize),
+        (DotKind::InnerFill, 0usize),
+        (DotKind::Track, 0usize),
+    ];
+    for (sub_x, column_bits) in BRAILLE_BITS.iter().enumerate() {
+        for (sub_y, bit) in column_bits.iter().enumerate() {
+            let x = f64::from(col) * 2.0 + sub_x as f64 + 0.5;
+            let y = f64::from(row) * 4.0 + sub_y as f64 + 0.5;
+            if let Some(kind) = classify_dot(bands, x - wide / 2.0, y - tall / 2.0) {
+                bits |= bit;
+                if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == kind) {
+                    slot.1 += 1;
+                }
+            }
+        }
+    }
+    RingCell {
+        symbol: char::from_u32(BRAILLE_BASE + bits).unwrap_or(' '),
+        kind: dominant_kind(&counts),
+    }
+}
+
+impl TokenBurnPalette {
+    pub fn ring_dot_color(&self, layout: RingLayout, kind: DotKind) -> Color {
+        match (layout, kind) {
+            (RingLayout::Single(None), _) => self.unknown,
+            (_, DotKind::Track) => self.border,
+            (RingLayout::Single(value), _) => self.allowance_color(value),
+            (RingLayout::Dual { outer, .. }, DotKind::OuterFill) => {
+                self.allowance_color(Some(outer))
+            }
+            (RingLayout::Dual { inner, .. }, DotKind::InnerFill) => {
+                self.allowance_color(Some(inner))
+            }
+        }
+    }
+}
+
+pub fn ring_lines(
+    layout: RingLayout,
+    cols: u16,
+    rows: u16,
+    palette: &TokenBurnPalette,
+) -> Vec<Line<'static>> {
+    ring_cells(layout, cols, rows)
+        .into_iter()
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .map(|cell| match cell.kind {
+                        Some(kind) => Span::styled(
+                            cell.symbol.to_string(),
+                            Style::default().fg(palette.ring_dot_color(layout, kind)),
+                        ),
+                        None => Span::raw(" "),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+pub fn compact_ring_glyph(remaining_percent: Option<f64>) -> &'static str {
+    match clamp_percent(remaining_percent) {
+        None => "○",
+        Some(p) if p < 12.5 => "○",
+        Some(p) if p < 37.5 => "◔",
+        Some(p) if p < 62.5 => "◑",
+        Some(p) if p < 87.5 => "◕",
+        Some(_) => "●",
+    }
+}
+
+pub fn compact_ring_span(
+    remaining_percent: Option<f64>,
+    palette: &TokenBurnPalette,
+) -> Span<'static> {
+    Span::styled(
+        format!(
+            "{} {}",
+            compact_ring_glyph(remaining_percent),
+            percent_label(remaining_percent)
+        ),
+        Style::default()
+            .fg(palette.allowance_color(remaining_percent))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+impl AccountCard {
+    pub fn ring_layout(&self) -> RingLayout {
+        RingLayout::for_windows(self.primary_remaining, self.secondary_remaining)
+    }
+
+    pub fn ring_tile_lines(&self, width: u16, palette: &TokenBurnPalette) -> Vec<Line<'static>> {
+        let layout = self.ring_layout();
+        let text_width = usize::from(width.saturating_sub(RING_COLS + 1));
+        let headline = layout.headline();
+        let left_label = match headline {
+            Some(_) => format!("{} left", percent_label(headline)),
+            None => "--".to_owned(),
+        };
+        let text_rows: [Vec<Span<'static>>; 4] = [
+            vec![Span::styled(
+                format!("{} · {}", self.provider, self.profile),
+                Style::default()
+                    .fg(palette.foreground)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            vec![
+                Span::styled(
+                    left_label,
+                    Style::default()
+                        .fg(palette.allowance_color(headline))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                tier_pill(&self.tier, palette),
+            ],
+            vec![reset_badge(self.seconds_until_reset, palette)],
+            self.window_caption(layout, palette),
+        ];
+        ring_lines(layout, RING_COLS, RING_ROWS, palette)
+            .into_iter()
+            .zip(text_rows)
+            .map(|(ring, text)| {
+                let mut spans = ring.spans;
+                spans.push(Span::raw(" "));
+                spans.extend(fit_line(text, text_width).spans);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    fn window_caption(&self, layout: RingLayout, palette: &TokenBurnPalette) -> Vec<Span<'static>> {
+        let caption = |label: &str, value: Option<f64>| {
+            Span::styled(
+                format!("{label} {}", percent_label(value)),
+                Style::default().fg(palette.allowance_color(value)),
+            )
+        };
+        match layout {
+            RingLayout::Dual { outer, inner } => vec![
+                caption("5h", Some(outer)),
+                Span::styled(" · ", Style::default().fg(palette.muted)),
+                caption("7d", Some(inner)),
+            ],
+            RingLayout::Single(Some(_)) if self.primary_remaining.is_some() => {
+                vec![caption("5h", self.primary_remaining)]
+            }
+            RingLayout::Single(Some(_)) => vec![caption("7d", self.secondary_remaining)],
+            RingLayout::Single(None) => vec![Span::styled(
+                "unreported",
+                Style::default().fg(palette.unknown),
+            )],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +1013,220 @@ mod tests {
                 assert!(line.width() <= 118);
             }
         }
+    }
+
+    fn dot_grid(layout: RingLayout) -> Vec<Vec<bool>> {
+        let cells = ring_cells(layout, RING_COLS, RING_ROWS);
+        let (wide, tall) = (usize::from(RING_COLS) * 2, usize::from(RING_ROWS) * 4);
+        let mut grid = vec![vec![false; wide]; tall];
+        for (row, line) in cells.iter().enumerate() {
+            for (col, cell) in line.iter().enumerate() {
+                let bits = cell.symbol as u32 - BRAILLE_BASE;
+                for (sub_x, column) in BRAILLE_BITS.iter().enumerate() {
+                    for (sub_y, bit) in column.iter().enumerate() {
+                        grid[row * 4 + sub_y][col * 2 + sub_x] = bits & bit != 0;
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    fn kinds(layout: RingLayout) -> Vec<DotKind> {
+        ring_cells(layout, RING_COLS, RING_ROWS)
+            .into_iter()
+            .flatten()
+            .filter_map(|cell| cell.kind)
+            .collect()
+    }
+
+    #[test]
+    fn ring_layout_uses_concentric_rings_only_when_both_windows_report() {
+        assert_eq!(
+            RingLayout::for_windows(Some(64.0), Some(12.0)),
+            RingLayout::Dual {
+                outer: 64.0,
+                inner: 12.0
+            }
+        );
+        assert_eq!(
+            RingLayout::for_windows(None, Some(150.0)),
+            RingLayout::Single(Some(100.0))
+        );
+        assert_eq!(
+            RingLayout::for_windows(Some(f64::NAN), None),
+            RingLayout::Single(None)
+        );
+        assert_eq!(RingLayout::Single(None).headline(), None);
+        assert_eq!(
+            RingLayout::Dual {
+                outer: 30.0,
+                inner: 90.0
+            }
+            .headline(),
+            Some(30.0)
+        );
+    }
+
+    #[test]
+    fn sweep_starts_at_twelve_o_clock_and_runs_clockwise() {
+        for (dx, dy, fraction) in [
+            (0.0, -1.0, 0.0),
+            (1.0, 0.0, 0.25),
+            (0.0, 1.0, 0.5),
+            (-1.0, 0.0, 0.75),
+        ] {
+            assert!((clockwise_fraction(dx, dy) - fraction).abs() < 1e-9);
+        }
+        let quarter = ring_cells(RingLayout::Single(Some(25.0)), RING_COLS, RING_ROWS);
+        let right_of_top = usize::from(RING_COLS) / 2;
+        assert_eq!(quarter[0][right_of_top].kind, Some(DotKind::OuterFill));
+        assert_eq!(quarter[0][right_of_top - 1].kind, Some(DotKind::Track));
+        let bottom = usize::from(RING_ROWS) - 1;
+        assert!(quarter[bottom]
+            .iter()
+            .all(|cell| cell.kind != Some(DotKind::OuterFill)));
+    }
+
+    #[test]
+    fn ring_silhouette_is_a_symmetric_hollow_circle_in_braille() {
+        for layout in [
+            RingLayout::Single(Some(40.0)),
+            RingLayout::Single(None),
+            RingLayout::Dual {
+                outer: 70.0,
+                inner: 10.0,
+            },
+        ] {
+            let grid = dot_grid(layout);
+            let (tall, wide) = (grid.len(), grid[0].len());
+            for y in 0..tall {
+                for x in 0..wide {
+                    assert_eq!(grid[y][x], grid[y][wide - 1 - x], "{layout:?}");
+                    assert_eq!(grid[y][x], grid[tall - 1 - y][x], "{layout:?}");
+                }
+            }
+            assert!(!grid[0][0] && !grid[tall - 1][wide - 1]);
+            assert!(!grid[tall / 2][wide / 2], "ring must be hollow");
+            assert!(grid[0][wide / 2] && grid[tall / 2][0]);
+            for cell in ring_cells(layout, RING_COLS, RING_ROWS)
+                .into_iter()
+                .flatten()
+            {
+                assert!(('\u{2800}'..='\u{28FF}').contains(&cell.symbol));
+            }
+        }
+        let single = dot_grid(RingLayout::Single(Some(50.0)));
+        let dual = dot_grid(RingLayout::Dual {
+            outer: 50.0,
+            inner: 50.0,
+        });
+        let count = |grid: &Vec<Vec<bool>>| grid.iter().flatten().filter(|d| **d).count();
+        assert!(count(&dual) > count(&single));
+    }
+
+    #[test]
+    fn fill_tracks_remaining_and_unknown_shows_only_muted_track() {
+        assert!(kinds(RingLayout::Single(Some(100.0)))
+            .iter()
+            .all(|kind| *kind == DotKind::OuterFill));
+        assert!(kinds(RingLayout::Single(Some(0.0)))
+            .iter()
+            .all(|kind| *kind == DotKind::Track));
+        assert!(kinds(RingLayout::Single(None))
+            .iter()
+            .all(|kind| *kind == DotKind::Track));
+        let half = kinds(RingLayout::Single(Some(50.0)));
+        let filled = half.iter().filter(|k| **k == DotKind::OuterFill).count();
+        assert!(filled * 3 > half.len() && filled * 3 < half.len() * 2);
+        let dual = kinds(RingLayout::Dual {
+            outer: 80.0,
+            inner: 60.0,
+        });
+        assert!(dual.contains(&DotKind::OuterFill) && dual.contains(&DotKind::InnerFill));
+
+        let p = TokenBurnPalette::default();
+        let low = RingLayout::Single(Some(19.0));
+        assert_eq!(p.ring_dot_color(low, DotKind::OuterFill), p.depleted);
+        assert_eq!(p.ring_dot_color(low, DotKind::Track), p.border);
+        let healthy = RingLayout::Single(Some(20.0));
+        assert_eq!(p.ring_dot_color(healthy, DotKind::OuterFill), p.healthy);
+        let unknown = RingLayout::Single(None);
+        assert_eq!(p.ring_dot_color(unknown, DotKind::Track), p.unknown);
+        let dual = RingLayout::Dual {
+            outer: 64.0,
+            inner: 12.0,
+        };
+        assert_eq!(p.ring_dot_color(dual, DotKind::OuterFill), p.healthy);
+        assert_eq!(p.ring_dot_color(dual, DotKind::InnerFill), p.depleted);
+        let line_fg: Vec<Option<Color>> = ring_lines(unknown, RING_COLS, RING_ROWS, &p)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.style.fg))
+            .filter(Option::is_some)
+            .collect();
+        assert!(line_fg.iter().all(|fg| *fg == Some(p.unknown)));
+    }
+
+    #[test]
+    fn compact_glyphs_quantize_remaining_and_color_by_state() {
+        for (remaining, glyph) in [
+            (None, "○"),
+            (Some(5.0), "○"),
+            (Some(25.0), "◔"),
+            (Some(50.0), "◑"),
+            (Some(75.0), "◕"),
+            (Some(95.0), "●"),
+        ] {
+            assert_eq!(compact_ring_glyph(remaining), glyph, "{remaining:?}");
+        }
+        let p = TokenBurnPalette::default();
+        let unknown = compact_ring_span(None, &p);
+        assert_eq!(unknown.content, "○ --");
+        assert_eq!(unknown.style.fg, Some(p.unknown));
+        assert_eq!(compact_ring_span(Some(12.0), &p).style.fg, Some(p.depleted));
+        assert_eq!(compact_ring_span(Some(64.0), &p).content, "◕ 64%");
+    }
+
+    #[test]
+    fn ring_tile_lines_fit_and_show_name_percent_tier_and_reset() {
+        let p = TokenBurnPalette::default();
+        let all = cards();
+        let lines = all[0].ring_tile_lines(28, &p);
+        assert_eq!(lines.len(), usize::from(RING_ROWS));
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert!(lines.iter().all(|line| line.width() <= 28), "{text:?}");
+        assert!(text[0].contains("claude · work"));
+        assert!(text[1].contains("64% left") && text[1].contains(" MAX "));
+        assert!(text[2].contains("↻ 3h 20m"));
+        assert!(text[3].contains("5h 64% · 7d 12%"));
+        let single = all[1].ring_tile_lines(28, &p);
+        let text: Vec<String> = single.iter().map(ToString::to_string).collect();
+        assert!(text[1].contains("20% left"), "{text:?}");
+        assert!(text[3].contains("7d 20%"));
+        let unknown = AccountCard {
+            secondary_remaining: None,
+            ..all[1].clone()
+        };
+        let text: Vec<String> = unknown
+            .ring_tile_lines(28, &p)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(text[1].contains("--") && !text[1].contains("0%"));
+        assert!(text[2].contains("↻ -") && text[3].contains("unreported"));
+    }
+
+    #[test]
+    fn reset_palette_matches_token_burn_hues() {
+        let p = TokenBurnPalette::default();
+        assert_eq!(p.reset_hour, rgb(0x3ddc97));
+        assert_eq!(p.reset_six_hours, rgb(0xffbc26));
+        assert_eq!(p.reset_day, rgb(0x44adff));
+        assert_eq!(p.reset_later, rgb(0xb680ff));
+        assert_eq!(p.reset_color(ResetBucket::Due), p.muted);
+        assert_eq!(p.reset_color(ResetBucket::Missing), p.muted);
+        assert_eq!(p.healthy, rgb(0x3ddc97));
+        assert_eq!(p.depleted, rgb(0xff4d5e));
+        assert_eq!(p.unknown, rgb(0x5d6570));
     }
 }

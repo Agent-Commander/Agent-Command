@@ -51,8 +51,7 @@ fn single_canvas_renders_cleanly_at_supported_and_narrow_sizes() {
         assert!(app.settings_area.width > 0 && app.settings_area.right() <= w);
         assert!(app.palette_area.width > 0 && app.palette_area.right() <= w);
         assert!(app.input_area.width > 0 && app.input_area.bottom() < h);
-        assert!(app.update_area.width > 0 && app.update_area.right() == w);
-        assert_eq!(app.update_area.y, h - 1);
+        assert_eq!(app.update_area, Rect::default());
         assert!(app.editing);
         if w >= 100 {
             assert!(app.crew_area.width > 0);
@@ -144,13 +143,13 @@ fn slash_help_and_unknown_typo_guard_never_dispatch_to_llm() {
     key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     let buffer = render(&mut app, 120, 40);
     let body = text(&buffer, app.transcript_area);
-    assert!(
-        body.contains("/spawn") && body.contains("Shortcuts"),
-        "{body}"
-    );
+    assert!(body.contains("Shortcuts"), "{body}");
     key(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
     let top_body = text(&render(&mut app, 120, 40), app.transcript_area);
-    assert!(top_body.contains("Slash Commands"), "{top_body}");
+    assert!(
+        top_body.contains("Slash Commands") && top_body.contains("/spawn"),
+        "{top_body}"
+    );
 
     let before_log = app.log.len();
     for ch in "/spwn".chars() {
@@ -224,36 +223,34 @@ fn command_palette_and_diff_viewer_work_via_keyboard_and_mouse() {
 }
 
 #[test]
-fn bottom_right_update_pill_is_always_visible_across_states() {
+fn bottom_right_update_pill_only_appears_when_a_newer_release_is_detected() {
     let mut app = App::default();
     let footer_bg = app.ui_palette.surface;
+    for state in [
+        UpdateState::Idle,
+        UpdateState::Checking,
+        UpdateState::UpToDate {
+            current: update::CURRENT.to_owned(),
+        },
+        UpdateState::Failed("offline".into()),
+    ] {
+        app.update_state = state;
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (140, 40)] {
+            let buf = render(&mut app, w, h);
+            assert_eq!(app.update_area, Rect::default(), "{w}x{h}");
+            let footer = text(&buf, Rect::new(0, h - 1, w, 1));
+            assert!(!footer.contains("Update"), "{w}x{h}: {footer}");
+            assert!(!footer.contains('↻'), "{w}x{h}: {footer}");
+            app.notice.clear();
+            app.click(w - 2, h - 1);
+            assert!(app.notice.is_empty(), "{w}x{h}: {}", app.notice);
+        }
+    }
     for (state, expected_narrow, expected_wide) in [
-        (
-            UpdateState::Idle,
-            "↻ Update",
-            format!("↻ Update · v{}", update::CURRENT),
-        ),
-        (
-            UpdateState::Checking,
-            "↻ Checking…",
-            "↻ Checking…".to_owned(),
-        ),
-        (
-            UpdateState::UpToDate {
-                current: update::CURRENT.to_owned(),
-            },
-            "↻ Update",
-            format!("↻ Update · v{}", update::CURRENT),
-        ),
-        (
-            UpdateState::Failed("offline".into()),
-            "↻ Update (retry)",
-            "↻ Update (retry)".to_owned(),
-        ),
         (
             UpdateState::Downloading { pct: 50 },
             "⬇ Updating 50%",
-            "⬇ Updating 50%".to_owned(),
+            "⬇ Updating 50%",
         ),
         (
             UpdateState::Available {
@@ -261,22 +258,20 @@ fn bottom_right_update_pill_is_always_visible_across_states() {
                 current: update::CURRENT.to_owned(),
             },
             "⬆ Update v0.9.0",
-            "⬆ Update v0.9.0 (F6)".to_owned(),
+            "⬆ Update v0.9.0 (F6)",
         ),
     ] {
         app.update_state = state;
-        for (w, h) in [(60, 20), (80, 24), (120, 40)] {
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (140, 40)] {
             let buf = render(&mut app, w, h);
             assert!(app.update_area.width > 0);
             assert_eq!(app.update_area.right(), w);
             assert_eq!(app.update_area.y, h - 1);
             let pill = text(&buf, app.update_area);
-            let expected = if w < 75 {
-                expected_narrow
-            } else if w >= 100 {
-                expected_wide.as_str()
+            let expected = if w >= 100 {
+                expected_wide
             } else {
-                expected_wide.trim_end_matches(" (F6)")
+                expected_narrow
             };
             assert_eq!(pill.trim(), expected, "{w}x{h}: {pill}");
             let cell = &buf[(app.update_area.x, app.update_area.y)];
