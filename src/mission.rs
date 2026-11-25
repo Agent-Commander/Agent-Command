@@ -1,3 +1,10 @@
+#[cfg(unix)]
+#[path = "mission/unix.rs"]
+mod process_tree;
+#[cfg(windows)]
+#[path = "mission/windows.rs"]
+mod process_tree;
+
 use crate::{
     auth::{Profile, Provider},
     catalog::Catalog,
@@ -16,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex, PoisonError,
     },
@@ -25,6 +32,7 @@ use std::{
 };
 
 const SNOOZE_POLL: Duration = Duration::from_millis(200);
+const CANCEL_POLL: Duration = Duration::from_millis(15);
 const STDERR_TAIL_LIMIT: usize = 20;
 const OUTPUT_PREVIEW_CHARS: usize = 400;
 const NO_ALTERNATE: &str =
@@ -154,6 +162,7 @@ pub struct Mission {
     pub normalized: Receiver<NormalizedEvent>,
     cancel: Arc<AtomicBool>,
     control: Arc<Mutex<Option<Sender<ControlMessage>>>>,
+    active_pid: Arc<AtomicU32>,
 }
 
 impl Drop for Mission {
@@ -164,14 +173,23 @@ impl Drop for Mission {
 
 impl Mission {
     pub fn interrupt(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(tx) = self
+        self.cancel.store(true, Ordering::SeqCst);
+        let has_control = if let Some(tx) = self
             .control
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
         {
             let _ = tx.send(ControlMessage::Interrupt);
+            true
+        } else {
+            false
+        };
+        if !has_control {
+            let pid = self.active_pid.swap(0, Ordering::AcqRel);
+            if pid != 0 {
+                thread::spawn(move || process_tree::kill_tree(pid));
+            }
         }
     }
 
@@ -241,6 +259,7 @@ impl Mission {
             normalized,
             cancel: Arc::default(),
             control: Arc::new(Mutex::new(None)),
+            active_pid: Arc::new(AtomicU32::new(0)),
         };
         (mission, sender)
     }
@@ -291,6 +310,7 @@ impl Mission {
                 limits: route.limits.clone(),
                 mode: route.mode,
                 options,
+                active_pid: Arc::new(AtomicU32::new(0)),
             },
             Work::Routed(route),
         )
@@ -314,6 +334,7 @@ impl Mission {
                     policy: PermissionPolicy::for_mode(PermissionMode::Supervised),
                     ..LaunchOptions::default()
                 },
+                active_pid: Arc::new(AtomicU32::new(0)),
             },
             Work::Resume {
                 interrupted,
@@ -328,6 +349,7 @@ impl Mission {
         let (norm_sender, normalized) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let control = Arc::new(Mutex::new(None));
+        let active_pid = Arc::clone(&execution.active_pid);
         let worker_cancel = Arc::clone(&cancel);
         let worker_control = Arc::clone(&control);
         thread::spawn(move || {
@@ -360,6 +382,7 @@ impl Mission {
             normalized,
             cancel,
             control,
+            active_pid,
         }
     }
 }
@@ -519,6 +542,7 @@ impl WarmSession {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
+            process_tree::kill_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1300,6 +1324,7 @@ struct Execution {
     limits: LimitPolicy,
     mode: PermissionMode,
     options: LaunchOptions,
+    active_pid: Arc<AtomicU32>,
 }
 
 impl Execution {
@@ -1451,6 +1476,7 @@ impl Execution {
             norm_sender,
             cancel,
             control,
+            &self.active_pid,
             self.clock,
             None,
         )?;
@@ -1646,6 +1672,7 @@ impl Execution {
             norm_sender,
             cancel,
             control,
+            &self.active_pid,
             self.clock,
             Some(Continuation {
                 claim,
@@ -1701,6 +1728,7 @@ fn run(
     norm_sender: &Sender<NormalizedEvent>,
     cancel: &AtomicBool,
     control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
+    active_pid: &AtomicU32,
     clock: fn() -> usage::Tick,
     continuation: Option<Continuation<'_>>,
 ) -> io::Result<Option<Progress>> {
@@ -1713,7 +1741,7 @@ fn run(
         mode,
         options,
     } = launch;
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
     command.args(configuration.arguments());
@@ -1737,6 +1765,8 @@ fn run(
             final_text: error.to_string(),
         });
     })?;
+    let child_pid = child.id();
+    active_pid.store(child_pid, Ordering::Release);
     if let Some(next) = continuation {
         let _ = sender.send(Event::Continuing {
             from: next.from,
@@ -1754,6 +1784,9 @@ fn run(
     });
     let limited = Arc::new(AtomicBool::new(false));
     let output_limit = Arc::clone(&limited);
+    let reader_cancel = Arc::new(AtomicBool::new(false));
+    let output_cancel = Arc::clone(&reader_cancel);
+    let stderr_cancel = Arc::clone(&reader_cancel);
     let policy = options.policy.clone();
     let persistent_claude = profile.provider == Provider::Claude && options.persistent_stdio;
 
@@ -1761,6 +1794,9 @@ fn run(
     let stderr_collect = Arc::clone(&stderr_lines);
     let stderr_reader = thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if stderr_cancel.load(Ordering::Acquire) {
+                break;
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1820,6 +1856,7 @@ fn run(
             &stdout_sender,
             &stdout_norm,
             &output_limit,
+            &output_cancel,
             &policy,
             persistent_claude.then_some(reader_control),
             clock,
@@ -1827,7 +1864,8 @@ fn run(
     });
 
     let status = loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Acquire) {
+            reader_cancel.store(true, Ordering::Release);
             if control_handle {
                 if let Some(tx) = control
                     .lock()
@@ -1836,25 +1874,40 @@ fn run(
                 {
                     let _ = tx.send(ControlMessage::Interrupt);
                 }
-                thread::sleep(Duration::from_millis(150));
+                for _ in 0..10 {
+                    if child.try_wait()?.is_some() {
+                        break;
+                    }
+                    thread::sleep(CANCEL_POLL);
+                }
             }
+            active_pid.store(0, Ordering::Release);
+            process_tree::kill_tree(child_pid);
             let _ = child.kill();
-            child.wait()?;
+            let _ = child.wait();
             control
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            let _ = stderr_reader.join();
+            let _ = norm_sender.send(NormalizedEvent::TurnFinished {
+                interrupted: true,
+                is_error: false,
+                error_code: None,
+                final_text: String::new(),
+            });
             return Ok(None);
         }
         if limited.load(Ordering::Acquire) {
+            active_pid.store(0, Ordering::Release);
+            process_tree::kill_tree(child_pid);
             let _ = child.kill();
             break child.wait()?;
         }
         if let Some(status) = child.try_wait()? {
+            active_pid.store(0, Ordering::Release);
             break status;
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(CANCEL_POLL);
     };
     control
         .lock()
@@ -1936,6 +1989,7 @@ fn read_output(
     sender: &SyncSender<Event>,
     norm_sender: &Sender<NormalizedEvent>,
     limited: &AtomicBool,
+    cancel: &AtomicBool,
     policy: &PermissionPolicy,
     control: Option<Arc<Mutex<Option<Sender<ControlMessage>>>>>,
     clock: fn() -> usage::Tick,
@@ -1944,7 +1998,13 @@ fn read_output(
     let mut completed = false;
     let mut parser = EventParser::new(profile.provider);
     for line in BufReader::new(stdout).lines() {
+        if cancel.load(Ordering::Acquire) {
+            return Ok((progress, completed));
+        }
         let line = line?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok((progress, completed));
+        }
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -2271,6 +2331,36 @@ mod engine_tests {
             classify_health(&["fatal: disk full".into()], None),
             HealthCode::AgentFailed
         );
+    }
+
+    #[test]
+    fn process_tree_kill_terminates_shell_and_grandchild_cleanly() {
+        let mut command = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "ping", "-n", "20", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 20"]);
+            cmd
+        };
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        thread::sleep(Duration::from_millis(120));
+        let started = std::time::Instant::now();
+        process_tree::kill_tree(child.id());
+        let _ = child.wait().unwrap();
+        let remaining: Vec<String> = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+        let _ = remaining;
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
 
