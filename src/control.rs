@@ -1,8 +1,10 @@
 use crate::{
-    auth, catalog, mission, native,
+    auth,
+    bridge::{BackgroundResult, WakeQueue},
+    catalog, mission, native,
     permissions::PermissionMode,
-    routing,
-    specialists::{self, Entry, Member, Status, Store},
+    routing, settings,
+    specialists::{self, Entry, Isolation, Member, Status, Store},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,16 +26,19 @@ pub(crate) const MAX_TEXT_CHARS: usize = 16_000;
 pub(crate) const MAX_BRIEF_FIELD_CHARS: usize = 4_000;
 pub(crate) const MAX_QUERY_CHARS: usize = 200;
 pub(crate) const MAX_ROLE_CHARS: usize = 40;
+pub(crate) const MAX_MODEL_CHARS: usize = 80;
 pub(crate) const MAX_PATH_CHARS: usize = 1_024;
 pub(crate) const MAX_QUEUE: usize = 16;
 pub(crate) const DEFAULT_READ_LIMIT: usize = 50;
-const PUMP_POLL: Duration = Duration::from_millis(50);
+const PUMP_POLL: Duration = Duration::from_millis(20);
+const ASYNC_SPAWN_NOTE: &str = "Worker spawned asynchronously. You will receive a <background-result> wakeup when it finishes; do not poll or sleep.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Scope {
     ReadOnly,
     Supervised,
+    Commander,
 }
 
 impl Scope {
@@ -54,11 +59,16 @@ impl Scope {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised => "supervised",
+            Self::Commander => "commander",
         }
     }
 
     pub(crate) fn allows_changes(self) -> bool {
-        self == Self::Supervised
+        matches!(self, Self::Supervised | Self::Commander)
+    }
+
+    pub(crate) fn allows_elevated_worker_modes(self) -> bool {
+        self == Self::Commander
     }
 }
 
@@ -106,11 +116,39 @@ pub(crate) trait Engine: Send + Sync + 'static {
 
 pub(crate) struct NativeEngine {
     profile_root: PathBuf,
+    settings_path: Option<PathBuf>,
 }
 
 impl NativeEngine {
     pub(crate) fn new(profile_root: PathBuf) -> Self {
-        Self { profile_root }
+        let settings_path = settings::LaunchConfig::from_env().settings_path;
+        Self {
+            profile_root,
+            settings_path,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_settings_path(
+        profile_root: PathBuf,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            profile_root,
+            settings_path,
+        }
+    }
+
+    pub(crate) fn limit_policy(&self) -> mission::LimitPolicy {
+        let loaded = self
+            .settings_path
+            .as_deref()
+            .and_then(|path| settings::Settings::load(path).ok())
+            .unwrap_or_default();
+        mission::LimitPolicy {
+            auto_resume_on_reset: loaded.auto_resume_on_reset,
+            fallback_profile: loaded.fallback_profile,
+        }
     }
 
     fn route(
@@ -128,7 +166,7 @@ impl NativeEngine {
             pins,
             target: None,
             mode,
-            limits: mission::LimitPolicy::default(),
+            limits: self.limit_policy(),
         })
     }
 }
@@ -145,14 +183,14 @@ pub(crate) fn external_mode(requested: PermissionMode) -> PermissionMode {
 
 impl Engine for NativeEngine {
     fn start(&self, member: &Member, task: &str, workspace: &Path) -> Result<Box<dyn Run>, String> {
-        let profiles = auth::profiles(&self.profile_root).map_err(|error| error.to_string())?;
+        let profiles = auth::all_profiles(&self.profile_root).map_err(|error| error.to_string())?;
         if profiles.is_empty() {
             return Err(format!("{}.", crate::panel::NO_PROVIDER_HINT));
         }
         let request = crate::framed(routing::parse(task)?, |unit| {
             specialists::specialist_prompt(member, unit)
         });
-        let route = self.route(request, external_mode(member.permission))?;
+        let route = self.route(request, member.permission)?;
         Ok(Box::new(mission::Mission::launch(
             profiles,
             route,
@@ -203,6 +241,33 @@ impl Brief {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpawnWorkerRequest {
+    pub(crate) name: String,
+    pub(crate) role: String,
+    pub(crate) task: String,
+    pub(crate) model: Option<String>,
+    pub(crate) mode: Option<PermissionMode>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) allow_elevated_mode: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SpawnedWorker {
+    pub(crate) worker_id: String,
+    pub(crate) name: String,
+    pub(crate) role: String,
+    pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) branch: Option<String>,
+    pub(crate) workspace: String,
+    pub(crate) mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    pub(crate) running: bool,
+    pub(crate) note: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct Summary {
     pub(crate) name: String,
@@ -210,6 +275,9 @@ pub(crate) struct Summary {
     pub(crate) status: &'static str,
     pub(crate) mission: String,
     pub(crate) workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) branch: Option<String>,
+    pub(crate) mode: &'static str,
     pub(crate) running: bool,
     pub(crate) queued: usize,
     pub(crate) entries: u64,
@@ -253,6 +321,8 @@ impl Thread {
             status: self.member.status.label(),
             mission: self.member.mission.clone(),
             workspace: specialists::workspace_label(&self.member),
+            branch: self.member.branch().map(|branch| branch.name.clone()),
+            mode: self.member.permission.flag(),
             running: self.running(),
             queued: self.queue.len(),
             entries: self.sequence,
@@ -297,6 +367,8 @@ struct Shared {
     store: Store,
     root: PathBuf,
     engine: Box<dyn Engine>,
+    shutdown: Arc<AtomicBool>,
+    wake_queue: Option<WakeQueue>,
 }
 
 #[derive(Clone)]
@@ -306,6 +378,16 @@ pub(crate) struct Control {
 
 impl Control {
     pub(crate) fn open(store: Store, root: &Path, engine: Box<dyn Engine>) -> io::Result<Self> {
+        Self::open_with(store, root, engine, Arc::new(AtomicBool::new(false)), None)
+    }
+
+    pub(crate) fn open_with(
+        store: Store,
+        root: &Path,
+        engine: Box<dyn Engine>,
+        shutdown: Arc<AtomicBool>,
+        wake_queue: Option<WakeQueue>,
+    ) -> io::Result<Self> {
         let root = root.canonicalize()?;
         if !root.is_dir() {
             return Err(io::Error::other("Workspace root must be a directory"));
@@ -327,8 +409,43 @@ impl Control {
                 store,
                 root,
                 engine,
+                shutdown,
+                wake_queue,
             }),
         })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.shared.root
+    }
+
+    pub(crate) fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shared.shutdown)
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shared.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn wake_queue(&self) -> Option<&WakeQueue> {
+        self.shared.wake_queue.as_ref()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        {
+            let mut threads = self.lock();
+            for thread in threads.iter_mut() {
+                thread.queue.clear();
+                if let Some(stop) = &thread.stop {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        if let Some(queue) = &self.shared.wake_queue {
+            queue.shutdown();
+        }
+        self.shared.changed.notify_all();
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Thread>> {
@@ -338,19 +455,43 @@ impl Control {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn sync_external(&self, threads: &mut Vec<Thread>) {
+        let Ok(disk_members) = self.shared.store.load_roster() else {
+            return;
+        };
+        for member in disk_members {
+            let exists = threads
+                .iter()
+                .any(|thread| thread.member.name.eq_ignore_ascii_case(&member.name));
+            if !exists {
+                threads.push(Thread {
+                    sequence: member.history.len() as u64,
+                    member,
+                    queue: VecDeque::new(),
+                    stop: None,
+                });
+            }
+        }
+    }
+
     pub(crate) fn list(&self) -> Vec<Summary> {
-        self.lock().iter().map(Thread::summary).collect()
+        let mut threads = self.lock();
+        self.sync_external(&mut threads);
+        threads.iter().map(Thread::summary).collect()
     }
 
     pub(crate) fn count(&self) -> usize {
-        self.lock().len()
+        let mut threads = self.lock();
+        self.sync_external(&mut threads);
+        threads.len()
     }
 
     pub(crate) fn search(&self, query: &str) -> Result<Vec<Summary>, Failure> {
         bounded_text("query", query, MAX_QUERY_CHARS)?;
         let needle = query.trim().to_lowercase();
-        Ok(self
-            .lock()
+        let mut threads = self.lock();
+        self.sync_external(&mut threads);
+        Ok(threads
             .iter()
             .filter(|thread| thread.matches(&needle))
             .map(Thread::summary)
@@ -358,7 +499,8 @@ impl Control {
     }
 
     pub(crate) fn read(&self, name: &str, since: u64, limit: usize) -> Result<Transcript, Failure> {
-        let threads = self.lock();
+        let mut threads = self.lock();
+        self.sync_external(&mut threads);
         let thread = &threads[locate(&threads, name)?];
         Ok(Transcript {
             thread: thread.summary(),
@@ -373,12 +515,28 @@ impl Control {
         task: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<Summary, Failure> {
+        self.create_with_mode(name, role, task, workspace, None, false)
+    }
+
+    fn create_with_mode(
+        &self,
+        name: &str,
+        role: &str,
+        task: Option<&str>,
+        workspace: Option<&str>,
+        requested_mode: Option<PermissionMode>,
+        allow_elevated: bool,
+    ) -> Result<Summary, Failure> {
+        if self.is_shutting_down() {
+            return Err(refused("Control plane is shutting down."));
+        }
         validate_role(role)?;
         if let Some(task) = task {
             bounded_text("task", task, MAX_TEXT_CHARS)?;
         }
         let base = resolve_workspace(&self.shared.root, workspace)?;
         let mut threads = self.lock();
+        self.sync_external(&mut threads);
         let crew: Vec<Member> = threads.iter().map(|thread| thread.member.clone()).collect();
         specialists::validate_name(name, &crew).map_err(invalid)?;
         let isolated = self
@@ -386,9 +544,26 @@ impl Control {
             .store
             .isolate(&base, name, task.map(str::trim).unwrap_or(role.trim()))
             .map_err(|error| refused(format!("Cannot isolate {name}: {error}")))?;
-        let member = Member::new(name, role.trim(), task.map(str::trim), Some(isolated));
-        let permission = external_mode(member.permission);
-        let member = member.with_permission(Some(permission));
+        let base_default = PermissionMode::default_for_role(role.trim());
+        let chosen_mode = if allow_elevated {
+            let mode = requested_mode.unwrap_or_else(|| {
+                if base_default == PermissionMode::ReadOnly {
+                    PermissionMode::ReadOnly
+                } else if matches!(isolated.isolation, Isolation::Worktree { .. }) {
+                    PermissionMode::WorktreeAuto
+                } else {
+                    PermissionMode::WorkspaceAuto
+                }
+            });
+            if let Err(refusal) = mode.require_isolation(Some(&isolated.isolation)) {
+                return Err(invalid(refusal));
+            }
+            mode
+        } else {
+            external_mode(requested_mode.unwrap_or(base_default))
+        };
+        let member = Member::new(name, role.trim(), task.map(str::trim), Some(isolated))
+            .with_permission(Some(chosen_mode));
         threads.push(Thread {
             member,
             sequence: 0,
@@ -401,9 +576,65 @@ impl Control {
         Ok(summary)
     }
 
+    pub(crate) fn spawn_worker(
+        &self,
+        request: &SpawnWorkerRequest,
+    ) -> Result<SpawnedWorker, Failure> {
+        if self.is_shutting_down() {
+            return Err(refused("Control plane is shutting down."));
+        }
+        validate_role(&request.role)?;
+        bounded_text("task", &request.task, MAX_TEXT_CHARS)?;
+        let model = match request.model.as_deref() {
+            Some(model) => {
+                bounded_text("model", model, MAX_MODEL_CHARS)?;
+                Some(model.trim().to_owned())
+            }
+            None => None,
+        };
+        let exists = {
+            let mut threads = self.lock();
+            self.sync_external(&mut threads);
+            locate(&threads, &request.name).is_ok()
+        };
+        if !exists {
+            self.create_with_mode(
+                &request.name,
+                &request.role,
+                Some(&request.task),
+                request.workspace.as_deref(),
+                request.mode,
+                request.allow_elevated_mode,
+            )?;
+        } else if request.workspace.is_some() {
+            return Err(invalid(format!(
+                "{} already exists; its workspace cannot be changed.",
+                request.name
+            )));
+        }
+        let formatted_task = format_worker_task(&request.task, model.as_deref());
+        let summary = self.launch(&request.name, &formatted_task)?;
+        Ok(SpawnedWorker {
+            worker_id: summary.name.clone(),
+            name: summary.name,
+            role: summary.role,
+            status: summary.status,
+            branch: summary.branch,
+            workspace: summary.workspace,
+            mode: summary.mode,
+            model,
+            running: summary.running,
+            note: ASYNC_SPAWN_NOTE.into(),
+        })
+    }
+
     pub(crate) fn launch(&self, name: &str, task: &str) -> Result<Summary, Failure> {
+        if self.is_shutting_down() {
+            return Err(refused("Control plane is shutting down."));
+        }
         bounded_text("task", task, MAX_TEXT_CHARS)?;
         let mut threads = self.lock();
+        self.sync_external(&mut threads);
         let index = locate(&threads, name)?;
         if threads[index].running() {
             return Err(refused(format!(
@@ -416,8 +647,12 @@ impl Control {
     }
 
     pub(crate) fn message(&self, name: &str, text: &str) -> Result<Summary, Failure> {
+        if self.is_shutting_down() {
+            return Err(refused("Control plane is shutting down."));
+        }
         bounded_text("message", text, MAX_TEXT_CHARS)?;
         let mut threads = self.lock();
+        self.sync_external(&mut threads);
         let index = locate(&threads, name)?;
         if !threads[index].running() {
             self.start(&mut threads, index, text.trim().to_owned())?;
@@ -442,7 +677,11 @@ impl Control {
     ) -> Result<Summary, Failure> {
         brief.validate()?;
         let role = brief_role(&brief.role);
-        let exists = locate(&self.lock(), name).is_ok();
+        let exists = {
+            let mut threads = self.lock();
+            self.sync_external(&mut threads);
+            locate(&threads, name).is_ok()
+        };
         if !exists {
             self.create(name, &role, Some(brief.goal.trim()), workspace)?;
         } else if workspace.is_some() {
@@ -462,6 +701,7 @@ impl Control {
         }
         let deadline = Instant::now() + timeout;
         let mut threads = self.lock();
+        self.sync_external(&mut threads);
         loop {
             let index = locate(&threads, name)?;
             let thread = &threads[index];
@@ -469,6 +709,12 @@ impl Control {
                 return Ok(Waited {
                     thread: thread.summary(),
                     finished: true,
+                });
+            }
+            if self.is_shutting_down() {
+                return Ok(Waited {
+                    thread: thread.summary(),
+                    finished: false,
                 });
             }
             let now = Instant::now();
@@ -489,6 +735,7 @@ impl Control {
 
     pub(crate) fn interrupt(&self, name: &str) -> Result<Summary, Failure> {
         let mut threads = self.lock();
+        self.sync_external(&mut threads);
         let index = locate(&threads, name)?;
         let dropped = threads[index].queue.len();
         threads[index].queue.clear();
@@ -500,11 +747,15 @@ impl Control {
             &mut threads[index],
             format!("SYSTEM  Interrupt requested · {dropped} queued dropped"),
         );
+        self.shared.changed.notify_all();
         Ok(threads[index].summary())
     }
 
     pub(crate) fn changed_since(&self, name: &str, seen: u64, timeout: Duration) -> bool {
         let threads = self.lock();
+        if self.is_shutting_down() {
+            return true;
+        }
         let current = |threads: &Vec<Thread>| {
             locate(threads, name)
                 .map(|index| threads[index].sequence)
@@ -518,7 +769,7 @@ impl Control {
             .changed
             .wait_timeout(threads, timeout)
             .unwrap_or_else(PoisonError::into_inner);
-        current(&threads) != seen
+        self.is_shutting_down() || current(&threads) != seen
     }
 
     fn start(&self, threads: &mut [Thread], index: usize, task: String) -> Result<(), Failure> {
@@ -552,7 +803,7 @@ impl Control {
     fn pump(&self, name: &str, run: Box<dyn Run>, stop: &AtomicBool) {
         let mut reply = String::new();
         let outcome = loop {
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || self.is_shutting_down() {
                 break Outcome::Interrupted;
             }
             match run.next(PUMP_POLL) {
@@ -585,27 +836,50 @@ impl Control {
     }
 
     fn finish(&self, name: &str, outcome: Outcome, reply: &str) {
-        let mut threads = self.lock();
-        let Ok(index) = locate(&threads, name) else {
-            return;
-        };
-        let thread = &mut threads[index];
-        thread.stop = None;
-        let (status, detail) = match outcome {
-            Outcome::Finished(Ok(())) => (Status::Done, specialists::summary(reply)),
-            Outcome::Finished(Err(error)) => (Status::Error, error.to_string()),
-            Outcome::Interrupted => (Status::Error, "Interrupted".into()),
-        };
-        thread.member.status = status;
-        let label = status.label();
-        self.record(thread, format!("{name}  {label} · {detail}"));
-        if let Some(next) = thread.queue.pop_front() {
-            if let Err(failure) = self.start(&mut threads, index, next) {
-                self.record(&mut threads[index], format!("{name}  ERROR · {failure}"));
+        let wake_event = {
+            let mut threads = self.lock();
+            let Ok(index) = locate(&threads, name) else {
+                return;
+            };
+            let thread = &mut threads[index];
+            thread.stop = None;
+            let (status, detail) = match outcome {
+                Outcome::Finished(Ok(())) => match specialists::approval_request(reply) {
+                    Some(question) => (Status::NeedsApproval, question),
+                    None => (Status::Done, specialists::summary(reply)),
+                },
+                Outcome::Finished(Err(error)) => (Status::Error, error.to_string()),
+                Outcome::Interrupted => (Status::Error, "Interrupted".into()),
+            };
+            thread.member.status = status;
+            let label = status.label();
+            self.record(thread, format!("{name}  {label} · {detail}"));
+            let event = BackgroundResult {
+                worker_id: thread.member.name.clone(),
+                role: thread.member.role.clone(),
+                status: label.into(),
+                branch: thread.member.branch().map(|branch| branch.name.clone()),
+                workspace: specialists::workspace_label(&thread.member),
+                summary: detail,
+                is_error: status == Status::Error,
+                finished_at: chrono::Local::now().format("%H:%M:%S").to_string(),
+            };
+            if !self.is_shutting_down() {
+                if let Some(next) = thread.queue.pop_front() {
+                    if let Err(failure) = self.start(&mut threads, index, next) {
+                        self.record(&mut threads[index], format!("{name}  ERROR · {failure}"));
+                    }
+                }
+            } else {
+                thread.queue.clear();
             }
+            self.save(&threads);
+            self.shared.changed.notify_all();
+            event
+        };
+        if let Some(queue) = &self.shared.wake_queue {
+            queue.push(wake_event);
         }
-        self.save(&threads);
-        self.shared.changed.notify_all();
     }
 
     fn record_output(&self, name: &str, text: &str) {
@@ -637,9 +911,24 @@ impl Control {
 
     fn save(&self, threads: &[Thread]) {
         let crew: Vec<Member> = threads.iter().map(|thread| thread.member.clone()).collect();
-        if let Err(error) = self.shared.store.save_roster(&crew) {
+        if let Err(error) = self.shared.store.save_roster_merging(&crew, &[]) {
             eprintln!("Roster not saved: {error}");
         }
+    }
+}
+
+fn format_worker_task(task: &str, model: Option<&str>) -> String {
+    let trimmed = task.trim();
+    match model {
+        Some(model) if !trimmed.starts_with('@') => {
+            let tag = if model.starts_with('@') {
+                model.to_owned()
+            } else {
+                format!("@{model}")
+            };
+            format!("{tag} {trimmed}")
+        }
+        _ => trimmed.to_owned(),
     }
 }
 
@@ -839,8 +1128,11 @@ pub(crate) mod tests {
         assert_eq!(Scope::parse("supervised").unwrap(), Scope::Supervised);
         assert_eq!(Scope::parse("read-only").unwrap(), Scope::ReadOnly);
         assert!(Scope::parse("full-access").unwrap_err().contains("never"));
+        assert!(Scope::parse("commander").is_err());
         assert!(Scope::parse("root").is_err());
         assert!(!Scope::ReadOnly.allows_changes());
+        assert!(Scope::Commander.allows_elevated_worker_modes());
+        assert!(!Scope::Supervised.allows_elevated_worker_modes());
     }
 
     #[test]
@@ -861,6 +1153,124 @@ pub(crate) mod tests {
         let crew = scratch.store().load_roster().unwrap();
         assert_eq!(crew[0].permission, PermissionMode::Supervised);
         assert_eq!(crew[1].permission, PermissionMode::ReadOnly);
+    }
+
+    #[test]
+    fn native_engine_loads_limit_policy_from_settings_toml() {
+        let scratch = Scratch::new("settings-policy");
+        let settings_file = scratch.0.join("settings.toml");
+        fs::write(
+            &settings_file,
+            "auto_resume_on_reset = true\nfallback_profile = \"codex/backup\"\n",
+        )
+        .unwrap();
+        let engine = NativeEngine::with_settings_path(scratch.0.clone(), Some(settings_file));
+        let policy = engine.limit_policy();
+        assert!(policy.auto_resume_on_reset);
+        assert_eq!(policy.fallback_profile.as_deref(), Some("codex/backup"));
+
+        let missing = NativeEngine::with_settings_path(
+            scratch.0.clone(),
+            Some(scratch.0.join("missing.toml")),
+        );
+        assert_eq!(missing.limit_policy(), mission::LimitPolicy::default());
+    }
+
+    #[test]
+    fn cooperative_shutdown_stops_running_workers_and_refuses_new_work() {
+        let scratch = Scratch::new("shutdown");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = WakeQueue::new();
+        let control = Control::open_with(
+            scratch.store(),
+            &scratch.root(),
+            Box::new(ScriptedEngine { hold: true }),
+            Arc::clone(&shutdown),
+            Some(wake.clone()),
+        )
+        .unwrap();
+        control.create("atlas", "builder", None, None).unwrap();
+        control.launch("atlas", "hold work").unwrap();
+        control.shutdown();
+        let waited = control.wait("atlas", Duration::from_secs(2)).unwrap();
+        assert!(!waited.thread.running || control.is_shutting_down());
+        assert!(matches!(
+            control.launch("atlas", "after shutdown"),
+            Err(Failure::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn external_roster_additions_are_reloaded_without_clobbering() {
+        let scratch = Scratch::new("roster-sync");
+        let control = control(&scratch, false);
+        control
+            .create("daemon_worker", "builder", None, None)
+            .unwrap();
+
+        let tui_member = Member::new("tui_worker", "reviewer", Some("Check UI"), None);
+        scratch
+            .store()
+            .save_roster_merging(&[Member::commander(), tui_member], &[])
+            .unwrap();
+
+        let listed = control.list();
+        let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"daemon_worker"), "{names:?}");
+        assert!(names.contains(&"tui_worker"), "{names:?}");
+
+        control
+            .create("second_daemon", "writer", None, None)
+            .unwrap();
+        let persisted = scratch.store().load_roster().unwrap();
+        let persisted_names: Vec<&str> = persisted.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            persisted_names.contains(&"tui_worker"),
+            "{persisted_names:?}"
+        );
+        assert!(
+            persisted_names.contains(&"daemon_worker"),
+            "{persisted_names:?}"
+        );
+        assert!(
+            persisted_names.contains(&"second_daemon"),
+            "{persisted_names:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_worker_is_non_blocking_and_pushes_background_result_to_wake_queue() {
+        let scratch = Scratch::new("spawn-worker");
+        let wake = WakeQueue::new();
+        let control = Control::open_with(
+            scratch.store(),
+            &scratch.root(),
+            Box::new(ScriptedEngine { hold: false }),
+            Arc::new(AtomicBool::new(false)),
+            Some(wake.clone()),
+        )
+        .unwrap();
+        let spawned = control
+            .spawn_worker(&SpawnWorkerRequest {
+                name: "forge".into(),
+                role: "builder".into(),
+                task: "slow build".into(),
+                model: Some("codex".into()),
+                mode: None,
+                workspace: None,
+                allow_elevated_mode: true,
+            })
+            .unwrap();
+        assert_eq!(spawned.worker_id, "forge");
+        assert!(spawned.running);
+        assert_eq!(spawned.mode, "workspace-auto");
+        assert!(spawned.note.contains("<background-result>"));
+
+        let result = wake.wait_next(Duration::from_secs(3)).unwrap();
+        assert_eq!(result.worker_id, "forge");
+        assert_eq!(result.status, "DONE");
+        assert!(!result.is_error);
+        assert!(result.summary.contains("@codex slow build"));
     }
 
     #[test]

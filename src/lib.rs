@@ -1,48 +1,57 @@
-mod auth;
+pub mod auth;
 mod branches;
+pub mod bridge;
 mod catalog;
 mod checkpoint;
 mod cli;
+pub mod clipboard;
 mod connect;
 mod control;
 mod daemon;
+pub mod editor;
+pub mod github;
 mod goal;
 mod http;
 mod install;
+pub mod ledger;
+pub mod markdown;
 mod mcp;
-mod mission;
+pub mod mission;
 mod native;
+pub mod onboard;
+pub mod palette;
 mod panel;
-mod permissions;
+pub mod permissions;
+pub mod prodgate;
 mod review;
-mod routing;
-mod settings;
+pub mod routing;
+pub mod settings;
 mod side;
+pub mod soul;
 mod specialists;
 mod targeting;
 pub mod token_burn;
 mod triage;
+pub mod tui;
 pub mod update;
-mod usage;
+pub mod usage;
 pub use cli::run_cli;
-pub use specialists::{Entry, Member, Status, COMMANDER};
+pub use specialists::{
+    format_goal_turn, format_help, help_entries, resolve_member_target, resolve_target,
+    split_goal_prompt, CommandHelp, Entry, GoalTurn, Member, Status, TargetCandidate, TargetMatch,
+    COMMANDER,
+};
 
 use std::{
-    collections::VecDeque,
-    fs, io,
+    collections::{HashMap, VecDeque},
+    env, fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, TryRecvError},
-    time::SystemTime,
+    sync::mpsc::{Receiver, Sender, TryRecvError},
+    time::{Instant, SystemTime},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
-    Frame,
-};
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, style::Color, Frame};
 use serde::Deserialize;
 
 const PREVIEW_NOTICE: &str = "Preview only; no external dispatch.";
@@ -120,30 +129,6 @@ fn profile_route(
     ProfileRoute::Excluded(reason.into())
 }
 
-fn deck_card(
-    label: &str,
-    allowance: usage::Allowance,
-    route: Option<&ProfileRoute>,
-) -> token_burn::AccountCard {
-    let (provider, profile) = label.split_once('/').unwrap_or((label, ""));
-    let (route_model, route_metric) = match route {
-        _ if allowance.latched => (None, Some("latched".to_owned())),
-        Some(ProfileRoute::Routed { model, metric }) => (Some(model.clone()), Some(metric.clone())),
-        Some(ProfileRoute::Excluded(reason)) => (None, Some(reason.clone())),
-        None => (None, None),
-    };
-    token_burn::AccountCard {
-        provider: provider.into(),
-        profile: profile.into(),
-        tier: String::new(),
-        primary_remaining: allowance.five,
-        secondary_remaining: allowance.week,
-        seconds_until_reset: allowance.reset_in,
-        route_model,
-        route_metric,
-    }
-}
-
 fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
     fs::read_to_string(path)
         .ok()
@@ -151,43 +136,21 @@ fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
         .unwrap_or_default()
 }
 
-fn deck_mode(area: Rect, compact_layout: bool) -> token_burn::DeckMode {
-    if compact_layout {
-        token_burn::DeckMode::Compact
-    } else {
-        token_burn::DeckMode::for_area(area)
-    }
-}
-
-const COMPACT_DECK_MAX_ROWS: usize = 3;
-const FULL_DECK_MAX_CARDS: usize = 3;
-const UPDATE_WIDE_MIN_WIDTH: u16 = 100;
-const ABANDON_LABEL: &str = "  F4 Abandon  ";
-const SHORTCUTS: &str =
-    " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed    F7 Settled";
-
 fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
     request.units = request.units.iter().map(|unit| frame(unit)).collect();
     request
 }
 
-struct SideAnswer {
-    thread: String,
-    entry: Entry,
-}
-
 struct Snooze {
     thread: String,
-    banner: Entry,
+    banner: String,
 }
 
 impl Snooze {
     fn new(thread: &str, label: &str) -> Self {
         Self {
             thread: thread.into(),
-            banner: Entry::now(format!(
-                "SNOOZED  {label} Feed collapsed until the mission resumes."
-            )),
+            banner: format!("SNOOZED  {label} Feed collapsed until the mission resumes."),
         }
     }
 }
@@ -227,39 +190,65 @@ enum ProfileRoute {
     Excluded(String),
 }
 
-struct Live {
-    workspace: PathBuf,
-    profiles: Vec<auth::Profile>,
-    profile_root: Option<PathBuf>,
-    preferred: Option<usize>,
+pub(crate) struct Live {
+    pub(crate) workspace: PathBuf,
+    pub(crate) profiles: Vec<auth::Profile>,
+    pub(crate) profile_root: Option<PathBuf>,
+    pub(crate) preferred: Option<usize>,
     pins: native::Pins,
     last_routed: Option<usize>,
-    profile_area: Rect,
+    pub(crate) profile_area: Rect,
     usage: Option<usage::Usage>,
     usage_checked_at: Option<u64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
-    pending: Option<(usize, checkpoint::Claim)>,
-    abandon_area: Rect,
-    runs: Vec<Run>,
-    store: Option<specialists::Store>,
-    queue: VecDeque<Delegation>,
+    pub(crate) pending: Option<(usize, checkpoint::Claim)>,
+    pub(crate) abandon_area: Rect,
+    pub(crate) runs: Vec<Run>,
+    pub(crate) store: Option<specialists::Store>,
+    pub(crate) queue: VecDeque<Delegation>,
     tools: branches::Tools,
     entry: Option<(String, &'static str)>,
     routes: Vec<ProfileRoute>,
-    allowances: Vec<usage::Allowance>,
-    signed_in: Vec<bool>,
+    pub(crate) allowances: Vec<usage::Allowance>,
+    pub(crate) signed_in: Vec<bool>,
+    pub(crate) bridge: Option<bridge::LoopbackBridge>,
+    pub(crate) commander_session_id: Option<String>,
+    pub(crate) commander_provider: Option<auth::Provider>,
+    pub(crate) soul_store: Option<soul::SoulStore>,
+    pub(crate) recent_shell_context: VecDeque<String>,
+    pub(crate) handoff_turns: Vec<soul::HandoffTurn>,
+    pub(crate) live_quota: Option<(Option<f32>, Option<f32>)>,
+    pub(crate) pending_prod_gates: HashMap<String, String>,
+    pub(crate) ask_user: Option<bridge::AskUserBroker>,
 }
 
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
 const EVENTS_PER_POLL: usize = 64;
 
-struct Run {
-    name: String,
-    mission: mission::Mission,
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RunPhase {
+    #[default]
+    Working,
+    Thinking,
+    Tool {
+        name: String,
+        summary: String,
+    },
+    Streaming,
+}
+
+pub(crate) struct Run {
+    pub(crate) name: String,
+    pub(crate) mission: mission::Mission,
     reply: String,
     continuation: Option<String>,
     reviewing: bool,
+    pub(crate) started_at: Instant,
+    pub(crate) phase: RunPhase,
+    pub(crate) thinking_started_at: Option<Instant>,
+    pub(crate) tool_started_at: HashMap<String, Instant>,
+    pub(crate) saw_normalized_text: bool,
 }
 
 impl Run {
@@ -270,6 +259,11 @@ impl Run {
             reply: String::new(),
             continuation: None,
             reviewing,
+            started_at: Instant::now(),
+            phase: RunPhase::Working,
+            thinking_started_at: None,
+            tool_started_at: HashMap::new(),
+            saw_normalized_text: false,
         }
     }
 
@@ -281,6 +275,14 @@ impl Run {
                 io::Error::other("Mission worker stopped"),
             ))),
         }
+    }
+
+    fn drain_normalized(&self) -> Vec<mission::NormalizedEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.mission.normalized.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }
 
@@ -312,6 +314,15 @@ impl Live {
             routes: Vec::new(),
             allowances: Vec::new(),
             signed_in: Vec::new(),
+            bridge: None,
+            commander_session_id: None,
+            commander_provider: None,
+            soul_store: soul::SoulStore::from_env(),
+            recent_shell_context: VecDeque::new(),
+            handoff_turns: Vec::new(),
+            live_quota: None,
+            pending_prod_gates: HashMap::new(),
+            ask_user: None,
         }
     }
 
@@ -319,11 +330,11 @@ impl Live {
         !self.runs.is_empty()
     }
 
-    fn running(&self, name: &str) -> bool {
+    pub(crate) fn running(&self, name: &str) -> bool {
         self.run_position(name).is_some()
     }
 
-    fn run_position(&self, name: &str) -> Option<usize> {
+    pub(crate) fn run_position(&self, name: &str) -> Option<usize> {
         self.runs
             .iter()
             .position(|run| run.name.eq_ignore_ascii_case(name))
@@ -344,7 +355,7 @@ impl Live {
         self.queue.remove(position)
     }
 
-    fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
+    pub(crate) fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
         self.profiles = profiles;
         self.preferred = None;
         self.last_routed = None;
@@ -401,20 +412,6 @@ impl Live {
             .collect();
     }
 
-    fn deck_cards(&self) -> Vec<token_burn::AccountCard> {
-        self.profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| {
-                deck_card(
-                    &profile.to_string(),
-                    self.allowances.get(index).copied().unwrap_or_default(),
-                    self.routes.get(index),
-                )
-            })
-            .collect()
-    }
-
     fn entry_label(&self) -> String {
         self.entry.as_ref().map_or_else(
             || "no signed-in profile".into(),
@@ -452,7 +449,7 @@ impl Live {
             .map(|index| self.profiles[index].clone())
     }
 
-    fn displayed_profile(&self) -> usize {
+    pub(crate) fn displayed_profile(&self) -> usize {
         self.running_profile
             .or(self.preferred)
             .or(self.last_routed)
@@ -493,13 +490,11 @@ impl Live {
         }
     }
 
-    fn pin_label(&self, index: usize) -> String {
-        self.pins
-            .get(&self.profiles[index].to_string())
-            .map_or_else(
-                || "no model pin".into(),
-                |pin| format!("pin {}", pin.label()),
-            )
+    pub(crate) fn pin_label(&self, index: usize) -> Option<String> {
+        self.profiles
+            .get(index)
+            .and_then(|profile| self.pins.get(&profile.to_string()))
+            .map(native::Pin::label)
     }
 
     fn save_override(&self) -> io::Result<()> {
@@ -520,15 +515,7 @@ impl Live {
         catalog::Catalog::load(state.as_deref())
     }
 
-    fn route_mode(&self) -> &'static str {
-        if self.preferred.is_some() {
-            "Override"
-        } else {
-            "Auto"
-        }
-    }
-
-    fn refresh_usage(&mut self) {
+    pub(crate) fn refresh_usage(&mut self) {
         let now = usage::now();
         if self.usage_checked_at == Some(now.elapsed / 1_000_000_000) {
             return;
@@ -568,7 +555,7 @@ impl Live {
 }
 
 pub struct App {
-    live: Option<Live>,
+    pub(crate) live: Option<Live>,
     pub selected: usize,
     pub crew: Vec<Member>,
     pub input: String,
@@ -577,6 +564,7 @@ pub struct App {
     pub log: VecDeque<String>,
     pub log_times: VecDeque<String>,
     pub theme: Theme,
+    pub ui_palette: markdown::UiPalette,
     pub notice: String,
     theme_stamp: Option<SystemTime>,
     pub crew_area: Rect,
@@ -584,36 +572,80 @@ pub struct App {
     pub new_area: Rect,
     pub pause_area: Rect,
     pub send_area: Rect,
-    crew_row_height: u16,
-    crew_offset: usize,
     pub show_settled: bool,
     touch_clock: u64,
     pub deck_palette: token_burn::TokenBurnPalette,
     update_receiver: Option<Receiver<String>>,
     pub update_available: Option<String>,
+    pub update_state: update::UpdateState,
+    pub(crate) manual_update_check: bool,
     pub update_area: Rect,
     exit_message: Option<String>,
-    deck_hits: Vec<(usize, Rect)>,
+    pub(crate) relaunch_executable: Option<PathBuf>,
     pub settings_area: Rect,
+    pub palette_area: Rect,
+    pub profile_area: Rect,
+    pub transcript_area: Rect,
     pub full_redraw: bool,
-    panel: Option<panel::Panel>,
+    pub(crate) panel: Option<panel::Panel>,
     panel_hits: Vec<(panel::Action, Rect)>,
     host: Option<Box<dyn panel::Host>>,
-    settings: settings::Settings,
-    launch: settings::LaunchConfig,
+    pub(crate) settings: settings::Settings,
+    pub(crate) launch: settings::LaunchConfig,
     goal: Option<goal::Goal>,
     side_chats: Vec<side::SideChat>,
-    side_answers: Vec<SideAnswer>,
     snoozes: Vec<Snooze>,
+    pub composer: editor::Composer,
+    pub autocomplete: editor::AutocompletePopup,
+    pub palette: palette::CommandPalette,
+    pub diff_modal: tui::diff_modal::DiffModal,
+    pub transcript: markdown::Transcript,
+    pub scroll: markdown::ScrollState,
+    pub(crate) specialist_transcripts: HashMap<String, markdown::Transcript>,
+    pub(crate) specialist_scrolls: HashMap<String, markdown::ScrollState>,
+    pub rail_open: bool,
+    pub rail_focused: bool,
+    pub show_welcome: bool,
+    pub github_status: github::GitHubAuthStatus,
+    pub auth_detections: Vec<auth::AuthDetection>,
+    pub git_snapshot: tui::events::GitSnapshot,
+    pub turn_changes: Vec<tui::events::ChangedFile>,
+    pub(crate) rail_hits: Vec<(Rect, tui::render::RailHit)>,
+    pub(crate) focus_banner_hits: Vec<(Rect, tui::render::FocusBannerHit)>,
+    pub(crate) welcome_hits: Vec<(Rect, tui::render::WelcomeHit)>,
+    pub(crate) bg_tx: Option<Sender<tui::events::AppEvent>>,
+    pub(crate) bg_rx: Option<Receiver<tui::events::AppEvent>>,
+    pub(crate) esc_armed_at: Option<Instant>,
+    pub(crate) ctrl_c_armed_at: Option<Instant>,
+    pub(crate) leader_armed_at: Option<Instant>,
+    pub(crate) external_editor_request: Option<String>,
+    pub view_tab: tui::tabs::ViewTab,
+    pub left_panel: tui::tabs::LeftPanelMode,
+    pub left_focused: bool,
+    pub(crate) left_hits: Vec<(Rect, tui::tabs::TabHit)>,
+    pub(crate) last_frame_width: u16,
+    pub(crate) ledger: ledger::Ledger,
+    pub(crate) ledger_path: Option<PathBuf>,
+    pub ledger_filter: ledger::LedgerFilter,
+    pub ledger_selected: usize,
+    pub inbox_selected: usize,
+    pub(crate) inbox_dismissed: std::collections::HashSet<String>,
+    pub(crate) inbox_wakes: Vec<tui::tabs::WakeNote>,
 }
+
 impl Default for App {
     fn default() -> Self {
+        let mut transcript = markdown::Transcript::new();
+        transcript.push(markdown::TranscriptEntry::SystemNotice {
+            level: markdown::NoticeLevel::Info,
+            text: "Commander online. Ask anything, /help for commands, Ctrl+P for palette.".into(),
+        });
         Self {
             live: None,
             selected: 0,
             crew: vec![Member::commander()],
             input: String::new(),
-            editing: false,
+            editing: true,
             quit: false,
             log: VecDeque::from([
                 "SYSTEM  Commander online. Message Commander, or /spawn NAME ROLE [TASK]."
@@ -621,6 +653,7 @@ impl Default for App {
             ]),
             log_times: VecDeque::from([chrono::Local::now().format("%H:%M:%S").to_string()]),
             theme: Theme::default(),
+            ui_palette: markdown::UiPalette::dark_deck(),
             notice: String::new(),
             theme_stamp: None,
             crew_area: Rect::default(),
@@ -628,17 +661,20 @@ impl Default for App {
             new_area: Rect::default(),
             pause_area: Rect::default(),
             send_area: Rect::default(),
-            crew_row_height: 1,
-            crew_offset: 0,
             show_settled: false,
             touch_clock: 0,
             deck_palette: token_burn::TokenBurnPalette::default(),
             update_receiver: None,
             update_available: None,
+            update_state: update::UpdateState::Idle,
+            manual_update_check: false,
             update_area: Rect::default(),
             exit_message: None,
-            deck_hits: Vec::new(),
+            relaunch_executable: None,
             settings_area: Rect::default(),
+            palette_area: Rect::default(),
+            profile_area: Rect::default(),
+            transcript_area: Rect::default(),
             full_redraw: false,
             panel: None,
             panel_hits: Vec::new(),
@@ -647,19 +683,89 @@ impl Default for App {
             launch: settings::LaunchConfig::default(),
             goal: None,
             side_chats: Vec::new(),
-            side_answers: Vec::new(),
             snoozes: Vec::new(),
+            composer: editor::Composer::new(),
+            autocomplete: editor::AutocompletePopup::new(),
+            palette: palette::CommandPalette::default(),
+            diff_modal: tui::diff_modal::DiffModal::new(),
+            transcript,
+            scroll: markdown::ScrollState::new(),
+            specialist_transcripts: HashMap::new(),
+            specialist_scrolls: HashMap::new(),
+            rail_open: true,
+            rail_focused: false,
+            show_welcome: false,
+            github_status: github::GitHubAuthStatus::default(),
+            auth_detections: Vec::new(),
+            git_snapshot: tui::events::GitSnapshot::default(),
+            turn_changes: Vec::new(),
+            rail_hits: Vec::new(),
+            focus_banner_hits: Vec::new(),
+            welcome_hits: Vec::new(),
+            bg_tx: None,
+            bg_rx: None,
+            esc_armed_at: None,
+            ctrl_c_armed_at: None,
+            leader_armed_at: None,
+            external_editor_request: None,
+            view_tab: tui::tabs::ViewTab::Chat,
+            left_panel: tui::tabs::LeftPanelMode::Auto,
+            left_focused: false,
+            left_hits: Vec::new(),
+            last_frame_width: 0,
+            ledger: ledger::Ledger::default(),
+            ledger_path: None,
+            ledger_filter: ledger::LedgerFilter::All,
+            ledger_selected: 0,
+            inbox_selected: 0,
+            inbox_dismissed: std::collections::HashSet::new(),
+            inbox_wakes: Vec::new(),
         }
     }
 }
+
 impl App {
-    fn live(workspace: PathBuf) -> Self {
+    pub fn live_fast(workspace: PathBuf) -> Self {
+        let root = auth::root().ok();
+        let mut live = Live::new(workspace, Vec::new(), root);
+        let _ = live.load_pins();
+        let _ = live.load_override();
+        Self::from_live(live)
+    }
+
+    pub(crate) fn attach_fast(
+        &mut self,
+        host: Box<dyn panel::Host>,
+        launch: settings::LaunchConfig,
+    ) {
+        if let Some(path) = &launch.settings_path {
+            match settings::Settings::load(path) {
+                Ok(loaded) => self.settings = loaded,
+                Err(error) => {
+                    self.notice = format!("Settings unreadable: {error}. Using defaults.")
+                }
+            }
+        }
+        self.crew[0].permission = self.settings.commander_permission;
+        if let Some(live) = &mut self.live {
+            live.soul_store = self
+                .settings
+                .effective_soul_path()
+                .map(soul::SoulStore::new)
+                .or_else(soul::SoulStore::from_env);
+        }
+        self.launch = launch;
+        self.host = Some(host);
+        self.editing = true;
+    }
+
+    pub fn live(workspace: PathBuf) -> Self {
         let mut notice = String::new();
         let root = auth::root();
         let profiles = root
             .as_ref()
             .map_err(|error| io::Error::new(error.kind(), error.to_string()))
-            .and_then(|root| auth::profiles(root))
+            .and_then(|root| auth::all_profiles(root))
             .unwrap_or_else(|error| {
                 notice = format!("Cannot load profiles: {error}");
                 Vec::new()
@@ -683,6 +789,7 @@ impl App {
         app
     }
 
+    #[cfg(test)]
     fn attach(&mut self, host: Box<dyn panel::Host>, launch: settings::LaunchConfig) {
         if let Some(path) = &launch.settings_path {
             match settings::Settings::load(path) {
@@ -693,10 +800,18 @@ impl App {
             }
         }
         self.crew[0].permission = self.settings.commander_permission;
+        if let Some(live) = &mut self.live {
+            live.soul_store = self
+                .settings
+                .effective_soul_path()
+                .map(soul::SoulStore::new)
+                .or_else(soul::SoulStore::from_env);
+        }
         self.launch = launch;
         self.host = Some(host);
         self.refresh_sign_in();
         if self.no_provider_connected() {
+            self.show_welcome = true;
             self.open_connect(panel::Origin::Onboarding);
         }
     }
@@ -713,19 +828,56 @@ impl App {
         let mut app = Self::default();
         app.log.clear();
         app.log_times.clear();
+        app.transcript.clear();
         if let Some(store) = &live.store {
-            match store.load_commander() {
+            let legacy_entries = match store.load_commander_for_workspace(&live.workspace) {
                 Ok(entries) => {
-                    for entry in entries {
-                        app.log.push_back(entry.text);
-                        app.log_times.push_back(entry.at);
+                    for entry in &entries {
+                        app.log.push_back(entry.text.clone());
+                        app.log_times.push_back(entry.at.clone());
+                    }
+                    entries
+                }
+                Err(error) => {
+                    app.notice = format!("Cannot read Commander transcript: {error}");
+                    Vec::new()
+                }
+            };
+            match store.load_transcript_for_workspace(&live.workspace) {
+                Ok(Some(structured)) => {
+                    app.transcript.entries = structured;
+                }
+                Ok(None) => {
+                    for entry in legacy_entries {
+                        app.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at));
                     }
                 }
-                Err(error) => app.notice = format!("Cannot read Commander transcript: {error}"),
+                Err(error) => {
+                    app.notice = format!("Cannot read Commander transcript: {error}");
+                    for entry in legacy_entries {
+                        app.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at));
+                    }
+                }
             }
             match store.load_roster() {
-                Ok(members) => app.crew.extend(members),
+                Ok(members) => {
+                    for member in members {
+                        let name = member.name.clone();
+                        for entry in &member.history {
+                            app.push_transcript_log_entry(
+                                &name,
+                                &entry.text,
+                                Some(entry.at.clone()),
+                            );
+                        }
+                        app.crew.push(member);
+                    }
+                }
                 Err(error) => app.notice = format!("Cannot read specialist roster: {error}"),
+            }
+            app.ledger_path = store.ledger_path_for_workspace(&live.workspace).ok();
+            if let Some(path) = &app.ledger_path {
+                app.ledger = ledger::Ledger::load(path);
             }
         }
         live.refresh_routes();
@@ -734,7 +886,7 @@ impl App {
         app
     }
 
-    fn select_profile(&mut self) {
+    pub(crate) fn select_profile(&mut self) {
         let Some(live) = &mut self.live else { return };
         if live.busy() || live.profiles.is_empty() {
             return;
@@ -756,15 +908,33 @@ impl App {
         };
     }
 
-    fn status(&self, index: usize) -> &'static str {
+    pub fn status(&self, index: usize) -> &'static str {
         self.crew[index].status.label()
     }
 
-    fn poll_mission(&mut self) {
-        if let Some(live) = &mut self.live {
-            live.refresh_usage();
-        }
+    pub fn poll_mission(&mut self) {
+        self.refresh_usage_and_sync();
         self.poll_side();
+
+        let normalized_batch: Vec<(String, mission::NormalizedEvent)> = self
+            .live
+            .as_ref()
+            .map(|live| {
+                live.runs
+                    .iter()
+                    .flat_map(|run| {
+                        let name = run.name.clone();
+                        run.drain_normalized()
+                            .into_iter()
+                            .map(move |ev| (name.clone(), ev))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, ev) in normalized_batch {
+            self.handle_normalized_event(&name, ev);
+        }
+
         for _ in 0..EVENTS_PER_POLL {
             let events = self.next_events();
             if events.is_empty() {
@@ -814,8 +984,9 @@ impl App {
                 live.refresh_usage();
                 self.touch(index);
                 if let Some(reason) = reason {
-                    self.notice = reason.clone();
-                    self.push_log(format!("SYSTEM  {reason}"));
+                    let concise = tui::app_ops::format_routing_notice(&reason);
+                    self.notice = concise.clone();
+                    self.push_log(format!("SYSTEM  {concise}"));
                 }
             }
             mission::Event::Continuing { from, to } => {
@@ -845,13 +1016,20 @@ impl App {
                 let run = &mut live.runs[position];
                 run.reply.push_str(&text);
                 run.reply.push('\n');
+                let saw_norm = run.saw_normalized_text;
                 let speaker = if run.reviewing {
                     format!("{name} review")
                 } else {
                     name.to_owned()
                 };
+                if !saw_norm {
+                    let clean = text.trim_end_matches('\r');
+                    if !clean.trim().is_empty() {
+                        self.append_transcript_assistant_chunk(name, &speaker, clean);
+                    }
+                }
                 for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    self.record(index, format!("{speaker}  {line}"));
+                    self.record_log_only(index, format!("{speaker}  {line}"));
                 }
             }
             mission::Event::Finished(result) => {
@@ -894,20 +1072,51 @@ impl App {
     }
 
     fn finish_commander(&mut self, run: Run, result: io::Result<()>) {
+        self.transcript.finish_assistant_stream();
+        self.composer.set_running(false);
         self.crew[0].status = if result.is_ok() {
             Status::Done
         } else {
             Status::Error
         };
+        if let Some(live) = &mut self.live {
+            let seq = (live.handoff_turns.len() + 1) as u64;
+            if !run.reply.trim().is_empty() {
+                live.handoff_turns.push(soul::HandoffTurn {
+                    seq,
+                    role: soul::TurnRole::Assistant,
+                    content: run.reply.trim().to_owned(),
+                    command_outcome: None,
+                });
+            }
+            live.pending_prod_gates
+                .retain(|_, run_name| run_name != COMMANDER);
+        }
         self.notice = match &result {
             Ok(()) => run.continuation.map_or_else(
                 || format!("{COMMANDER} replied."),
                 |link| format!("Done · {link}"),
             ),
-            Err(error) => format!("{COMMANDER}: {error}"),
+            Err(error) => {
+                self.mark_provider_stderr_failed(COMMANDER);
+                let msg = format!("{COMMANDER}: {error}");
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Error,
+                        text: msg.clone(),
+                    });
+                msg
+            }
         };
         if result.is_ok() {
             self.apply_directives(&run.reply);
+        }
+        self.persist_commander_transcript();
+        if let (Some(live), Some(tx)) = (&self.live, &self.bg_tx) {
+            tui::events::spawn_git_refresh(live.workspace.clone(), tx.clone());
+        }
+        if let Some(queued) = self.composer.pop_next_queued() {
+            self.message_commander(queued);
         }
     }
 
@@ -955,19 +1164,23 @@ impl App {
             return;
         }
         let mut goal = goal::Goal::new(&member, criteria, self.settings.goal_cap());
-        let prompt = goal.begin();
+        let _ = goal.begin();
+        let turn =
+            specialists::format_goal_turn(&goal.criteria, goal.turns, goal.cap, goal::GOAL_MET);
         self.notice = format!("Goal pinned on {member}: {}", goal.status());
         self.push_log(format!(
             "SYSTEM  Goal pinned on {member}: {}",
             goal.status()
         ));
+        self.ledger_record(ledger::TaskKind::Goal, &member, &goal.criteria);
         self.goal = Some(goal);
-        self.send_goal_turn(&member, prompt);
+        self.send_goal_turn(&member, turn);
     }
 
     fn cancel_goal(&mut self) {
         self.notice = match self.goal.take() {
             Some(goal) => {
+                self.ledger_finish_goal(&goal.member, ledger::TaskStatus::Cancelled);
                 let message = format!(
                     "Goal cancelled on {} after {} of {} turns.",
                     goal.member, goal.turns, goal.cap
@@ -984,10 +1197,16 @@ impl App {
             return;
         };
         let message = match goal.after_turn(outcome) {
-            goal::Step::Continue(prompt) => {
+            goal::Step::Continue(_) => {
                 let status = goal.status();
+                let turn = specialists::format_goal_turn(
+                    &goal.criteria,
+                    goal.turns,
+                    goal.cap,
+                    goal::GOAL_MET,
+                );
                 self.push_log(format!("SYSTEM  Goal continues: {status}"));
-                self.send_goal_turn(member, prompt);
+                self.send_goal_turn(member, turn);
                 return;
             }
             goal::Step::Met => format!("Goal met on {member}: {}", goal.status()),
@@ -995,24 +1214,38 @@ impl App {
                 "Goal stopped at the {}-turn safety cap on {member}: {}",
                 goal.cap, goal.criteria
             ),
-            goal::Step::Failed(error) => format!("Goal stopped on {member}: {error}"),
+            goal::Step::Failed(error) => {
+                let message = format!("Goal stopped on {member}: {error}");
+                self.goal = None;
+                self.ledger_finish_goal(member, ledger::TaskStatus::Error);
+                self.notice = message.clone();
+                self.push_log(format!("SYSTEM  {message}"));
+                return;
+            }
         };
+        self.ledger_finish_goal(member, ledger::TaskStatus::Done);
         self.goal = None;
         self.notice = message.clone();
         self.push_log(format!("SYSTEM  {message}"));
     }
 
-    fn send_goal_turn(&mut self, member: &str, prompt: String) {
+    fn send_goal_turn(&mut self, member: &str, turn: specialists::GoalTurn) {
         let typed = std::mem::take(&mut self.input);
         match specialists::find(&self.crew, member) {
-            Some(0) => self.message_commander(prompt),
-            Some(index) => self.delegate(index, prompt),
+            Some(0) => self.message_commander_with_display(turn.model_prompt, turn.display_label),
+            Some(index) => {
+                self.delegate(index, turn.model_prompt);
+                if let Some(slot) = self.crew.get_mut(index) {
+                    slot.mission = turn.display_label;
+                }
+            }
             None => {}
         }
         self.input = typed;
         if !self.turn_scheduled(member) {
             let reason = std::mem::take(&mut self.notice);
             self.goal = None;
+            self.ledger_finish_goal(member, ledger::TaskStatus::Error);
             self.notice = format!("Goal stopped on {member}: {reason}");
         }
     }
@@ -1065,23 +1298,18 @@ impl App {
     }
 
     fn show_side_answer(&mut self, chat: &side::SideChat, result: io::Result<Vec<String>>) {
-        let mut lines = vec![format!("BTW  Q: {}", chat.question)];
+        let mut lines = vec![format!("**Q:** {}", chat.question)];
         match result {
-            Ok(answer) if answer.is_empty() => lines.push("BTW  (no answer)".into()),
-            Ok(answer) => lines.extend(answer.into_iter().map(|line| format!("BTW  {line}"))),
-            Err(error) => lines.push(format!("BTW  Side chat failed: {error}")),
+            Ok(answer) if answer.is_empty() => lines.push("(no answer)".into()),
+            Ok(answer) => lines.extend(answer),
+            Err(error) => lines.push(format!("Side chat failed: {error}")),
         }
-        for text in lines {
-            self.side_answers.push(SideAnswer {
-                thread: chat.thread.clone(),
-                entry: Entry::now(text),
+        self.transcript_for_mut(&chat.thread)
+            .push(markdown::TranscriptEntry::AssistantMarkdown {
+                speaker: "Side Q&A (/btw)".into(),
+                markdown: lines.join("\n\n"),
+                streaming: false,
             });
-        }
-        let overflow = self
-            .side_answers
-            .len()
-            .saturating_sub(specialists::FEED_LIMIT);
-        self.side_answers.drain(..overflow);
         self.notice = format!("Side answer ready in the {} feed.", chat.thread);
     }
 
@@ -1089,10 +1317,11 @@ impl App {
         self.snoozes.iter().any(|snooze| snooze.thread == thread)
     }
 
-    fn snoozed(&self) -> bool {
-        self.live
-            .as_ref()
-            .is_some_and(|live| live.runs.iter().all(|run| self.is_snoozed(&run.name)))
+    pub(crate) fn collapsed_snooze(&self, thread: &str) -> Option<&str> {
+        self.snoozes
+            .iter()
+            .find(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
+            .map(|snooze| snooze.banner.as_str())
     }
 
     fn apply_directives(&mut self, reply: &str) {
@@ -1114,7 +1343,7 @@ impl App {
         let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) else {
             return;
         };
-        if let Err(error) = store.save_roster(&self.crew) {
+        if let Err(error) = store.save_roster_merging(&self.crew, &[]) {
             self.notice = format!("Roster not saved: {error}");
         }
     }
@@ -1123,11 +1352,37 @@ impl App {
         if self.crew[index].is_commander() {
             return self.push_log(text);
         }
+        let name = self.crew[index].name.clone();
         let entry = Entry::now(text);
+        self.push_transcript_log_entry(&name, &entry.text, Some(entry.at.clone()));
         if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
-            if let Err(error) = store.append_history(&self.crew[index].name, &entry) {
+            if let Err(error) = store.append_history(&name, &entry) {
                 self.notice = format!("History not saved: {error}");
             }
+        }
+        self.crew[index].remember(entry);
+        self.touch(index);
+    }
+
+    fn record_log_only(&mut self, index: usize, text: String) {
+        if self.crew[index].is_commander() {
+            let entry = Entry::now(text);
+            if let Some(live) = &self.live {
+                if let Some(store) = &live.store {
+                    let _ = store.append_commander_for_workspace(&live.workspace, &entry);
+                }
+            }
+            self.log.push_back(entry.text);
+            self.log_times.push_back(entry.at);
+            if self.log.len() > specialists::FEED_LIMIT {
+                self.log.pop_front();
+                self.log_times.pop_front();
+            }
+            return;
+        }
+        let entry = Entry::now(text);
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            let _ = store.append_history(&self.crew[index].name, &entry);
         }
         self.crew[index].remember(entry);
         self.touch(index);
@@ -1217,12 +1472,21 @@ impl App {
             return;
         };
         let busy = live.running(&name);
+        let title = targeted.text.clone();
         live.queue.push_back(Delegation {
             name: name.clone(),
             task: targeted.text,
             target: targeted.target,
             review: false,
         });
+        if !self.goal_pinned_on(&name) {
+            let status = if busy {
+                ledger::TaskStatus::Queued
+            } else {
+                ledger::TaskStatus::Running
+            };
+            self.ledger_record_with(ledger::TaskKind::Spawn, &name, &title, status);
+        }
         self.push_log(format!("SYSTEM  Delegated to {name}: {task}"));
         if busy {
             self.notice = format!("{name} is busy; the task is queued for its workspace.");
@@ -1276,6 +1540,13 @@ impl App {
             review::MAX_REVIEW_ROUNDS,
             plan.note
         ));
+        let title = format!(
+            "Review round {}/{} · {}",
+            plan.round,
+            review::MAX_REVIEW_ROUNDS,
+            plan.note
+        );
+        self.ledger_record(ledger::TaskKind::Review, &name, &title);
         self.save_roster();
         self.start_next();
     }
@@ -1321,14 +1592,44 @@ impl App {
             });
             (request, member.permission)
         };
-        let mission = mission::Mission::launch(
+        let mut options = mission::LaunchOptions {
+            policy: permissions::PermissionPolicy::for_mode(mode),
+            ..mission::LaunchOptions::default()
+        };
+        let uniform_provider = live.profiles.first().map(|p| p.provider).filter(|first| {
+            live.profiles
+                .iter()
+                .all(|candidate| candidate.provider == *first)
+        });
+        if let Some(provider) = uniform_provider {
+            options.extra_args =
+                bridge::worker_mcp_diet_args(bridge::BridgeProvider::from(provider));
+        }
+        let mission = mission::Mission::launch_with_options(
             live.profiles.clone(),
             live.route(request, delegation.target, mode, limits),
             workspace.path.clone(),
+            options,
         );
+        let worker_name = member.name.clone();
+        let worker_role = member.role.clone();
+        let worker_branch = member.branch().map(|b| b.name.clone()).unwrap_or_default();
+        let worker_provider = uniform_provider
+            .map(tui::provider_short_name)
+            .unwrap_or("auto")
+            .to_owned();
         live.runs
-            .push(Run::new(&member.name, mission, delegation.review));
+            .push(Run::new(&worker_name, mission, delegation.review));
         self.crew[index].status = Status::Running;
+        self.transcript
+            .push(markdown::TranscriptEntry::DelegationCard {
+                worker: worker_name,
+                role: worker_role,
+                provider: worker_provider,
+                branch: worker_branch,
+                status: markdown::DelegationStatus::Running,
+                summary: self.crew[index].mission.clone(),
+            });
         Ok(())
     }
 
@@ -1339,6 +1640,7 @@ impl App {
             self.deck_palette = deck_palette(path);
             match Theme::load(path) {
                 Ok(theme) => {
+                    self.ui_palette = markdown::UiPalette::from_theme(&theme);
                     self.theme = theme;
                     self.notice.clear();
                 }
@@ -1348,6 +1650,9 @@ impl App {
     }
     pub fn watch_updates(&mut self, receiver: Option<Receiver<String>>) {
         self.update_receiver = receiver;
+        if self.update_receiver.is_some() && self.update_state == update::UpdateState::Idle {
+            self.update_state = update::UpdateState::Checking;
+        }
     }
 
     pub fn poll_update(&mut self) {
@@ -1356,19 +1661,25 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(latest) => {
+                self.update_state = update::UpdateState::Available {
+                    tag: format!("v{latest}"),
+                    current: update::CURRENT.to_owned(),
+                };
                 self.update_available = Some(latest);
                 self.update_receiver = None;
             }
-            Err(TryRecvError::Disconnected) => self.update_receiver = None,
+            Err(TryRecvError::Disconnected) => {
+                if self.update_available.is_none()
+                    && self.update_state == update::UpdateState::Checking
+                {
+                    self.update_state = update::UpdateState::UpToDate {
+                        current: update::CURRENT.to_owned(),
+                    };
+                }
+                self.update_receiver = None;
+            }
             Err(TryRecvError::Empty) => {}
         }
-    }
-
-    fn deck_card_at(&self, point: ratatui::layout::Position) -> Option<usize> {
-        self.deck_hits
-            .iter()
-            .find(|(_, area)| area.contains(point))
-            .map(|(index, _)| *index)
     }
 
     pub fn take_exit_message(&mut self) -> Option<String> {
@@ -1377,9 +1688,13 @@ impl App {
 
     fn push_log(&mut self, text: String) {
         let entry = Entry::now(text);
-        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
-            if let Err(error) = store.append_commander(&entry) {
-                self.notice = format!("Transcript not saved: {error}");
+        self.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at.clone()));
+        self.persist_commander_transcript();
+        if let Some(live) = &self.live {
+            if let Some(store) = &live.store {
+                if let Err(error) = store.append_commander_for_workspace(&live.workspace, &entry) {
+                    self.notice = format!("Transcript not saved: {error}");
+                }
             }
         }
         self.log.push_back(entry.text);
@@ -1410,12 +1725,45 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        let command = self.input.trim().to_owned();
-        if command.is_empty() {
+        let from_composer = self.composer.take_submission();
+        let command = match from_composer {
+            Some(text) => {
+                self.input.clear();
+                text
+            }
+            None => {
+                let raw = self.input.trim().to_owned();
+                if !raw.is_empty() {
+                    self.composer.clear();
+                }
+                raw
+            }
+        };
+        if command.trim().is_empty() {
             return;
         }
-        match specialists::parse_command(&command) {
-            Err(usage) => self.notice = usage,
+        self.submit_text(command);
+    }
+
+    pub(crate) fn submit_text(&mut self, command: String) {
+        let trimmed = command.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(shell_cmd) = trimmed.strip_prefix('!') {
+            self.input.clear();
+            self.run_shell_command(shell_cmd.to_owned());
+            return;
+        }
+        match specialists::parse_command(&trimmed) {
+            Err(usage) => {
+                self.notice = usage.clone();
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Warning,
+                        text: usage,
+                    });
+            }
             Ok(specialists::Command::Message(text)) if self.selected > 0 => {
                 self.input.clear();
                 self.delegate(self.selected, text);
@@ -1459,7 +1807,21 @@ impl App {
             }
             specialists::Command::Remove { name } => self.remove(&name),
             specialists::Command::Entry { profile } => self.set_entry(&profile),
-            specialists::Command::Diff { name } => self.show_diff(name.as_deref()),
+            specialists::Command::Diff { name } => {
+                if name.is_none() && self.selected == 0 {
+                    self.open_diff_viewer(None);
+                    self.notice = "Opened workspace unified diff.".into();
+                } else {
+                    self.show_diff(name.as_deref());
+                    let target = match name.as_deref() {
+                        Some(n) => specialists::find(&self.crew, n).is_some(),
+                        None => self.crew[self.selected].workspace.is_some(),
+                    };
+                    if target {
+                        self.open_diff_viewer(name.as_deref());
+                    }
+                }
+            }
             specialists::Command::Pr { name, commit } => self.open_pr(name.as_deref(), commit),
             specialists::Command::Settle { name, settled } => self.settle(&name, settled),
             specialists::Command::SettledDrawer => self.toggle_settled_drawer(),
@@ -1472,6 +1834,22 @@ impl App {
             specialists::Command::Goal { criteria } => self.start_goal(&criteria),
             specialists::Command::GoalCancel => self.cancel_goal(),
             specialists::Command::Mode { mode } => self.set_commander_mode(mode),
+            specialists::Command::Help => {
+                self.show_help_in_transcript();
+                self.record_log_only(0, format!("SYSTEM  {}", specialists::format_help()));
+            }
+            specialists::Command::Unknown {
+                command,
+                suggestion,
+            } => {
+                let msg = specialists::unknown_command_message(&command, suggestion.as_deref());
+                self.notice = msg.clone();
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Warning,
+                        text: msg,
+                    });
+            }
             specialists::Command::Message(text) => self.message_commander(text),
         }
     }
@@ -1510,7 +1888,11 @@ impl App {
         };
         let note = specialists::removal_note(&member.name, retained.as_deref());
         self.push_log(format!("SYSTEM  {note}"));
-        self.save_roster();
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            if let Err(error) = store.save_roster_merging(&self.crew, &[&member.name]) {
+                self.notice = format!("Roster not saved: {error}");
+            }
+        }
     }
 
     fn target(&self, name: Option<&str>, usage: &str) -> Result<usize, String> {
@@ -1664,20 +2046,25 @@ impl App {
     }
 
     fn message_commander(&mut self, command: String) {
+        self.message_commander_with_display(command.clone(), command);
+    }
+
+    fn message_commander_with_display(&mut self, command: String, display: String) {
         let limits = self.limit_policy();
         let commander_mode = self.settings.commander_permission;
-        let Some(live) = &mut self.live else {
-            self.crew[0].mission = command.clone();
-            self.push_log(format!("YOU  {command}"));
+        let prod_gate_enabled = self.settings.prod_gate;
+        if self.live.is_none() {
+            self.crew[0].mission = display.clone();
+            self.push_log(format!("YOU  {display}"));
             self.input.clear();
             self.notice = PREVIEW_NOTICE.into();
             return;
-        };
-        if live.running(COMMANDER) {
+        }
+        if self.is_running(COMMANDER) {
             self.notice = if self.is_snoozed(COMMANDER) {
                 "A mission is snoozed until its limit resets; /btw still works.".into()
             } else {
-                "Commander is still working; wait for its reply.".into()
+                "Commander is still working; follow-up queued.".into()
             };
             return;
         }
@@ -1685,20 +2072,27 @@ impl App {
             self.notice = "Resume Commander before sending a message.".into();
             return;
         }
-        if let Some((index, claim)) = live.pending.clone() {
+        if let Some((index, claim)) = self.live.as_ref().and_then(|live| live.pending.clone()) {
+            let live = self.live.as_mut().expect("checked live");
             let mission = mission::Mission::resume(
                 live.profiles.clone(),
                 index,
                 live.workspace.clone(),
-                command.clone(),
+                command,
                 claim,
             );
             live.runs.push(Run::new(COMMANDER, mission, false));
-            self.crew[0].mission = command;
+            self.record_commander_mission(&display);
+            self.crew[0].mission = display;
+            self.composer.set_running(true);
             self.input.clear();
             return;
         }
-        if live.profiles.is_empty() {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.profiles.is_empty())
+        {
             self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
             return;
         }
@@ -1713,28 +2107,66 @@ impl App {
             self.notice = format!("{refusal} {}", permissions::COMMANDER_MODE_USAGE);
             return;
         }
-        let request = match routing::parse(&targeted.text) {
-            Ok(request) => framed(request, |unit| {
-                specialists::commander_prompt(self.log.iter().map(String::as_str), &self.crew, unit)
-            }),
+        let parsed = match routing::parse(&targeted.text) {
+            Ok(request) => request,
             Err(error) => {
                 self.notice = error;
                 return;
             }
         };
+        let request = framed(parsed, |unit| self.build_commander_prompt_text(unit));
+        let mcp_config = self.ensure_loopback_bridge();
+        let active_provider = self.live.as_ref().and_then(|live| {
+            live.profiles
+                .get(live.displayed_profile())
+                .map(|p| p.provider)
+        });
+        let resume_session = if let Some(live) = &mut self.live {
+            if live.commander_provider != active_provider {
+                live.commander_session_id = None;
+                live.commander_provider = active_provider;
+            }
+            live.commander_session_id.clone()
+        } else {
+            None
+        };
+        let mut policy = permissions::PermissionPolicy::for_mode(commander_mode);
+        if !prod_gate_enabled {
+            policy.restrictions.clear();
+        }
+        let options = mission::LaunchOptions {
+            resume_session,
+            mcp_config,
+            extra_args: Vec::new(),
+            policy,
+            persistent_stdio: true,
+        };
+        self.turn_changes.clear();
+        let live = self.live.as_mut().expect("checked live");
+        let seq = (live.handoff_turns.len() + 1) as u64;
+        live.handoff_turns.push(soul::HandoffTurn {
+            seq,
+            role: soul::TurnRole::User,
+            content: display.clone(),
+            command_outcome: None,
+        });
         self.notice = format!("Routing in {}", live.workspace.display());
-        let mission = mission::Mission::launch(
+        let mission = mission::Mission::launch_with_options(
             live.profiles.clone(),
             live.route(request, targeted.target, commander_mode, limits),
             live.workspace.clone(),
+            options,
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
-        self.crew[0].mission = command.clone();
+        self.crew[0].status = Status::Running;
+        self.record_commander_mission(&display);
+        self.crew[0].mission = display.clone();
+        self.composer.set_running(true);
         self.input.clear();
-        self.push_log(format!("YOU  {command}"));
+        self.push_log(format!("YOU  {display}"));
     }
 
-    fn abandon_continuation(&mut self) {
+    pub(crate) fn abandon_continuation(&mut self) {
         let Some(live) = &mut self.live else { return };
         if live.running(COMMANDER) {
             return;
@@ -1746,6 +2178,7 @@ impl App {
             Ok(()) => {
                 live.pending = None;
                 self.input.clear();
+                self.composer.clear();
                 "Interrupted continuation abandoned.".into()
             }
             Err(error) => error.to_string(),
@@ -1753,863 +2186,36 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.panel.is_some() && !(control && matches!(key.code, KeyCode::Char('q' | 'c'))) {
-            return self.panel_key(key);
-        }
-        if control {
-            match key.code {
-                KeyCode::Char('q' | 'c') if self.mission_running() && !self.snoozed() => {
-                    self.notice = "Wait for the running mission before quitting.".into();
-                }
-                KeyCode::Char('q' | 'c') => self.quit = true,
-                KeyCode::Char('n') => self.editing = true,
-                KeyCode::Char('p') => self.toggle_pause(),
-                KeyCode::Char('l') => {
-                    self.log.clear();
-                    self.log_times.clear();
-                }
-                _ => {}
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::F(2) => self.select_profile(),
-            KeyCode::F(3) => self.open_settings(),
-            KeyCode::F(4) => self.abandon_continuation(),
-            KeyCode::F(6) => self.request_update(),
-            KeyCode::F(7) => self.toggle_settled_drawer(),
-            KeyCode::Tab => self.editing = !self.editing,
-            KeyCode::Esc => self.editing = false,
-            KeyCode::Enter if self.editing => self.submit(),
-            KeyCode::Enter => self.editing = true,
-            KeyCode::Backspace if self.editing => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if self.editing => self.input.push(c),
-            KeyCode::Up => self.step_selection(false),
-            KeyCode::Down => self.step_selection(true),
-            KeyCode::Home => self.selected = 0,
-            _ => {}
-        }
+        self.handle_key_single_canvas(key);
     }
+
     pub fn click(&mut self, x: u16, y: u16) {
-        let point = ratatui::layout::Position::new(x, y);
-        if self.panel.is_some() {
-            self.panel_click(x, y);
-        } else if self.settings_area.contains(point) {
-            self.open_settings();
-        } else if self.update_area.contains(point) {
-            self.request_update();
-        } else if let Some(index) = self.deck_card_at(point) {
-            self.open_subscription(index, false);
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.abandon_area.contains(point))
-        {
-            self.abandon_continuation();
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.profile_area.contains(point))
-        {
-            self.select_profile();
-        } else if self.new_area.contains(point) || self.input_area.contains(point) {
-            self.editing = true;
-        } else if self.pause_area.contains(point) {
-            self.toggle_pause();
-        } else if self.send_area.contains(point) {
-            self.submit();
-        } else if self.crew_area.contains(point) {
-            let row = usize::from((y - self.crew_area.y) / self.crew_row_height.max(1));
-            match self.roster_rows().get(self.crew_offset + row) {
-                Some(specialists::RosterRow::Member(index)) => self.selected = *index,
-                Some(specialists::RosterRow::Settled { .. }) => self.toggle_settled_drawer(),
-                None => {}
-            }
-            self.editing = false;
-        }
-    }
-    fn crew_counts(&self) -> [String; 4] {
-        let count = |wanted: fn(Status) -> bool| {
-            self.crew
-                .iter()
-                .filter(|member| !member.settled && wanted(member.status))
-                .count()
-        };
-        [
-            format!("{:02}  CREW", self.crew.len()),
-            format!("{:02}  RUNNING", count(|status| status == Status::Running)),
-            format!("{:02}  NEED ATTENTION", count(Status::needs_attention)),
-            if self.live.is_some() {
-                "LIVE  /  COMMANDER".into()
-            } else {
-                "PREVIEW  /  NO DISPATCH".into()
-            },
-        ]
-    }
-
-    fn selected_details(&self) -> Vec<Line<'static>> {
-        let member = &self.crew[self.selected];
-        let mut lines = if member.is_commander() {
-            let entry = self
-                .live
-                .as_ref()
-                .map_or_else(|| "preview".into(), Live::entry_label);
-            vec![
-                Line::raw("ENTRY MODEL"),
-                Line::raw(entry),
-                Line::raw(""),
-                Line::raw("PERMISSIONS"),
-                Line::raw(self.settings.commander_permission.flag()),
-                Line::raw(""),
-                Line::raw("SPECIALISTS"),
-                Line::raw(format!("{} on roster", self.crew.len() - 1)),
-            ]
-        } else {
-            let mut details = Vec::new();
-            if let Some(branch) = member.branch() {
-                let changes = member
-                    .changes
-                    .as_ref()
-                    .map_or_else(|| "diff unavailable".into(), branches::DiffStat::label);
-                details.extend([
-                    Line::raw("BRANCH"),
-                    Line::raw(format!("{} → {}", branch.name, branch.base)),
-                    Line::raw(changes),
-                    Line::raw(""),
-                ]);
-            }
-            details.extend([
-                Line::raw("ROLE"),
-                Line::raw(member.role.clone()),
-                Line::raw(""),
-                Line::raw("WORKSPACE"),
-                Line::raw(specialists::workspace_label(member)),
-            ]);
-            details
-        };
-        lines.extend(self.goal_lines(&member.name));
-        lines
-    }
-
-    fn member_lines(&self, index: usize, t: &Theme) -> Vec<Line<'static>> {
-        let member = &self.crew[index];
-        let chosen = index == self.selected;
-        let style = match (chosen, member.settled) {
-            (true, _) => Style::default().fg(color("d1dce4")).bold(),
-            (false, true) => Style::default().fg(color(&t.muted)),
-            (false, false) => Style::default(),
-        };
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    " ●",
-                    Style::default().fg(color(status_color(member.status, t))),
-                ),
-                Span::styled(format!(" {}  ", member.name), style),
-                Span::styled(
-                    format!("/{:02}", index + 1),
-                    Style::default().fg(color(if chosen { "97a3ad" } else { "5f646b" })),
-                ),
-            ]),
-            Line::styled(
-                format!("   {} · {}", member.status.caption(), member.role),
-                style,
-            ),
-        ]
-    }
-
-    fn change_badge(member: &Member) -> String {
-        member
-            .changes
-            .as_ref()
-            .filter(|changes| !changes.files.is_empty())
-            .map_or_else(String::new, |changes| format!("  ·  {}", changes.totals()))
-    }
-
-    fn feed_entries(&self) -> Vec<(&str, &str)> {
-        let thread = self.crew[self.selected].name.as_str();
-        let mut entries: Vec<(&str, &str)> = match self.collapsed_snooze(thread) {
-            Some(banner) => vec![(banner.at.as_str(), banner.text.as_str())],
-            None if self.selected == 0 => self
-                .log_times
-                .iter()
-                .zip(&self.log)
-                .map(|(at, text)| (at.as_str(), text.as_str()))
-                .collect(),
-            None => self.crew[self.selected]
-                .history
-                .iter()
-                .map(|entry| (entry.at.as_str(), entry.text.as_str()))
-                .collect(),
-        };
-        entries.extend(
-            self.side_answers
-                .iter()
-                .filter(|answer| answer.thread == thread)
-                .map(|answer| (answer.entry.at.as_str(), answer.entry.text.as_str())),
-        );
-        entries
-    }
-
-    fn collapsed_snooze(&self, thread: &str) -> Option<&Entry> {
-        self.snoozes
-            .iter()
-            .find(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
-            .map(|snooze| &snooze.banner)
-    }
-
-    fn goal_lines(&self, member: &str) -> Vec<Line<'static>> {
-        self.goal
-            .as_ref()
-            .filter(|goal| goal.member == member)
-            .map_or_else(Vec::new, |goal| {
-                vec![Line::raw(""), Line::raw("GOAL"), Line::raw(goal.status())]
-            })
+        self.handle_click_single_canvas(x, y);
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        self.selected = self.selected.min(self.crew.len() - 1);
-        let t = self.theme.clone();
-        let a = f.area();
-        let base = Style::default()
-            .fg(color(&t.foreground))
-            .bg(color(&t.background));
-        f.render_widget(Block::default().style(base), a);
-        let r = |x: u16, y: u16, w: u16, h: u16| {
-            Rect::new(
-                x.min(a.width),
-                y.min(a.height),
-                w.min(a.width.saturating_sub(x)),
-                h.min(a.height.saturating_sub(y)),
-            )
-        };
-        self.draw_menu_bar(f, a);
-        let compact = a.height < 36 || a.width < 105;
-        self.deck_hits.clear();
-        let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
-        let mode = deck_mode(a, compact);
-        let deck_rows = match mode {
-            token_burn::DeckMode::Full if !cards.is_empty() => {
-                self.draw_deck(
-                    f,
-                    &cards,
-                    mode,
-                    r(
-                        3,
-                        2,
-                        a.width.saturating_sub(6),
-                        token_burn::FULL_CARD_HEIGHT,
-                    ),
-                );
-                0
-            }
-            token_burn::DeckMode::Full => 0,
-            token_burn::DeckMode::Compact => {
-                let rows = cards.len().min(COMPACT_DECK_MAX_ROWS) as u16;
-                self.draw_deck(f, &cards, mode, r(1, 1, a.width.saturating_sub(2), rows));
-                rows
-            }
-        };
-        let top_shift = deck_rows.saturating_sub(1);
-        if !compact && cards.is_empty() {
-            let banner = if a.width >= 105 {
-                banner()
-            } else {
-                "AGENT COMMAND".into()
-            };
-            f.render_widget(
-                Paragraph::new(banner).style(Style::default().fg(color("dad8ca")).bold()),
-                r(3, 2, a.width.saturating_sub(41), 3),
-            );
-            f.render_widget(
-                Paragraph::new(if self.live.is_some() {
-                    "PRIVATEER RADIO  /  LOCAL"
-                } else {
-                    "PRIVATEER RADIO  /  LOCAL\n───┤ ◆ ├───  SIGNAL CLEAR\n1200 BAUD  ·  UI PREVIEW"
-                })
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::default().fg(color(&t.muted))),
-                r(a.width.saturating_sub(38), 2, 35, 3),
-            );
-            let mut stripe = ["89a76f", "dbc77b", "cc955d", "b86d67", "9c829f", "7d9fb6"]
-                .map(|c| Span::styled("━━", Style::default().fg(color(c))))
-                .to_vec();
-            stripe.push(Span::raw("  INDEPENDENT OPERATORS. UNCHARTED WATERS."));
-            f.render_widget(
-                Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
-                r(3, 6, a.width.saturating_sub(6), 1),
-            );
-        }
-        if !compact {
-            let ma = r(3, 8, a.width.saturating_sub(6), 3);
-            f.render_widget(
-                Block::default().style(Style::default().bg(color("191e25"))),
-                ma,
-            );
-            let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
-            let labels = self.crew_counts();
-            for (i, label) in labels.iter().enumerate() {
-                f.render_widget(
-                    Paragraph::new(label.as_str())
-                        .alignment(ratatui::layout::Alignment::Center)
-                        .style(Style::default().fg(color(if i == 3 {
-                            &t.amber
-                        } else {
-                            &t.foreground
-                        }))),
-                    Rect::new(metrics[i].x, metrics[i].y + 1, metrics[i].width, 1),
-                );
-            }
-        }
-        let usage_rows = if self.live.is_some() { 3 } else { 0 };
-        let main = if compact {
-            r(
-                1,
-                2 + top_shift,
-                a.width.saturating_sub(2),
-                a.height.saturating_sub(8 + usage_rows + top_shift),
-            )
-        } else {
-            r(
-                3,
-                12,
-                a.width.saturating_sub(6),
-                a.height.saturating_sub(18 + usage_rows),
-            )
-        };
-        let cols = Layout::horizontal([
-            Constraint::Length(if compact { 18 } else { 25 }),
-            Constraint::Min(32),
-            Constraint::Fill(1),
-        ])
-        .spacing(1)
-        .split(main);
-        for (i, title) in ["01 / CREW", "02 / CHART ROOM", "03 / SHIP'S LOG"]
-            .iter()
-            .enumerate()
-        {
-            f.render_widget(
-                Block::bordered()
-                    .style(Style::default().bg(color(&t.panel)))
-                    .border_style(Style::default().fg(color(&t.border))),
-                cols[i],
-            );
-            f.render_widget(
-                Paragraph::new(*title).style(Style::default().fg(color("cbc9bc")).bold()),
-                r(
-                    cols[i].x + 2,
-                    cols[i].y + 1,
-                    cols[i].width.saturating_sub(4),
-                    1,
-                ),
-            );
-        }
-        self.crew_area = r(
-            cols[0].x + 2,
-            cols[0].y + if compact && self.live.is_some() { 2 } else { 3 },
-            cols[0].width.saturating_sub(4),
-            if compact {
-                8.min(cols[0].height.saturating_sub(4))
-            } else {
-                16.min(cols[0].height.saturating_sub(7))
-            },
-        );
-        let stride = (if compact { 2 } else { 4 })
-            .min(self.crew_area.height)
-            .max(1);
-        let visible = usize::from((self.crew_area.height / stride).max(1));
-        self.crew_row_height = stride;
-        let rows = self.roster_rows();
-        let selected_row = rows
-            .iter()
-            .position(|row| *row == specialists::RosterRow::Member(self.selected))
-            .unwrap_or(0);
-        self.crew_offset = (selected_row + 1).saturating_sub(visible);
-        for (row_index, roster_row) in rows.iter().skip(self.crew_offset).take(visible).enumerate()
-        {
-            let y = self.crew_area.y + row_index as u16 * stride;
-            let row = r(self.crew_area.x, y, self.crew_area.width, stride);
-            let lines = match *roster_row {
-                specialists::RosterRow::Member(i) => {
-                    if i == self.selected {
-                        f.render_widget(
-                            Block::default().style(Style::default().bg(color(&t.selection))),
-                            row,
-                        );
-                    }
-                    self.member_lines(i, &t)
-                }
-                specialists::RosterRow::Settled { count, open } => settled_lines(count, open, &t),
-            };
-            f.render_widget(
-                Paragraph::new(lines),
-                r(row.x, row.y + u16::from(!compact), row.width, 2),
-            );
-        }
-        f.render_widget(
-            Paragraph::new(if compact {
-                "↑ ↓ select\nEnter: edit"
-            } else {
-                "↑ ↓ select an agent\nEnter to inspect"
-            })
-            .style(Style::default().fg(color("666f78"))),
-            r(
-                cols[0].x + 3,
-                cols[0]
-                    .bottom()
-                    .saturating_sub(4)
-                    .max(self.crew_area.bottom()),
-                cols[0].width.saturating_sub(5),
-                2,
-            ),
-        );
-        let x = cols[1].x + 2;
-        let y = cols[1].y + 3;
-        let w = cols[1].width.saturating_sub(4);
-        let selected = &self.crew[self.selected];
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}  ", selected.name), Style::default().bold()),
-                Span::styled(
-                    format!(
-                        "● {}",
-                        if selected.paused {
-                            "PAUSED"
-                        } else {
-                            self.status(self.selected)
-                        }
-                    ),
-                    Style::default()
-                        .fg(color(status_color(selected.status, &t)))
-                        .bold(),
-                ),
-            ])),
-            r(x, y, w, 1),
-        );
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    selected.mission.clone(),
-                    Style::default().fg(color("d4d9df")),
-                ),
-                Line::styled(
-                    format!(
-                        "{}  /  {:02}{}",
-                        selected.role.to_uppercase(),
-                        self.selected + 1,
-                        Self::change_badge(selected)
-                    ),
-                    Style::default().fg(color(&t.muted)),
-                ),
-            ])
-            .wrap(Wrap { trim: false }),
-            r(x, y + 2, w, 4),
-        );
-        let by = cols[1].bottom().saturating_sub(5);
-        if by > y + 7 {
-            f.render_widget(
-                Paragraph::new(self.selected_details())
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(color(&t.muted))),
-                r(x, y + 6, w, by - y - 7),
-            );
-        }
-        self.new_area = r(x, by, 15.min(w), 3);
-        self.pause_area = r(x + 16, by, 12.min(w.saturating_sub(16)), 3);
-        fn button(text: &str, primary: bool, t: &Theme) -> Paragraph<'static> {
-            Paragraph::new(format!(" {text}"))
-                .block(Block::default().padding(ratatui::widgets::Padding::new(0, 0, 1, 0)))
-                .style(if primary {
-                    Style::default()
-                        .fg(color("242b32"))
-                        .bg(color(&t.ivory))
-                        .bold()
-                } else {
-                    Style::default()
-                        .fg(color(&t.foreground))
-                        .bg(color("28323d"))
-                        .bold()
-                })
-        }
-        f.render_widget(button("+ New mission", true, &t), self.new_area);
-        f.render_widget(
-            button(
-                if self.crew[self.selected].paused {
-                    "▶ Resume"
-                } else {
-                    "Ⅱ Pause"
-                },
-                false,
-                &t,
-            ),
-            self.pause_area,
-        );
-        let feed = r(
-            cols[2].x + 2,
-            cols[2].y + 3,
-            cols[2].width.saturating_sub(5),
-            cols[2].height.saturating_sub(6),
-        );
-        let keep = (usize::from(feed.height) + 1).div_ceil(3);
-        let entries = self.feed_entries();
-        let mut lines: Vec<_> = entries
-            .iter()
-            .skip(entries.len().saturating_sub(keep))
-            .flat_map(|(stamp, entry)| {
-                let (source, message) = entry.split_once("  ").unwrap_or(("SYSTEM", entry));
-                [
-                    Line::from(vec![
-                        Span::styled(format!("{stamp}  "), Style::default().fg(color("666f78"))),
-                        Span::styled(source.to_owned(), Style::default().fg(color(&t.accent))),
-                    ]),
-                    Line::raw(message.trim().to_owned()),
-                    Line::raw(""),
-                ]
-            })
-            .collect();
-        lines.pop();
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let hidden_rows = paragraph
-            .line_count(feed.width)
-            .saturating_sub(usize::from(feed.height));
-        let scroll = u16::try_from(hidden_rows).unwrap_or(u16::MAX);
-        f.render_widget(paragraph.scroll((scroll, 0)), feed);
-        let iy = a.height.saturating_sub(5);
-        if let Some(live) = &mut self.live {
-            live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
-            let now = usage::now();
-            let label = if live.profiles.is_empty() {
-                vec![Line::raw(panel::NO_PROVIDER_HINT)]
-            } else {
-                {
-                    let latch = live.usage.map_or_else(
-                        || "State unavailable".into(),
-                        |usage| usage.latch_label(now),
-                    );
-                    let control = if live.running_profile.is_some() {
-                        "Running"
-                    } else {
-                        "F2 / click"
-                    };
-                    vec![
-                        Line::raw(format!("{control} · {latch} · {}", live.route_mode())),
-                        Line::raw(format!(
-                            "{} · {}",
-                            live.profiles[live.displayed_profile()],
-                            live.pin_label(live.displayed_profile())
-                        )),
-                    ]
-                }
-            };
-            let [five, week] = live.usage.unwrap_or_default().rows(now);
-            f.render_widget(
-                Paragraph::new(label).style(Style::default().fg(color(&t.accent))),
-                live.profile_area,
-            );
-            f.render_widget(
-                Paragraph::new(vec![Line::raw(five), Line::raw(week)])
-                    .style(Style::default().fg(color(&t.muted))),
-                r(7, iy.saturating_sub(2), a.width.saturating_sub(14), 2),
-            );
-        }
-        f.render_widget(
-            Paragraph::new("❯").style(Style::default().fg(color("b8ccd9"))),
-            r(4, iy + 1, 1, 1),
-        );
-        self.input_area = r(7, iy, a.width.saturating_sub(23), 3);
-        self.send_area = r(a.width.saturating_sub(15), iy, 12, 3);
-        f.render_widget(
-            Paragraph::new(format!(
-                " {}",
-                if self.input.is_empty() {
-                    if self
-                        .live
-                        .as_ref()
-                        .is_some_and(|live| live.pending.is_some())
-                    {
-                        "Re-enter the original task to resume…".into()
-                    } else if self.selected == 0 {
-                        "Message Commander or /spawn NAME ROLE [TASK]…".into()
-                    } else {
-                        format!("Give {} a task…", self.crew[self.selected].name)
-                    }
-                } else {
-                    self.input.clone()
-                }
-            ))
-            .block(
-                Block::bordered().border_style(Style::default().fg(color(if self.editing {
-                    "b8ccd9"
-                } else {
-                    "455566"
-                }))),
-            )
-            .style(
-                Style::default()
-                    .fg(color(if self.input.is_empty() {
-                        "666f78"
-                    } else {
-                        "c0c6cd"
-                    }))
-                    .bg(color("191f27")),
-            ),
-            self.input_area,
-        );
-        f.render_widget(button("Send ↗", true, &t), self.send_area);
-        let pending = self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.pending.is_some() && !live.running(COMMANDER));
-        f.render_widget(
-            Paragraph::new(if pending && self.notice.is_empty() {
-                "Interrupted continuation pending · re-enter task, then Send"
-            } else if self.notice.is_empty() && self.no_provider_connected() {
-                panel::NO_PROVIDER_HINT
-            } else if self.notice.is_empty() {
-                if self.live.is_some() {
-                    "   Ready"
-                } else {
-                    "   ● SIGNAL CLEAR    Local demo · commands stay in this preview"
-                }
-            } else {
-                &self.notice
-            })
-            .style(Style::default().fg(color("a1adb8"))),
-            r(0, a.height.saturating_sub(2), a.width, 1),
-        );
-        self.draw_shortcut_bar(f, r(0, a.height.saturating_sub(1), a.width, 1), pending);
-        self.draw_panel(f, a);
+        self.selected = self.selected.min(self.crew.len().saturating_sub(1));
+        self.sync_ledger();
+        tui::render::draw_single_canvas(self, f);
     }
-}
-
-fn status_color(status: Status, t: &Theme) -> &str {
-    match status {
-        Status::Running => &t.amber,
-        Status::Error => "b86d67",
-        Status::NeedsApproval => "cc955d",
-        Status::Snoozed => &t.muted,
-        Status::Idle | Status::Done => &t.accent,
-    }
-}
-
-fn settled_lines(count: usize, open: bool, t: &Theme) -> Vec<Line<'static>> {
-    let marker = if open { "▾" } else { "▸" };
-    let action = if open { "F7 hide" } else { "F7 show" };
-    vec![
-        Line::styled(
-            format!(" {marker} SETTLED ({count})"),
-            Style::default().fg(color(&t.muted)).bold(),
-        ),
-        Line::styled(format!("   {action}"), Style::default().fg(color("666f78"))),
-    ]
-}
-
-const MENU_BRAND: &str = "  ▣  AGENT COMMAND";
-const MENU_ITEMS: &str = "File   Crew   Missions   Radio    |    PRIVATEER";
-const MENU_SHIP_NUMBER: &str = " / 01";
-const MENU_SETTINGS: &str = " Settings ";
-
-impl App {
-    fn draw_menu_bar(&mut self, f: &mut Frame, area: Rect) {
-        let bar = Rect::new(area.x, area.y, area.width, 1).intersection(area);
-        let settings_width = MENU_SETTINGS.chars().count() as u16;
-        let wide = format!("{MENU_BRAND}     {MENU_ITEMS}{MENU_SHIP_NUMBER}");
-        let labels = if wide.chars().count() + usize::from(settings_width) < usize::from(bar.width)
-        {
-            wide
-        } else {
-            format!("{MENU_BRAND}   {MENU_ITEMS}")
-        };
-        f.render_widget(
-            Paragraph::new(labels).style(
-                Style::default()
-                    .fg(color("272c32"))
-                    .bg(color(&self.theme.ivory))
-                    .bold(),
-            ),
-            bar,
-        );
-        self.settings_area = Rect::new(
-            bar.right().saturating_sub(settings_width),
-            bar.y,
-            settings_width,
-            1,
-        )
-        .intersection(bar);
-        f.render_widget(
-            Paragraph::new(MENU_SETTINGS).style(
-                Style::default()
-                    .fg(color(&self.theme.ivory))
-                    .bg(color("272c32"))
-                    .bold(),
-            ),
-            self.settings_area,
-        );
-    }
-
-    fn draw_shortcut_bar(&mut self, f: &mut Frame, bar: Rect, pending: bool) {
-        let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
-        f.render_widget(Block::default().style(style), bar);
-        let abandon_width = if pending && self.live.is_some() {
-            text_width(ABANDON_LABEL)
-        } else {
-            0
-        };
-        let abandon_area = right_of(bar, bar.right(), abandon_width);
-        let update_label = self
-            .update_available
-            .as_deref()
-            .map(|latest| update_label(latest, bar.width));
-        let update_width = update_label.as_deref().map_or(0, text_width);
-        self.update_area = right_of(bar, abandon_area.x, update_width);
-        let shortcuts_width = self.update_area.x.saturating_sub(bar.x);
-        f.render_widget(
-            Paragraph::new(clipped(SHORTCUTS, usize::from(shortcuts_width))).style(style),
-            Rect::new(bar.x, bar.y, shortcuts_width, bar.height),
-        );
-        if let Some(label) = update_label {
-            f.render_widget(
-                Paragraph::new(label).style(
-                    Style::default()
-                        .fg(color("1b2027"))
-                        .bg(color(&self.theme.amber))
-                        .bold(),
-                ),
-                self.update_area,
-            );
-        }
-        if let Some(live) = &mut self.live {
-            live.abandon_area = abandon_area;
-            if abandon_width > 0 {
-                f.render_widget(Paragraph::new(ABANDON_LABEL).style(style), abandon_area);
-            }
-        }
-    }
-
-    fn draw_deck(
-        &mut self,
-        f: &mut Frame,
-        cards: &[token_burn::AccountCard],
-        mode: token_burn::DeckMode,
-        area: Rect,
-    ) {
-        if mode == token_burn::DeckMode::Compact {
-            token_burn::render_deck_as(mode, cards, area, f.buffer_mut(), &self.deck_palette);
-            self.deck_hits = (0..cards.len().min(usize::from(area.height)))
-                .map(|index| {
-                    let row = Rect::new(area.x, area.y + index as u16, area.width, 1);
-                    (index, row)
-                })
-                .collect();
-            return;
-        }
-        let shown = &cards[..cards.len().min(FULL_DECK_MAX_CARDS)];
-        let columns = Layout::horizontal(vec![Constraint::Fill(1); shown.len()])
-            .spacing(1)
-            .split(area);
-        self.deck_hits = columns.iter().copied().enumerate().collect();
-        for (card, column) in shown.iter().zip(columns.iter()) {
-            token_burn::render_deck_as(
-                mode,
-                std::slice::from_ref(card),
-                *column,
-                f.buffer_mut(),
-                &self.deck_palette,
-            );
-        }
-    }
-}
-
-fn text_width(text: &str) -> u16 {
-    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
-}
-
-fn right_of(bar: Rect, right: u16, width: u16) -> Rect {
-    let width = width.min(right.saturating_sub(bar.x));
-    Rect::new(right - width, bar.y, width, bar.height)
-}
-
-fn clipped(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.into();
-    }
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
-
-fn update_label(latest: &str, bar_width: u16) -> String {
-    if bar_width >= UPDATE_WIDE_MIN_WIDTH {
-        format!(" Update v{latest} ")
-    } else {
-        " Update ".into()
-    }
-}
-
-pub fn banner() -> String {
-    let glyph = |c| match c {
-        'A' => [" ▄▄ ", "█▄▄█", "█  █"],
-        'G' => [" ▄▄▄", "█ ▄▄", "█▄▄█"],
-        'E' => ["▄▄▄▄", "█▄▄ ", "█▄▄▄"],
-        'N' => ["▄  ▄", "██ █", "█ ██"],
-        'T' => ["▄▄▄▄", " ▐▌ ", " ▐▌ "],
-        'C' => [" ▄▄▄", "█   ", "█▄▄▄"],
-        'O' => [" ▄▄ ", "█  █", "▀▄▄▀"],
-        'M' => ["▄   ▄", "█▀▄▀█", "█   █"],
-        'D' => ["▄▄▄ ", "█  █", "█▄▄▀"],
-        _ => ["  ", "  ", "  "],
-    };
-    (0..3)
-        .map(|row| {
-            "AGENT COMMAND"
-                .chars()
-                .map(|c| glyph(c)[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 pub fn snapshot(path: &Path) -> io::Result<()> {
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 46)).unwrap();
-    terminal.draw(|f| App::default().draw(f)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let mut svg=String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1500 920\"><rect width=\"100%\" height=\"100%\" fill=\"#111419\"/>");
-    let css_color = |c: Color| match c {
-        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-        _ => "#c0c6cd".into(),
-    };
-    for y in 0..46 {
-        for x in 0..150 {
-            let cell = &buffer[(x, y)];
-            svg.push_str(&format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"10.1\" height=\"20.1\" fill=\"{}\"/>",
-                x * 10,
-                y * 20,
-                css_color(cell.bg)
-            ));
-        }
-    }
-    for y in 0..46 {
-        for x in 0..150 {
-            let cell = &buffer[(x, y)];
-            let symbol = cell
-                .symbol()
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            let weight = if cell.modifier.contains(ratatui::style::Modifier::BOLD) {
-                "bold"
-            } else {
-                "normal"
-            };
-            svg.push_str(&format!("<text x=\"{}\" y=\"{}\" font-family=\"monospace\" font-weight=\"{weight}\" font-size=\"16\" textLength=\"10\" lengthAdjust=\"spacingAndGlyphs\" fill=\"{}\">{symbol}</text>",x*10,y*20+16,css_color(cell.fg)));
-        }
-    }
-    svg.push_str("</svg>");
+    let cols = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&n| n >= 40)
+        .unwrap_or(120);
+    let rows = env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&n| n >= 16)
+        .unwrap_or(40);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows)).unwrap();
+    let mut app = App::default();
+    terminal.draw(|f| app.draw(f)).unwrap();
+    let svg = tui::render_compact_svg(terminal.backend().buffer(), "#101011");
     fs::write(path, svg)
 }
 
@@ -2643,6 +2249,7 @@ pub fn source_stamp(root: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[cfg(unix)]
     fn test_live(
@@ -2665,7 +2272,7 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         fs::write(workspace.join("workspace-marker"), "").unwrap();
         let helper = workspace.join("provider");
-        fs::write(&helper, r#"#!/bin/sh
+        fs::write(&helper, format!("#!/bin/sh\n{}\n{}", usage::tests::READ_PROMPT, r#"
 case "${1}" in
     auth)
         test -d "$CLAUDE_CONFIG_DIR" && test -z "$CODEX_HOME" || exit 8
@@ -2681,7 +2288,7 @@ case "${1}" in
         fi
         ;;
 esac
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 case "$prompt" in "You are Commander"*"Operator: Mission input") ;; *) exit 9 ;; esac
 test -f workspace-marker || exit 9
 long=
@@ -2690,7 +2297,7 @@ while test "$remaining" -gt 0; do
     long="${long}wide "
     remaining=$((remaining - 1))
 done
-if test "$1" = --print; then
+if test "$1" = -p || test "$1" = --print; then
     printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$long"
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude output"},{"type":"tool_use","input":"internal event"}]}}'
 else
@@ -2699,7 +2306,7 @@ else
     printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Codex output"}}'
 fi
 while test ! -f release-mission; do sleep 0.01; done
-"#).unwrap();
+"#)).unwrap();
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
         let root = workspace.join("profiles");
         let claude = auth::Profile::fixture(&root, auth::Provider::Claude, helper.clone());
@@ -2728,52 +2335,71 @@ while test ! -f release-mission; do sleep 0.01; done
             } else {
                 app.click(profile.x, profile.y);
             }
-            app.input = "Mission input".into();
-            if key {
-                app.editing = true;
-                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            } else {
-                app.click(app.send_area.x, app.send_area.y);
+            if !key {
+                app.click(app.input_area.x + 1, app.input_area.y + 1);
             }
+            type_and_enter(&mut app, "Mission input");
             wait_for(&mut app, |app| {
                 app.log
                     .back()
                     .is_some_and(|line| line.contains(&format!("{provider} output")))
+                    && transcript_has(app, &format!("{provider} output"))
             });
             assert_eq!(app.status(0), "RUNNING");
-            terminal.draw(|f| app.draw(f)).unwrap();
-            let screen = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
+            let text = words(&region(
+                &screen(&mut app, width, height),
+                app.transcript_area,
+            ));
             assert!(
-                screen.contains(&format!("{provider} output")),
-                "{width}×{height}: {provider} tail hidden during streaming"
+                text.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden during streaming: {text}"
             );
-            assert!(screen.contains("RUNNING"));
-            assert!(!screen.contains("internal event"));
+            let live_spinner =
+                |text: &str| text.contains("Working…") || text.contains("Streaming response…");
+            assert!(live_spinner(&text), "{text}");
+            assert!(!text.contains("internal event"));
             fs::write(workspace.join("release-mission"), "").unwrap();
             wait_for(&mut app, |app| !app.mission_running());
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
-            terminal.draw(|f| app.draw(f)).unwrap();
-            let screen = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(screen.contains("DONE"));
+            let text = words(&region(
+                &screen(&mut app, width, height),
+                app.transcript_area,
+            ));
+            assert!(!live_spinner(&text), "{text}");
             assert!(
-                screen.contains(&format!("{provider} output")),
-                "{width}×{height}: {provider} tail hidden after completion"
+                text.contains(&format!("{provider} output")),
+                "{width}×{height}: {provider} tail hidden after completion: {text}"
             );
             fs::remove_file(workspace.join("release-mission")).unwrap();
         }
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn transcript_has(app: &App, needle: &str) -> bool {
+        app.active_transcript().entries.iter().any(|entry| {
+            matches!(
+                entry,
+                markdown::TranscriptEntry::AssistantMarkdown { markdown, .. }
+                    if markdown.contains(needle)
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    fn submit_with(app: &mut App, keyboard: bool, text: &str) {
+        if !keyboard {
+            app.click(app.input_area.x + 1, app.input_area.y + 1);
+            assert!(app.editing);
+        }
+        type_and_enter(app, text);
+    }
+
+    #[cfg(unix)]
+    fn type_and_enter(app: &mut App, text: &str) {
+        app.editing = true;
+        app.composer.set_text(text);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     #[cfg(unix)]
@@ -2782,7 +2408,12 @@ while test ! -f release-mission; do sleep 0.01; done
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready(app) {
-            assert!(Instant::now() < deadline, "{}", app.notice);
+            assert!(
+                Instant::now() < deadline,
+                "{} [{}]",
+                app.notice,
+                app.status(0)
+            );
             app.poll_mission();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2791,37 +2422,36 @@ while test ! -f release-mission; do sleep 0.01; done
     #[cfg(unix)]
     #[test]
     fn continuation_receipt_is_visible_after_keyboard_and_mouse_submission() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
         for (width, height, keyboard) in [(80, 24, true), (120, 40, false)] {
             let (_fixture, workspace, profiles) =
                 mission::tests::limit_fixture(&format!("continuation-panel-{width}"), usage::now());
             let mut app = App {
                 live: Some(test_live(workspace.clone(), profiles, Some(0))),
-                input: "Keep the finished step".into(),
                 editing: keyboard,
                 ..App::default()
             };
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| app.draw(frame)).unwrap();
-            if keyboard {
-                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            } else {
-                app.click(app.send_area.x, app.send_area.y);
-                app.click(app.send_area.x, app.send_area.y);
+            if !keyboard {
+                app.click(app.input_area.x + 1, app.input_area.y + 1);
+                assert!(app.editing);
             }
+            type_and_enter(&mut app, "Keep the finished step");
             wait_for(&mut app, |app| !app.mission_running());
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
             terminal.draw(|frame| app.draw(frame)).unwrap();
             let buffer = terminal.backend().buffer();
             let notice: String = (0..width)
-                .map(|x| buffer[(x, height - 2)].symbol())
+                .map(|x| buffer[(x, height - 1)].symbol())
                 .collect();
             assert!(
-                notice.contains("Done · Limit: claude/first → claude/standby"),
-                "{notice}"
+                app.notice
+                    .contains("Done · Limit: claude/first → claude/standby"),
+                "{}",
+                app.notice
             );
+            assert!(notice.contains("Done · Limit: claude/first →"), "{notice}");
             assert_eq!(
                 fs::read_to_string(workspace.join("completed")).unwrap(),
                 "done\ncontinued\n"
@@ -2871,38 +2501,32 @@ while test ! -f release-mission; do sleep 0.01; done
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| app.draw(f)).unwrap();
-            let area = app.live.as_ref().unwrap().profile_area;
-            let panel = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
-                let buffer = terminal.backend().buffer();
-                (area.y..area.y + 4)
-                    .map(|y| {
-                        (area.x..area.right())
-                            .map(|x| buffer[(x, y)].symbol())
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
+            let top = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+                region(terminal.backend().buffer(), Rect::new(0, 0, width, 1))
             };
-            let initial = panel(&terminal);
-            assert!(initial[0].contains("No latch") && initial[1].contains("claude/ready"));
-            assert!(initial[2].contains("5h unavailable"));
-            assert!(initial[0].contains("Auto"));
+            let initial = top(&terminal);
+            assert!(initial.contains("Commander [Claude · ready]"), "{initial}");
+            assert!(!initial.contains("5h "), "{initial}");
+            assert!(!app.live.as_ref().unwrap().allowances[0].latched);
             let mut press = |app: &mut App| {
+                let area = app.live.as_ref().unwrap().profile_area;
                 if key {
                     app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
                 } else {
-                    app.click(area.x, area.y);
+                    app.click(area.x + area.width / 2, area.y);
                 }
                 terminal.draw(|f| app.draw(f)).unwrap();
-                panel(&terminal)
+                top(&terminal)
             };
             let first = press(&mut app);
-            assert!(first[0].contains("Override") && first[1].contains("claude/ready"));
+            assert_eq!(app.notice, "Override saved: claude/ready");
+            assert!(first.contains("Commander [Claude · ready]"), "{first}");
             let changed = press(&mut app);
-            assert!(
-                changed[0].contains("Latched") && changed[1].contains(&format!("claude/{long}"))
-            );
-            assert!(changed[2].contains("5h 25% used / 75% left, reset"));
-            assert!(changed[3].contains("Week 60% used / 40% left, reset"));
+            assert_eq!(app.notice, format!("Override saved: claude/{long}"));
+            assert!(changed.contains("Commander [Claude · aaaa"), "{changed}");
+            let allowance = &app.live.as_ref().unwrap().allowances[1];
+            assert!(allowance.latched);
+            assert_eq!((allowance.five, allowance.week), (Some(75.0), Some(40.0)));
         }
     }
 
@@ -2921,7 +2545,7 @@ if test "$1" = auth; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
     exit
 fi
-cat > /dev/null
+read_prompt "$@" > /dev/null
 while test ! -f release; do sleep 0.01; done
 "#,
             );
@@ -2958,39 +2582,40 @@ while test ! -f release; do sleep 0.01; done
                 }
                 terminal.draw(|f| app.draw(f)).unwrap();
             }
-            assert!(row(&terminal, height - 2).contains("Override saved: claude/zulu"));
+            assert!(row(&terminal, height - 1).contains("Override saved: claude/zulu"));
 
             let mut reopened = test_live(fixture.root.clone(), profiles.clone(), None);
             assert_eq!(reopened.load_override(), None);
             assert_eq!(reopened.preferred, Some(1));
             let mut app = App {
                 live: Some(reopened),
-                input: "Do work".into(),
                 editing: keyboard,
                 ..App::default()
             };
             app.poll_mission();
             terminal.draw(|f| app.draw(f)).unwrap();
             let area = app.live.as_ref().unwrap().profile_area;
-            assert!(
-                row(&terminal, area.y).contains("Latched")
-                    && row(&terminal, area.y).contains("Override")
-            );
-            assert!(row(&terminal, area.y + 1).contains("claude/zulu"));
-            if keyboard {
-                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            } else {
-                let send = app.send_area;
-                click_center(&mut app, send);
-            }
-            wait_for(&mut app, |app| app.status(0) == "RUNNING");
+            assert!(app.live.as_ref().unwrap().allowances[1].latched);
+            let top = row(&terminal, area.y);
+            assert!(top.contains("Commander ["), "{top}");
+            assert_eq!(app.top_bar_commander_badge(), "Commander [Claude · zulu]");
+            submit_with(&mut app, keyboard, "Do work");
+            wait_for(&mut app, |app| {
+                app.status(0) == "RUNNING" && !app.notice.starts_with("Routing in")
+            });
             terminal.draw(|f| app.draw(f)).unwrap();
-            let notice = row(&terminal, height - 2);
             assert!(
-                notice.contains("Override claude/zulu skipped: latched · rotated → claude/alpha"),
-                "{notice}"
+                app.notice
+                    .contains("Override claude/zulu skipped: latched · rotated → claude/alpha"),
+                "{}",
+                app.notice
             );
-            assert!(row(&terminal, area.y + 1).contains("claude/alpha"));
+            let notice = row(&terminal, height - 1);
+            assert!(notice.contains("Override claude/zulu skipped"), "{notice}");
+            assert_eq!(
+                app.top_bar_commander_badge(),
+                "Commander [Claude · alpha · running]"
+            );
             fs::write(fixture.root.join("release"), "").unwrap();
             wait_for(&mut app, |app| !app.mission_running());
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
@@ -3000,14 +2625,8 @@ while test ! -f release; do sleep 0.01; done
                 b"{",
             )
             .unwrap();
-            app.input = "Do work".into();
             app.editing = keyboard;
-            if keyboard {
-                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            } else {
-                let send = app.send_area;
-                click_center(&mut app, send);
-            }
+            submit_with(&mut app, keyboard, "Do work");
             wait_for(&mut app, |app| !app.mission_running());
             terminal.draw(|f| app.draw(f)).unwrap();
             assert_eq!(app.status(0), "ERROR");
@@ -3015,8 +2634,7 @@ while test ! -f release; do sleep 0.01; done
                 app.notice,
                 "Commander: No eligible signed-in subscription profile. Skipped: claude/alpha usage state unreadable; claude/zulu latched."
             );
-            assert!(row(&terminal, height - 2)
-                .contains("Commander: No eligible signed-in subscription"));
+            assert!(row(&terminal, height - 1).contains("Commander: No eligible"));
         }
     }
 
@@ -3036,7 +2654,7 @@ if test "$1" = auth; then
     exit
 fi
 printf '%s\n' "$*" >> arguments
-cat > /dev/null
+read_prompt "$@" > /dev/null
 while test ! -f release; do sleep 0.01; done
 "#,
             );
@@ -3089,42 +2707,51 @@ while test ! -f release; do sleep 0.01; done
                     .collect::<String>()
             };
             terminal.draw(|f| app.draw(f)).unwrap();
-            let area = app.live.as_ref().unwrap().profile_area;
             let mut press = |app: &mut App| {
+                let area = app.live.as_ref().unwrap().profile_area;
                 if keyboard {
                     app.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
                 } else {
                     click_center(app, area);
                 }
                 terminal.draw(|f| app.draw(f)).unwrap();
-                row(&terminal, area.y + 1)
+                assert!(row(&terminal, area.y).contains("Commander ["));
+                app.top_bar_commander_badge()
             };
-            assert!(press(&mut app).contains("claude/alpha · pin claude-opus-5-5 high"));
-            assert!(press(&mut app).contains("claude/beta · no model pin"));
+            let alpha = "Commander [Claude · alpha · claude-opus-5-5 high]";
+            assert_eq!(press(&mut app), alpha);
+            assert_eq!(press(&mut app), "Commander [Claude · beta]");
             press(&mut app);
-            assert!(press(&mut app).contains("claude/alpha · pin claude-opus-5-5 high"));
-            app.input = "/hard Do work".into();
-            app.editing = keyboard;
-            if keyboard {
-                app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            } else {
-                let send = app.send_area;
-                click_center(&mut app, send);
-            }
-            wait_for(&mut app, |app| app.status(0) == "RUNNING");
+            assert_eq!(press(&mut app), alpha);
+            submit_with(&mut app, keyboard, "/hard Do work");
+            wait_for(&mut app, |app| {
+                app.status(0) == "RUNNING" && !app.notice.starts_with("Routing in")
+            });
             assert!(app.notice.starts_with(
                 "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
-            ));
+            ), "{}", app.notice);
             terminal.draw(|f| app.draw(f)).unwrap();
-            let notice = row(&terminal, height - 2);
-            assert!(notice.contains("AA intelligence index 63.0"), "{notice}");
-            assert!(row(&terminal, area.y + 1).contains("claude/alpha · pin claude-opus-5-5 high"));
+            let notice = row(&terminal, height - 1);
+            assert!(notice.contains("Override → claude/alpha"), "{notice}");
+            assert!(app
+                .log
+                .iter()
+                .any(|line| line.contains("AA intelligence index 63.0")));
+            assert_eq!(
+                app.top_bar_commander_badge(),
+                "Commander [Claude · alpha · claude-opus-5-5 high · running]"
+            );
             fs::write(fixture.root.join("release"), "").unwrap();
             wait_for(&mut app, |app| !app.mission_running());
             assert_eq!(app.status(0), "DONE", "{}", app.notice);
-            assert_eq!(
-                fs::read_to_string(fixture.root.join("arguments")).unwrap(),
-                "--model claude-opus-5-5 --effort high --print --verbose --output-format stream-json --setting-sources user --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit --\n"
+            let arguments = fs::read_to_string(fixture.root.join("arguments")).unwrap();
+            assert!(
+                arguments.starts_with(
+                    "--model claude-opus-5-5 --effort high -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --setting-sources user --mcp-config "
+                ) && arguments.ends_with(
+                    ".json --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit\n"
+                ) && arguments.lines().count() == 1,
+                "{arguments}"
             );
             fs::write(state.join(native::PINS_FILE), b"{\"schema\":\"agent-command-native-pins-v1\",\"pins\":[{\"profile\":\"claude/alpha\",\"model\":\"opus\",\"effort\":null}]}").unwrap();
             let mut reopened = test_live(
@@ -3136,7 +2763,7 @@ while test ! -f release; do sleep 0.01; done
                 .load_pins()
                 .unwrap()
                 .starts_with("Cannot read model pins"));
-            assert_eq!(reopened.pin_label(0), "no model pin");
+            assert_eq!(reopened.pin_label(0), None);
         }
     }
 
@@ -3146,11 +2773,11 @@ if test "$1" = auth; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
     exit
 fi
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 case "$prompt" in
   "You are Commander"*"Operator: Review the patch please")
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Spawning a reviewer.\nSPAWN_SPECIALIST: nova | reviewer | Check the README"}]}}' ;;
-  "You are Commander"*"nova (reviewer, DONE)"*"Spawning a reviewer."*"Operator: Hi")
+  "You are Commander"*"nova (reviewer, DONE)"*"Operator: Hi")
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello again"}]}}' ;;
   "You are nova"*"Task: Check the README")
     test -f README || exit 3
@@ -3172,7 +2799,7 @@ case "$1" in
         ;;
 esac
 printf '%s\n' "$*" >> '{}'
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 case "$prompt" in
   "You are bolt"*"Task: Build it")
     printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Built it"}}]}}}}' ;;
@@ -3268,6 +2895,23 @@ esac
         terminal.backend().buffer().clone()
     }
 
+    #[cfg(unix)]
+    fn words(text: &str) -> String {
+        text.split_whitespace()
+            .filter(|word| !matches!(*word, "│" | "┃"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[cfg(unix)]
+    fn rail_rect(app: &App, target: tui::render::RailHit) -> Rect {
+        app.rail_hits
+            .iter()
+            .find(|(_, hit)| *hit == target)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("no rail hit for {target:?}"))
+    }
+
     fn region(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
         (area.y..area.bottom())
             .map(|y| {
@@ -3277,6 +2921,20 @@ esac
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[cfg(unix)]
+    fn side_answers(app: &App) -> Vec<String> {
+        app.transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                markdown::TranscriptEntry::AssistantMarkdown {
+                    speaker, markdown, ..
+                } if speaker == "Side Q&A (/btw)" => Some(markdown.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -3291,7 +2949,7 @@ if test "$1" = auth; then
     printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
     exit
 fi
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$1"; }
 case "$*" in *"--permission-mode plan"*)
     case "$prompt" in
@@ -3328,20 +2986,14 @@ esac
         wait_for(&mut app, |app| app.crew[0].status == Status::Running);
         send(&mut app, "/btw Where are we?");
         assert!(app.input.is_empty());
-        wait_for(&mut app, |app| app.side_answers.len() >= 2);
+        wait_for(&mut app, |app| !side_answers(app).is_empty());
         assert!(app.mission_running());
         assert_eq!(app.crew[0].status, Status::Running);
-        let feed: Vec<String> = app
-            .feed_entries()
-            .into_iter()
-            .map(|(_, text)| text.to_owned())
-            .collect();
-        assert!(
-            feed.contains(&"BTW  Q: Where are we?".to_owned()),
-            "{feed:?}"
-        );
-        assert!(feed.contains(&"BTW  Side answer: still on step 2".to_owned()));
-        assert!(!app.log.iter().any(|line| line.starts_with("BTW")));
+        let feed = side_answers(&app);
+        assert_eq!(feed.len(), 1, "{feed:?}");
+        assert!(feed[0].contains("**Q:** Where are we?"), "{feed:?}");
+        assert!(feed[0].contains("Side answer: still on step 2"), "{feed:?}");
+        assert!(!app.log.iter().any(|line| line.contains("Where are we?")));
         fs::write(workspace.join("release"), "").unwrap();
         wait_for(&mut app, |app| app.crew[0].status == Status::Done);
         assert!(app.log.contains(&"Commander  Main finished".to_owned()));
@@ -3369,8 +3021,6 @@ esac
         send(&mut app, "Long task MAIN-HISTORY-MARKER");
         wait_for(&mut app, |app| app.crew[0].status == Status::Running);
         let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
-        app.key(quit);
-        assert!(!app.quit);
         app.handle_event(
             COMMANDER,
             mission::Event::Snoozed {
@@ -3382,18 +3032,31 @@ esac
         assert!(app
             .notice
             .starts_with("Snoozed: claude/alpha limit resets at"));
-        let expanded = app.feed_entries().len();
-        assert!(expanded > 1);
+        assert_eq!(app.collapsed_snooze(COMMANDER), None);
+        let buffer = screen(&mut app, 120, 40);
+        let expanded = region(&buffer, app.transcript_area);
+        assert!(
+            expanded.contains("MAIN-HISTORY-MARKER") && !expanded.contains("SNOOZED"),
+            "{expanded}"
+        );
         app.settings.snooze_limited_missions = true;
-        let collapsed = app.feed_entries();
-        assert_eq!(collapsed.len(), 1);
-        assert!(collapsed[0].1.starts_with("SNOOZED  Snoozed: claude/alpha"));
+        assert!(app
+            .collapsed_snooze(COMMANDER)
+            .is_some_and(|banner| banner.starts_with("SNOOZED  Snoozed: claude/alpha")));
+        let buffer = screen(&mut app, 120, 40);
+        let collapsed = region(&buffer, app.transcript_area);
+        assert!(
+            collapsed.contains("SNOOZED") && !collapsed.contains("MAIN-HISTORY-MARKER"),
+            "{collapsed}"
+        );
         send(&mut app, "Another task");
         assert!(app.notice.contains("snoozed until its limit resets"));
         app.handle_event(COMMANDER, mission::Event::Continuing { from: 0, to: 0 });
         assert_eq!(app.status(0), "RUNNING");
         assert_eq!(app.notice, "Reset passed: resumed on claude/alpha");
-        assert!(app.feed_entries().len() > 1);
+        assert_eq!(app.collapsed_snooze(COMMANDER), None);
+        let buffer = screen(&mut app, 120, 40);
+        assert!(region(&buffer, app.transcript_area).contains("MAIN-HISTORY-MARKER"));
         app.handle_event(
             COMMANDER,
             mission::Event::Snoozed {
@@ -3402,7 +3065,7 @@ esac
             },
         );
         app.key(quit);
-        assert!(app.quit);
+        assert!(app.quit && !app.mission_running());
     }
 
     #[cfg(unix)]
@@ -3421,10 +3084,9 @@ esac
             app.goal.as_ref().map(goal::Goal::status).as_deref(),
             Some("turn 1/10 · ship the release")
         );
-        assert!(app
-            .goal_lines(COMMANDER)
-            .iter()
-            .any(|line| line.to_string() == "turn 1/10 · ship the release"));
+        assert!(app.log.contains(
+            &"SYSTEM  Goal pinned on Commander: turn 1/10 · ship the release".to_owned()
+        ));
         wait_for(&mut app, |app| app.goal.is_none() && !app.mission_running());
         assert!(
             app.log.contains(
@@ -3535,37 +3197,40 @@ esac
         );
         assert!(!app.log.iter().any(|line| line == "nova  Working"));
 
-        for (width, height, keyboard) in INPUT_MATRIX {
+        for (width, height, keyboard) in RAIL_INPUT_MATRIX {
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
             assert!(
                 crew.contains("Commander") && crew.contains("nova"),
                 "{crew}"
             );
-            assert!(crew.contains("done · rev"), "{width}x{height}: {crew}");
+            assert!(crew.contains("DONE"), "{width}x{height}: {crew}");
             if keyboard {
+                app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
                 app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             } else {
-                app.click(app.crew_area.x, app.crew_area.y + app.crew_row_height + 1);
+                let row = rail_rect(&app, tui::render::RailHit::SelectMember(1));
+                app.click(row.x, row.y);
             }
             assert_eq!(app.selected, 1);
             let buffer = screen(&mut app, width, height);
-            let feed = Rect::new(
-                app.pause_area.right() + 2,
-                app.crew_area.y,
-                width - app.pause_area.right() - 3,
-                app.input_area.y - app.crew_area.y,
+            let feed = words(&region(&buffer, app.transcript_area));
+            assert!(feed.contains("README looks good"), "{feed}");
+            let banner = words(&region(&buffer, Rect::new(0, 0, width, height)));
+            assert!(
+                banner.contains("Focused: nova (review") && banner.contains("✓ nova DONE"),
+                "{banner}"
             );
-            assert!(region(&buffer, feed).contains("README looks good"));
-            assert!(region(&buffer, Rect::new(0, 0, width, height)).contains("nova  ● DONE"));
             if keyboard {
                 app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             } else {
-                app.click(app.crew_area.x, app.crew_area.y + 1);
+                let row = rail_rect(&app, tui::render::RailHit::SelectMember(0));
+                app.click(row.x, row.y);
             }
             assert_eq!(app.selected, 0);
             let buffer = screen(&mut app, width, height);
-            let commander_feed = region(&buffer, feed);
+            let commander_feed = words(&region(&buffer, app.transcript_area));
             assert!(
                 commander_feed.contains("DONE · README") && !commander_feed.contains("Working"),
                 "{width}x{height}: {commander_feed}"
@@ -3625,8 +3290,19 @@ esac
         assert_eq!(app.notice, "nobody/else is not a signed-in profile.");
         send(&mut app, "/entry auto");
         assert!(app.notice.ends_with("(auto)"), "{}", app.notice);
+        let entry = app.live.as_ref().unwrap().entry.clone().unwrap();
+        assert_eq!(entry.1, "auto");
+        let name = entry
+            .0
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .trim_start_matches("claude/");
+        let badge = format!("Commander [Claude · {name}]");
+        assert_eq!(app.top_bar_commander_badge(), badge);
         let buffer = screen(&mut app, 120, 40);
-        assert!(region(&buffer, Rect::new(0, 0, 120, 40)).contains("ENTRY MODEL"));
+        let top = region(&buffer, Rect::new(0, 0, 120, 1));
+        assert!(top.contains(&badge), "{top}");
 
         let signed_out = Fixture::new("entry-signed-out", "exit 1\n");
         let profiles = vec![signed_out.profile(Provider::Claude, "gamma")];
@@ -3662,6 +3338,17 @@ esac
     }
 
     #[cfg(unix)]
+    const RAIL_SIZES: [(u16, u16); 2] = [(100, 30), (120, 40)];
+
+    #[cfg(unix)]
+    const RAIL_INPUT_MATRIX: [(u16, u16, bool); 4] = [
+        (100, 30, true),
+        (100, 30, false),
+        (120, 40, true),
+        (120, 40, false),
+    ];
+
+    #[cfg(unix)]
     const INPUT_MATRIX: [(u16, u16, bool); 4] = [
         (80, 24, true),
         (80, 24, false),
@@ -3680,12 +3367,11 @@ esac
             ..App::default()
         };
         a.submit();
-        a.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(a.selected, 1);
+        a.toggle_pause();
         assert!(a.crew[1].paused);
-        a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        a.editing = true;
+        a.toggle_pause();
+        assert!(!a.crew[1].paused);
         for c in "Build λ".chars() {
             a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -3697,7 +3383,7 @@ esac
     }
     #[test]
     fn layouts() {
-        for (w, h) in [(80, 24), (120, 40), (150, 46), (210, 54)] {
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (150, 46), (210, 54)] {
             let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             let mut a = App::default();
             t.draw(|f| a.draw(f)).unwrap();
@@ -3709,7 +3395,8 @@ esac
                 .iter()
                 .map(|c| c.symbol())
                 .collect::<String>();
-            assert!(text.contains("AGENT COMMAND"));
+            assert!(text.contains("agent-command"));
+            assert!(!text.contains("PRIVATEER"));
         }
     }
     #[test]
@@ -3745,7 +3432,7 @@ esac
         assert_eq!(app.theme.accent, "123456");
         for (width, height) in SIZES {
             let buffer = screen(&mut app, width, height);
-            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+            assert!(region(&buffer, app.input_area).contains("Ask Commander"));
         }
         fs::remove_file(path).unwrap();
     }
@@ -3777,17 +3464,14 @@ esac
             app.poll_update();
             assert!(app.update_available.is_none());
             let buffer = screen(&mut app, width, height);
+            assert_eq!(app.update_area, Rect::default());
             assert!(!row(&buffer, height - 1).contains("Update"));
-            assert_eq!(app.update_area.width, 0);
-            let crew_before = app.crew_area;
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
             assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
             let buffer = screen(&mut app, width, height);
             let bar = row(&buffer, height - 1);
-            assert!(bar.ends_with(&update_label("9.9.9", width)), "{bar}");
-            assert!(!row(&buffer, 1).contains("9.9.9"));
-            assert_eq!(app.crew_area, crew_before);
+            assert!(bar.contains("Update v9.9.9"), "{bar}");
             assert_eq!(app.update_area.right(), width);
             assert!(region(&buffer, app.update_area).contains("Update"));
             app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
@@ -3811,15 +3495,437 @@ esac
     }
 
     #[test]
-    fn shortcut_text_is_clipped_before_the_right_side_buttons() {
-        assert_eq!(clipped("abcdef", 6), "abcdef");
-        assert_eq!(clipped("abcdef", 4), "abc…");
-        assert_eq!(clipped("abcdef", 0), "…");
-        assert_eq!(update_label("1.2.3", 80), " Update ");
-        assert_eq!(update_label("1.2.3", 120), " Update v1.2.3 ");
-        let bar = Rect::new(0, 23, 10, 1);
-        assert_eq!(right_of(bar, 10, 4), Rect::new(6, 23, 4, 1));
-        assert_eq!(right_of(bar, 3, 8), Rect::new(0, 23, 3, 1));
+    fn update_button_label_exists_only_for_detected_releases() {
+        let mut app = App::default();
+        for state in [
+            update::UpdateState::Idle,
+            update::UpdateState::Checking,
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+            update::UpdateState::Failed("offline".into()),
+        ] {
+            app.update_state = state.clone();
+            assert!(!app.update_button_visible(), "{state:?}");
+            for width in [60, 80, 120] {
+                assert_eq!(app.update_button_label(width), None, "{state:?}");
+            }
+        }
+        app.update_available = Some("1.2.3".into());
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(80).as_deref(),
+            Some("⬆ Update v1.2.3")
+        );
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v1.2.3 (F6)")
+        );
+        app.update_available = None;
+        app.update_state = update::UpdateState::Available {
+            tag: "v2.0.0".into(),
+            current: update::CURRENT.to_owned(),
+        };
+        assert_eq!(
+            app.update_button_label(80).as_deref(),
+            Some("⬆ Update v2.0.0")
+        );
+        app.update_state = update::UpdateState::Downloading { pct: 42 };
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬇ Updating 42%")
+        );
+    }
+
+    #[test]
+    fn manual_update_check_reports_clear_feedback_when_completed() {
+        let mut app = App {
+            manual_update_check: true,
+            update_state: update::UpdateState::Checking,
+            ..App::default()
+        };
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+        ));
+        assert!(!app.manual_update_check);
+        assert_eq!(app.notice, format!("Up to date (v{})", update::CURRENT));
+
+        app.manual_update_check = true;
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: update::CURRENT.to_owned(),
+            },
+        ));
+        assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+        assert!(app.notice.contains("Update v0.9.0 available"));
+
+        app.manual_update_check = true;
+        app.apply_background_event(tui::events::AppEvent::UpdateChecked(
+            update::UpdateState::Failed("network offline".into()),
+        ));
+        assert!(app.update_available.is_none());
+        assert!(app.notice.contains("network offline"));
+    }
+
+    #[test]
+    fn workspace_scoped_commander_history_isolates_directories() {
+        let base =
+            std::env::temp_dir().join(format!("agent-command-ws-history-{}", uuid::Uuid::new_v4()));
+        let root = base.join("profiles");
+        let dir_a = base.join("repo-a");
+        let dir_b = base.join("repo-b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let store = specialists::Store::new(root);
+        store
+            .append_commander_for_workspace(&dir_a, &Entry::now("YOU  secret-a".into()))
+            .unwrap();
+        store
+            .append_commander_for_workspace(&dir_b, &Entry::now("YOU  secret-b".into()))
+            .unwrap();
+        let a_entries = store.load_commander_for_workspace(&dir_a).unwrap();
+        let b_entries = store.load_commander_for_workspace(&dir_b).unwrap();
+        assert_eq!(a_entries.len(), 1);
+        assert_eq!(b_entries.len(), 1);
+        assert_eq!(a_entries[0].text, "YOU  secret-a");
+        assert_eq!(b_entries[0].text, "YOU  secret-b");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn structured_transcript_persists_and_reloads_with_tables_thinking_and_tool_cards() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-structured-tx-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = specialists::Store::new(root.clone());
+        let saved = vec![
+            markdown::TranscriptEntry::UserMessage {
+                text: "Build gridfall.html".into(),
+                timestamp: Some("01:25:00".into()),
+            },
+            markdown::TranscriptEntry::ThinkingBlock {
+                text: "Design canvas loop and controls".into(),
+                duration_ms: 2100,
+                collapsed: true,
+            },
+            markdown::TranscriptEntry::ToolCallCard {
+                call_id: "tool-write-1".into(),
+                kind: markdown::ToolKind::Write,
+                name: "Write".into(),
+                summary: "C:\\Users\\j\\gridfall.html".into(),
+                output: "Wrote 8420 bytes".into(),
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(120),
+                collapsed: true,
+            },
+            markdown::TranscriptEntry::AssistantMarkdown {
+                speaker: COMMANDER.into(),
+                markdown: "I built Gridfall.\n\n| Key | Action |\n| --- | --- |\n| ← → | Move |"
+                    .into(),
+                streaming: true,
+            },
+        ];
+        store
+            .save_transcript_for_workspace(&workspace, &saved)
+            .unwrap();
+
+        let live = Live::new(workspace, Vec::new(), Some(root));
+        let mut app = App::from_live(live);
+        assert_eq!(app.transcript.entries.len(), 4);
+        assert!(matches!(
+            &app.transcript.entries[1],
+            markdown::TranscriptEntry::ThinkingBlock { text, .. } if text.contains("Design canvas")
+        ));
+        assert!(matches!(
+            &app.transcript.entries[2],
+            markdown::TranscriptEntry::ToolCallCard { name, .. } if name == "Write"
+        ));
+        assert!(matches!(
+            &app.transcript.entries[3],
+            markdown::TranscriptEntry::AssistantMarkdown {
+                streaming: false,
+                ..
+            }
+        ));
+
+        let buf = screen(&mut app, 100, 30);
+        let rendered = region(&buf, app.transcript_area);
+        assert!(rendered.contains("Write · C:\\Users\\j\\gridfall.html"));
+        assert!(rendered.contains("─┼─"), "{rendered}");
+        assert!(!rendered.contains("| --- |"), "{rendered}");
+        assert_eq!(rendered.matches("Commander").count(), 1, "{rendered}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_commander_log_coalesces_multiline_reply_and_tables_into_one_block() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-legacy-coalesce-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = specialists::Store::new(root.clone());
+        for line in [
+            "YOU  Build a Tetris clone",
+            "SYSTEM  Override → claude/default provider default · unscored · speed n/a · headroom unknown",
+            "Commander  I built Gridfall.",
+            "Commander  • Pieces: I, O, T, S, Z, J, L",
+            "Commander  | Key | Action |",
+            "Commander  |---|---|",
+            "Commander  | ← → | Move |",
+            "Commander  | Space | Hard drop |",
+        ] {
+            store
+                .append_commander_for_workspace(&workspace, &Entry::now(line.into()))
+                .unwrap();
+        }
+
+        let live = Live::new(workspace, Vec::new(), Some(root));
+        let mut app = App::from_live(live);
+        assert_eq!(app.transcript.entries.len(), 3);
+        assert!(matches!(
+            &app.transcript.entries[1],
+            markdown::TranscriptEntry::SystemNotice { text, .. } if text == "Override → claude/default"
+        ));
+        assert!(matches!(
+            &app.transcript.entries[2],
+            markdown::TranscriptEntry::AssistantMarkdown { speaker, .. } if speaker == COMMANDER
+        ));
+
+        let buf = screen(&mut app, 100, 30);
+        let rendered = region(&buf, app.transcript_area);
+        assert_eq!(rendered.matches("Commander").count(), 1, "{rendered}");
+        assert!(rendered.contains("─┼─"), "{rendered}");
+        assert!(!rendered.contains("|---|"), "{rendered}");
+        assert!(!rendered.contains("unscored"), "{rendered}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn live_normalized_events_update_spinner_phase_upsert_tools_and_expand_thinking() {
+        let (mission, _sender) = mission::Mission::held();
+        let mut live = Live::new(std::env::temp_dir(), Vec::new(), None);
+        live.runs.push(Run::new(COMMANDER, mission, false));
+        let mut app = App::from_live(live);
+        app.crew[0].status = Status::Running;
+
+        let initial = app.active_live_activity(COMMANDER).unwrap();
+        assert!(initial.label.starts_with("Working…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ThinkingDelta("Planning HTML canvas".into()),
+        );
+        let thinking = app.active_live_activity(COMMANDER).unwrap();
+        assert!(thinking.label.starts_with("Thinking…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolStart {
+                call_id: "tool-1".into(),
+                kind: mission::ToolKind::Write,
+                name: "Write".into(),
+                summary: "Write".into(),
+                raw_input: serde_json::json!({}),
+            },
+        );
+        let initial_tool = app.active_live_activity(COMMANDER).unwrap();
+        assert!(initial_tool.label.ends_with(" · Write"));
+        assert!(!initial_tool.label.contains("Write Write"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolStart {
+                call_id: "tool-1".into(),
+                kind: mission::ToolKind::Write,
+                name: "Write".into(),
+                summary: "Write: C:\\Users\\j\\gridfall.html".into(),
+                raw_input: serde_json::json!({"file_path": "C:\\Users\\j\\gridfall.html"}),
+            },
+        );
+        let tool_phase = app.active_live_activity(COMMANDER).unwrap();
+        assert!(tool_phase
+            .label
+            .contains("Write C:\\Users\\j\\gridfall.html"));
+        assert!(!tool_phase.label.contains("Write: "));
+        let tool_cards: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| matches!(e, markdown::TranscriptEntry::ToolCallCard { .. }))
+            .collect();
+        assert_eq!(tool_cards.len(), 1);
+
+        let running_buf = screen(&mut app, 120, 30);
+        let whole_running = region(&running_buf, Rect::new(0, 0, 120, 30));
+        assert!(whole_running.contains("RUNNING 0s") || whole_running.contains("RUNNING "));
+        assert!(whole_running.contains("Write · C:\\Users\\j\\gridfall.html"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolEnd {
+                call_id: "tool-1".into(),
+                ok: true,
+                output_preview: "Wrote gridfall.html".into(),
+                exit_code: Some(0),
+            },
+        );
+        let after_tool = app.active_live_activity(COMMANDER).unwrap();
+        assert!(after_tool.label.starts_with("Working…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TextDelta("Built ".into()),
+        );
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TextDelta("gridfall.html!".into()),
+        );
+        let streaming = app.active_live_activity(COMMANDER).unwrap();
+        assert!(streaming.label.starts_with("Streaming response…"));
+        let assistant_entries: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| matches!(e, markdown::TranscriptEntry::AssistantMarkdown { .. }))
+            .collect();
+        assert_eq!(assistant_entries.len(), 1);
+    }
+
+    #[test]
+    fn format_routing_notice_strips_unscored_noise_and_preserves_scored_metrics() {
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Override → claude/work provider default · unscored · speed n/a · headroom unknown"
+            ),
+            "Override → claude/work"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · speed n/a · 100% left"
+            ),
+            "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · 100% left"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
+            ),
+            "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
+        );
+    }
+
+    #[test]
+    fn double_esc_arms_and_cancels_active_mission() {
+        let (mission, _sender) = mission::Mission::held();
+        let mut live = Live::new(std::env::temp_dir(), Vec::new(), None);
+        live.runs.push(Run::new(COMMANDER, mission, false));
+        let mut app = App::from_live(live);
+        app.crew[0].status = Status::Running;
+        app.composer.set_running(true);
+        assert!(app.mission_running());
+
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.esc_armed_active());
+        assert!(app.notice.contains("Esc again to cancel"), "{}", app.notice);
+
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.esc_armed_active());
+        assert!(!app.mission_running());
+        assert_eq!(app.crew[0].status, Status::Idle);
+        assert!(!app.composer.is_running());
+        assert!(
+            app.notice.contains("Cancelled active mission"),
+            "{}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn provider_stderr_collapses_when_nonfatal_and_expands_on_error() {
+        let mut app = App::default();
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::StderrLine("WARN config line 1".into()),
+        );
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::StderrLine("WARN config line 2".into()),
+        );
+        let stderr_cards: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    markdown::TranscriptEntry::ToolCallCard { name, .. } if name == "Provider stderr"
+                )
+            })
+            .collect();
+        assert_eq!(stderr_cards.len(), 1);
+        match stderr_cards[0] {
+            markdown::TranscriptEntry::ToolCallCard {
+                collapsed,
+                ok,
+                summary,
+                output,
+                ..
+            } => {
+                assert!(*collapsed);
+                assert_eq!(*ok, Some(true));
+                assert!(summary.contains("2 lines"), "{summary}");
+                assert!(output.contains("WARN config line 2"));
+            }
+            _ => panic!("expected stderr tool card"),
+        }
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: None,
+                final_text: "fatal failure".into(),
+            },
+        );
+        let expanded = app.transcript.entries.iter().find(|e| {
+            matches!(
+                e,
+                markdown::TranscriptEntry::ToolCallCard {
+                    name,
+                    collapsed: false,
+                    ok: Some(false),
+                    ..
+                } if name == "Provider stderr"
+            )
+        });
+        assert!(expanded.is_some());
+    }
+
+    #[test]
+    fn slash_diff_on_commander_opens_modal_without_specialist_error() {
+        let mut app = App {
+            input: "/diff".into(),
+            ..App::default()
+        };
+        app.submit();
+        assert!(app.diff_modal.is_open());
+        assert!(
+            !app.notice.contains("Select a specialist"),
+            "{}",
+            app.notice
+        );
     }
 
     #[cfg(unix)]
@@ -3860,8 +3966,16 @@ esac
             None,
         ));
         let palette = app.deck_palette;
+        let cards = deck_cards(app.live.as_ref().unwrap());
 
-        let compact = screen(&mut app, 80, 24);
+        let mut compact = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 24));
+        token_burn::render_deck_as(
+            token_burn::DeckMode::Compact,
+            &cards,
+            Rect::new(1, 1, 78, 3),
+            &mut compact,
+            &palette,
+        );
         let [known_row, fresh_row, held_row] = [1, 2, 3].map(|y| row(&compact, y));
         assert!(known_row.contains("claude · known"), "{known_row}");
         assert!(
@@ -3878,9 +3992,23 @@ esac
         assert_eq!(compact[(x, y)].bg, palette.unknown);
         let (x, y) = cell_at(&compact, "↻ -").unwrap();
         assert_eq!(compact[(x, y)].fg, palette.muted);
-        assert!(app.crew_area.y > 3 && app.input_area.bottom() <= 24);
 
-        let full = screen(&mut app, 120, 40);
+        let mut full = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 120, 40));
+        let columns = ratatui::layout::Layout::horizontal(vec![
+            ratatui::layout::Constraint::Fill(1);
+            cards.len()
+        ])
+        .spacing(1)
+        .split(Rect::new(3, 2, 114, token_burn::FULL_CARD_HEIGHT));
+        for (card, column) in cards.iter().zip(columns.iter()) {
+            token_burn::render_deck_as(
+                token_burn::DeckMode::Full,
+                std::slice::from_ref(card),
+                *column,
+                &mut full,
+                &palette,
+            );
+        }
         let deck = region(&full, Rect::new(0, 2, 120, token_burn::FULL_CARD_HEIGHT));
         for expected in [
             "claude · known",
@@ -3898,7 +4026,43 @@ esac
         assert_eq!(full[(x, y)].fg, palette.unknown);
         let (x, y) = cell_at(&full, "▸ latched").unwrap();
         assert_eq!(full[(x, y)].fg, palette.muted);
-        assert!(app.input_area.bottom() <= 40);
+
+        let top = row(&screen(&mut app, 120, 40), 0);
+        assert!(
+            top.contains("Commander [Claude · known] · ◕ 5h 64% 7d 12%"),
+            "{top}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn deck_cards(live: &Live) -> Vec<token_burn::AccountCard> {
+        live.profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| {
+                let label = profile.to_string();
+                let (provider, name) = label.split_once('/').unwrap_or((&label, ""));
+                let allowance = live.allowances.get(index).copied().unwrap_or_default();
+                let (route_model, route_metric) = match live.routes.get(index) {
+                    _ if allowance.latched => (None, Some("latched".to_owned())),
+                    Some(ProfileRoute::Routed { model, metric }) => {
+                        (Some(model.clone()), Some(metric.clone()))
+                    }
+                    Some(ProfileRoute::Excluded(reason)) => (None, Some(reason.clone())),
+                    None => (None, None),
+                };
+                token_burn::AccountCard {
+                    provider: provider.into(),
+                    profile: name.into(),
+                    tier: String::new(),
+                    primary_remaining: allowance.five,
+                    secondary_remaining: allowance.week,
+                    seconds_until_reset: allowance.reset_in,
+                    route_model,
+                    route_metric,
+                }
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -3917,26 +4081,34 @@ esac
         assert_eq!(app.crew.len(), 2, "{}", app.notice);
         send(&mut app, "/roster");
         app.selected = 1;
-        for (width, height) in SIZES {
+        let deck = "Commander [Claude · alpha] · ◑ 5h 50% 7d 75%";
+        let rail = |app: &mut App, code: KeyCode| {
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            app.key(KeyEvent::new(code, KeyModifiers::NONE));
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        for (width, height) in RAIL_SIZES {
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
             assert!(
                 crew.contains("Commander") && crew.contains("atlas"),
                 "{crew}"
             );
-            let whole = region(&buffer, buffer.area);
-            assert!(whole.contains("claude · alpha") && whole.contains("50%"));
+            assert!(row(&buffer, 0).contains(deck), "{}", row(&buffer, 0));
             assert!(region(&buffer, app.input_area).contains("Give atlas a task"));
-            app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            rail(&mut app, KeyCode::Home);
+            assert_eq!(app.selected, 0);
             let buffer = screen(&mut app, width, height);
             let whole = region(&buffer, buffer.area);
             assert!(whole.contains("Roster:"), "{width}x{height}\n{whole}");
-            assert!(whole.contains("claude · alpha"));
-            assert!(region(&buffer, app.input_area).contains("Message Commander"));
-            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-            app.editing = true;
+            assert!(row(&buffer, 0).contains(deck));
+            assert!(region(&buffer, app.input_area).contains("Ask Commander anything"));
+            rail(&mut app, KeyCode::Down);
+            assert_eq!(app.selected, 1);
+            assert!(app.editing);
             app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
             assert_eq!(app.input, "x");
+            app.composer.clear();
             app.input.clear();
         }
     }
@@ -3949,7 +4121,7 @@ if test "$1" = auth; then
 fi
 root="${CLAUDE_CONFIG_DIR%/profiles/claude/*}"
 say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$1"; }
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 case "$prompt" in
   "You are Commander"*"Operator: Status?")
     say "Crew is busy" ;;
@@ -4030,24 +4202,28 @@ esac
             "nova is busy; the task is queued for its workspace."
         );
 
-        for (width, height) in SIZES {
+        for (width, height) in RAIL_SIZES {
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
             let order = row_order(&crew, &["Commander", "atlas", "nova"]);
             assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{crew}");
-            assert!(crew.contains("needs appr"), "{width}x{height}\n{crew}");
-            if width >= 105 {
-                let whole = region(&buffer, buffer.area);
-                assert!(
-                    whole.contains("01  RUNNING") && whole.contains("01  NEED ATTENTION"),
-                    "{whole}"
-                );
-            }
+            let rows: Vec<&str> = crew.lines().collect();
+            let atlas = rows.iter().find(|line| line.contains("atlas")).unwrap();
+            let nova = rows.iter().find(|line| line.contains("nova")).unwrap();
+            assert!(atlas.contains("! atlas"), "{width}x{height}\n{crew}");
+            assert!(atlas.contains(Status::NeedsApproval.label()), "{crew}");
+            assert!(
+                nova.contains("● nova") && nova.contains("RUNNING"),
+                "{crew}"
+            );
+            assert!(region(&buffer, buffer.area).contains("WORKERS (2)"));
         }
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.crew[app.selected].name, "atlas");
         app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.crew[app.selected].name, "nova");
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         fs::write(fixture.root.join("release-nova"), "").unwrap();
         wait_for(&mut app, |app| {
@@ -4067,16 +4243,19 @@ esac
         assert!(!repository.join("parser.txt").exists());
 
         app.selected = specialists::find(&app.crew, "nova").unwrap();
-        for (width, height) in SIZES {
+        for (width, height) in RAIL_SIZES {
             let buffer = screen(&mut app, width, height);
-            let whole = region(&buffer, buffer.area);
+            let banner_row = if app.left_panel_visible() { 1 } else { 2 };
+            let banner = row(&buffer, banner_row);
             assert!(
-                whole.contains("BUILDER  /  02  ·  +1 −0"),
+                banner.contains("Focused: nova (builder") && banner.contains("[d: Diff]"),
+                "{width}x{height}\n{banner}"
+            );
+            let whole = words(&region(&buffer, buffer.area));
+            assert!(
+                whole.contains("CHANGES (1)") && whole.contains("parser.txt +1 -0"),
                 "{width}x{height}\n{whole}"
             );
-            if width >= 105 {
-                assert!(whole.contains("BRANCH") && whole.contains("ac/nova-build-the-parser →"));
-            }
         }
         send(&mut app, "/diff");
         let report = app.log.back().unwrap().clone();
@@ -4089,7 +4268,8 @@ esac
         assert_eq!(app.notice, "No specialist named ghost.");
         app.selected = 0;
         send(&mut app, "/diff");
-        assert!(app.notice.starts_with("Select a specialist or name one."));
+        assert!(app.diff_modal.is_open());
+        assert_eq!(app.notice, "Opened workspace unified diff.");
     }
 
     #[cfg(unix)]
@@ -4113,29 +4293,31 @@ esac
         send(&mut app, "/settle nova");
         assert!(app.crew[nova].settled);
         assert_eq!(app.selected, 0);
-        for (index, (width, height)) in SIZES.into_iter().enumerate() {
+        for (index, (width, height)) in RAIL_SIZES.into_iter().enumerate() {
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
             assert!(
-                crew.contains("▸ SETTLED (1)") && !crew.contains("nova"),
+                crew.contains("▸ Settled (1)") && !crew.contains("nova"),
                 "{crew}"
             );
             if index == 0 {
                 app.key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
             } else {
-                let header = 2 * app.crew_row_height;
-                app.click(app.crew_area.x + 1, app.crew_area.y + header + 1);
+                let header = rail_rect(&app, tui::render::RailHit::ToggleSettled);
+                app.click(header.x + 1, header.y);
             }
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
-            let order = row_order(&crew, &["atlas", "▾ SETTLED (1)"]);
+            let order = row_order(&crew, &["atlas", "▾ Settled (1)"]);
             assert!(order[0] < order[1], "{crew}");
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             assert_eq!(app.selected, nova);
             let buffer = screen(&mut app, width, height);
             let crew = region(&buffer, app.crew_area);
-            let order = row_order(&crew, &["SETTLED", "nova"]);
+            let order = row_order(&crew, &["Settled", "nova"]);
             assert!(order[0] < order[1], "{width}x{height}\n{crew}");
             send(&mut app, "/settled");
             assert!(!app.show_settled);
@@ -4197,7 +4379,12 @@ esac
         app.crew[1].changes = None;
         app.selected = 1;
         let buffer = screen(&mut app, 120, 40);
-        assert!(region(&buffer, buffer.area).contains("diff unavailable"));
+        let whole = words(&region(&buffer, buffer.area));
+        assert!(whole.contains("Focused: atlas (writer"), "{whole}");
+        assert!(
+            whole.contains("CHANGES (0)") && !whole.contains("+1 -0"),
+            "{whole}"
+        );
     }
 
     #[cfg(unix)]
@@ -4206,9 +4393,6 @@ esac
         let (fixture, _repository, mut app) = parallel_app("parallel-drop");
         send(&mut app, "/spawn atlas writer Hang");
         wait_for(&mut app, |_| fixture.root.join("hanging").exists());
-        app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(!app.quit);
-        assert_eq!(app.notice, "Wait for the running mission before quitting.");
         send(&mut app, "/settle atlas");
         assert!(app.notice.contains("is running"));
         send(&mut app, "/remove atlas");
@@ -4223,7 +4407,7 @@ esac
         assert_eq!(member(&app, "atlas").status, Status::Snoozed);
         assert!(app.is_snoozed("atlas") && !app.is_snoozed(COMMANDER));
         app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(app.quit);
+        assert!(app.quit && !app.mission_running());
         drop(app);
         std::thread::sleep(std::time::Duration::from_millis(200));
         fs::write(fixture.root.join("release-hang"), "").unwrap();

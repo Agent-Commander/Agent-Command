@@ -1,30 +1,136 @@
+#[cfg(unix)]
+#[path = "mission/unix.rs"]
+mod process_tree;
+#[cfg(windows)]
+#[path = "mission/windows.rs"]
+mod process_tree;
+
 use crate::{
     auth::{Profile, Provider},
     catalog::Catalog,
     checkpoint::{Checkpoint, Claim, Handoff, Progress},
     native::Pins,
-    permissions::{self, PermissionMode},
+    permissions::{self, PermissionEffect, PermissionMode, PermissionPolicy},
     routing::{self, Candidate, Configuration, Request},
     targeting::Target,
     usage::{self, Usage},
 };
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
-    process::Stdio,
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender},
-        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc, Mutex, PoisonError,
     },
     thread,
     time::Duration,
 };
 
 const SNOOZE_POLL: Duration = Duration::from_millis(200);
+const CANCEL_POLL: Duration = Duration::from_millis(15);
+const STDERR_TAIL_LIMIT: usize = 20;
+const OUTPUT_PREVIEW_CHARS: usize = 400;
+const MAX_PARTIAL_TOOL_JSON_BYTES: usize = 256 * 1024;
 const NO_ALTERNATE: &str =
     "Usage limit reached; mission stopped without replay. No eligible signed-in alternate.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Shell,
+    Read,
+    Edit,
+    Write,
+    Search,
+    Web,
+    Mcp,
+    Subagent,
+    Todo,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchKind {
+    Add,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCode {
+    AgentMissing,
+    AgentBlocked,
+    AgentAuth,
+    AgentFailed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NormalizedEvent {
+    SessionStarted {
+        session_id: String,
+        model: Option<String>,
+    },
+    TextDelta(String),
+    ThinkingDelta(String),
+    ToolStart {
+        call_id: String,
+        kind: ToolKind,
+        name: String,
+        summary: String,
+        raw_input: Value,
+    },
+    ToolEnd {
+        call_id: String,
+        ok: bool,
+        output_preview: String,
+        exit_code: Option<i32>,
+    },
+    FileChanged {
+        path: String,
+        kind: PatchKind,
+    },
+    PermissionAsked {
+        req_id: String,
+        tool: String,
+        input: Value,
+        prod_gate_reason: Option<String>,
+    },
+    UsageDelta {
+        input: u64,
+        cached_read: u64,
+        output: u64,
+        cost_usd: Option<f64>,
+        context_used: Option<u64>,
+    },
+    RateLimit {
+        five_hour_pct: Option<f32>,
+        seven_day_pct: Option<f32>,
+        resets_at: Option<String>,
+    },
+    StderrLine(String),
+    TurnFinished {
+        interrupted: bool,
+        is_error: bool,
+        error_code: Option<HealthCode>,
+        final_text: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LaunchOptions {
+    pub resume_session: Option<String>,
+    pub mcp_config: Option<PathBuf>,
+    pub extra_args: Vec<String>,
+    pub policy: PermissionPolicy,
+    pub persistent_stdio: bool,
+}
 
 pub(crate) enum Event {
     Running {
@@ -43,14 +149,70 @@ pub(crate) enum Event {
     Finished(io::Result<()>),
 }
 
-pub(crate) struct Mission {
+enum ControlMessage {
+    Interrupt,
+    PermissionResponse {
+        req_id: String,
+        allow: bool,
+        steer_msg: Option<String>,
+    },
+}
+
+pub struct Mission {
     pub(crate) events: Receiver<Event>,
+    pub normalized: Receiver<NormalizedEvent>,
     cancel: Arc<AtomicBool>,
+    control: Arc<Mutex<Option<Sender<ControlMessage>>>>,
+    active_pid: Arc<AtomicU32>,
 }
 
 impl Drop for Mission {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.interrupt();
+    }
+}
+
+impl Mission {
+    pub fn interrupt(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let has_control = if let Some(tx) = self
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = tx.send(ControlMessage::Interrupt);
+            true
+        } else {
+            false
+        };
+        if !has_control {
+            let pid = self.active_pid.swap(0, Ordering::AcqRel);
+            if pid != 0 {
+                thread::spawn(move || process_tree::kill_tree(pid));
+            }
+        }
+    }
+
+    pub fn respond_permission(
+        &self,
+        req_id: &str,
+        allow: bool,
+        steer_msg: Option<&str>,
+    ) -> io::Result<()> {
+        let guard = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(tx) = guard.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "No interactive stdio permission channel is active for this mission.",
+            ));
+        };
+        tx.send(ControlMessage::PermissionResponse {
+            req_id: req_id.to_owned(),
+            allow,
+            steer_msg: steer_msg.map(str::to_owned),
+        })
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Permission channel closed"))
     }
 }
 
@@ -89,25 +251,57 @@ impl Route {
 }
 
 impl Mission {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn held() -> (Self, std::sync::mpsc::Sender<Event>) {
         let (sender, events) = std::sync::mpsc::channel();
+        let (_norm_tx, normalized) = mpsc::channel();
         let mission = Self {
             events,
+            normalized,
             cancel: Arc::default(),
+            control: Arc::new(Mutex::new(None)),
+            active_pid: Arc::new(AtomicU32::new(0)),
         };
         (mission, sender)
     }
 
     pub(crate) fn launch(profiles: Vec<Profile>, route: Route, workspace: PathBuf) -> Self {
-        Self::launch_with_clock(profiles, route, workspace, usage::now)
+        let options = LaunchOptions {
+            policy: PermissionPolicy::for_mode(route.mode),
+            ..LaunchOptions::default()
+        };
+        Self::launch_with_options(profiles, route, workspace, options)
     }
 
+    pub(crate) fn launch_with_options(
+        profiles: Vec<Profile>,
+        route: Route,
+        workspace: PathBuf,
+        options: LaunchOptions,
+    ) -> Self {
+        Self::launch_with_clock_and_options(profiles, route, workspace, usage::now, options)
+    }
+
+    #[cfg(all(test, unix))]
     fn launch_with_clock(
         profiles: Vec<Profile>,
         route: Route,
         workspace: PathBuf,
         clock: fn() -> usage::Tick,
+    ) -> Self {
+        let options = LaunchOptions {
+            policy: PermissionPolicy::for_mode(route.mode),
+            ..LaunchOptions::default()
+        };
+        Self::launch_with_clock_and_options(profiles, route, workspace, clock, options)
+    }
+
+    fn launch_with_clock_and_options(
+        profiles: Vec<Profile>,
+        route: Route,
+        workspace: PathBuf,
+        clock: fn() -> usage::Tick,
+        options: LaunchOptions,
     ) -> Self {
         Self::start(
             Execution {
@@ -116,6 +310,8 @@ impl Mission {
                 clock,
                 limits: route.limits.clone(),
                 mode: route.mode,
+                options,
+                active_pid: Arc::new(AtomicU32::new(0)),
             },
             Work::Routed(route),
         )
@@ -135,6 +331,11 @@ impl Mission {
                 clock: usage::now,
                 limits: LimitPolicy::default(),
                 mode: PermissionMode::Supervised,
+                options: LaunchOptions {
+                    policy: PermissionPolicy::for_mode(PermissionMode::Supervised),
+                    ..LaunchOptions::default()
+                },
+                active_pid: Arc::new(AtomicU32::new(0)),
             },
             Work::Resume {
                 interrupted,
@@ -146,20 +347,1405 @@ impl Mission {
 
     fn start(execution: Execution, work: Work) -> Self {
         let (sender, events) = mpsc::sync_channel(64);
+        let (norm_sender, normalized) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(Mutex::new(None));
+        let active_pid = Arc::clone(&execution.active_pid);
         let worker_cancel = Arc::clone(&cancel);
+        let worker_control = Arc::clone(&control);
         thread::spawn(move || {
             let result = match work {
-                Work::Routed(route) => execution.route(&route, &sender, &worker_cancel),
+                Work::Routed(route) => execution.route(
+                    &route,
+                    &sender,
+                    &norm_sender,
+                    &worker_cancel,
+                    &worker_control,
+                ),
                 Work::Resume {
                     interrupted,
                     prompt,
                     claim,
-                } => execution.resume(interrupted, &prompt, claim, &sender, &worker_cancel),
+                } => execution.resume(
+                    interrupted,
+                    &prompt,
+                    claim,
+                    &sender,
+                    &norm_sender,
+                    &worker_cancel,
+                    &worker_control,
+                ),
             };
             let _ = sender.send(Event::Finished(result));
         });
-        Self { events, cancel }
+        Self {
+            events,
+            normalized,
+            cancel,
+            control,
+            active_pid,
+        }
+    }
+}
+
+pub struct WarmSession {
+    provider: Provider,
+    pub events: Receiver<NormalizedEvent>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Arc<Mutex<Option<Child>>>,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl Drop for WarmSession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl WarmSession {
+    pub fn spawn_claude(
+        profile: &Profile,
+        workspace: &Path,
+        configuration: &Configuration,
+        mode: PermissionMode,
+        options: &LaunchOptions,
+    ) -> io::Result<Self> {
+        if profile.provider != Provider::Claude {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Warm persistent stdio sessions are supported for Claude.",
+            ));
+        }
+        let mut command = profile.authenticated_command()?;
+        command.args(configuration.arguments());
+        command.args(claude_persistent_arguments(mode, options));
+        permissions::refuse_bypass(command.get_args()).map_err(io::Error::other)?;
+        command
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process_tree::own_group(&mut command);
+
+        let mut child = command.spawn()?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let stdout = child.stdout.take().expect("warm session stdout is piped");
+        let stderr = child.stderr.take().expect("warm session stderr is piped");
+        let child_handle = Arc::new(Mutex::new(Some(child)));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let (tx, events) = mpsc::channel();
+
+        let stderr_tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = stderr_tx.send(NormalizedEvent::StderrLine(trimmed.to_owned()));
+                }
+            }
+        });
+
+        let stdout_tx = tx;
+        let stdout_stdin = Arc::clone(&stdin);
+        let stdout_interrupted = Arc::clone(&interrupted);
+        let policy = options.policy.clone();
+        let profile_clone = profile.clone();
+        thread::spawn(move || {
+            let mut parser = EventParser::new(Provider::Claude);
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let _ = Usage::observe_claude(&profile_clone, &value, usage::now());
+                let is_interrupted = stdout_interrupted.load(Ordering::Acquire);
+                for event in parser.parse_value(&value, is_interrupted, Some(&policy)) {
+                    if let NormalizedEvent::PermissionAsked {
+                        ref req_id,
+                        ref tool,
+                        ref input,
+                        ..
+                    } = event
+                    {
+                        let resource = tool_resource(tool, input);
+                        let resolved = policy.evaluate(tool, &resource, input);
+                        match resolved.effect {
+                            PermissionEffect::Allow => {
+                                let _ = write_claude_permission_response(
+                                    &stdout_stdin,
+                                    req_id,
+                                    true,
+                                    None,
+                                );
+                                continue;
+                            }
+                            PermissionEffect::Deny => {
+                                let _ = write_claude_permission_response(
+                                    &stdout_stdin,
+                                    req_id,
+                                    false,
+                                    resolved.reason.as_deref(),
+                                );
+                                continue;
+                            }
+                            PermissionEffect::Ask => {}
+                        }
+                    }
+                    if matches!(event, NormalizedEvent::TurnFinished { .. }) {
+                        stdout_interrupted.store(false, Ordering::Release);
+                    }
+                    if stdout_tx.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            provider: Provider::Claude,
+            events,
+            stdin,
+            child: child_handle,
+            interrupted,
+        })
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub fn send_turn(&self, prompt: &str) -> io::Result<()> {
+        self.interrupted.store(false, Ordering::Release);
+        let payload = claude_user_turn_json(prompt);
+        write_stdin_line(&self.stdin, &payload)
+    }
+
+    pub fn interrupt(&self) -> io::Result<()> {
+        self.interrupted.store(true, Ordering::Release);
+        let payload = claude_interrupt_request_json(&uuid::Uuid::new_v4().to_string());
+        if write_stdin_line(&self.stdin, &payload).is_err() {
+            self.force_kill();
+        }
+        Ok(())
+    }
+
+    pub fn respond_permission(
+        &self,
+        req_id: &str,
+        allow: bool,
+        steer_msg: Option<&str>,
+    ) -> io::Result<()> {
+        write_claude_permission_response(&self.stdin, req_id, allow, steer_msg)
+    }
+
+    pub fn force_kill(&self) {
+        if let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            process_tree::kill_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.stdin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.force_kill();
+    }
+}
+
+pub fn claude_user_turn_json(prompt: &str) -> String {
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": prompt }]
+        }
+    })
+    .to_string()
+}
+
+pub fn claude_interrupt_request_json(request_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" }
+    })
+    .to_string()
+}
+
+pub fn claude_permission_response_json(
+    request_id: &str,
+    allow: bool,
+    steer_msg: Option<&str>,
+) -> String {
+    let inner = if allow {
+        json!({ "behavior": "allow" })
+    } else {
+        json!({
+            "behavior": "deny",
+            "message": steer_msg.unwrap_or("Denied by operator.")
+        })
+    };
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": inner
+        }
+    })
+    .to_string()
+}
+
+fn write_claude_permission_response(
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    req_id: &str,
+    allow: bool,
+    steer_msg: Option<&str>,
+) -> io::Result<()> {
+    let payload = claude_permission_response_json(req_id, allow, steer_msg);
+    write_stdin_line(stdin, &payload)
+}
+
+fn write_stdin_line(stdin: &Arc<Mutex<Option<ChildStdin>>>, line: &str) -> io::Result<()> {
+    let mut guard = stdin.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(writer) = guard.as_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "Provider stdin is closed.",
+        ));
+    };
+    writeln!(writer, "{line}")?;
+    writer.flush()
+}
+
+pub fn claude_persistent_arguments(mode: PermissionMode, options: &LaunchOptions) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_owned(),
+        "--input-format".to_owned(),
+        "stream-json".to_owned(),
+        "--output-format".to_owned(),
+        "stream-json".to_owned(),
+        "--verbose".to_owned(),
+        "--include-partial-messages".to_owned(),
+        "--permission-prompt-tool".to_owned(),
+        "stdio".to_owned(),
+        "--setting-sources".to_owned(),
+        "user".to_owned(),
+    ];
+    if let Some(session_id) = &options.resume_session {
+        args.extend(["--resume".to_owned(), session_id.clone()]);
+    }
+    if let Some(mcp_config) = &options.mcp_config {
+        args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+    }
+    args.extend(mode.claude_arguments().into_iter().map(str::to_owned));
+    args.extend(options.extra_args.iter().cloned());
+    args
+}
+
+pub fn build_provider_arguments(
+    provider: Provider,
+    mode: PermissionMode,
+    options: &LaunchOptions,
+) -> Vec<String> {
+    match provider {
+        Provider::Claude if options.persistent_stdio => claude_persistent_arguments(mode, options),
+        Provider::Claude => {
+            let mut args: Vec<String> = permissions::dispatch_arguments(provider, mode)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let has_trailing_dash = args.last().is_some_and(|a| a == "--");
+            if has_trailing_dash {
+                args.pop();
+            }
+            if let Some(session_id) = &options.resume_session {
+                args.extend(["--resume".to_owned(), session_id.clone()]);
+            }
+            if let Some(mcp_config) = &options.mcp_config {
+                args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+            }
+            args.extend(options.extra_args.iter().cloned());
+            if has_trailing_dash {
+                args.push("--".to_owned());
+            }
+            args
+        }
+        Provider::Codex => {
+            if let Some(thread_id) = &options.resume_session {
+                let mut args = vec![
+                    "exec".to_owned(),
+                    "resume".to_owned(),
+                    "--json".to_owned(),
+                    "--skip-git-repo-check".to_owned(),
+                ];
+                args.extend(options.extra_args.iter().cloned());
+                args.push(thread_id.clone());
+                args.push("-".to_owned());
+                args
+            } else {
+                let mut args: Vec<String> = permissions::dispatch_arguments(provider, mode)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                let has_stdin_dash = args.last().is_some_and(|a| a == "-");
+                if has_stdin_dash {
+                    args.pop();
+                }
+                args.extend(options.extra_args.iter().cloned());
+                if has_stdin_dash {
+                    args.push("-".to_owned());
+                }
+                args
+            }
+        }
+        Provider::Gemini => {
+            let mut args: Vec<String> = permissions::dispatch_arguments(provider, mode)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if let Some(session_id) = &options.resume_session {
+                args.extend(["--resume".to_owned(), session_id.clone()]);
+            }
+            args.extend(options.extra_args.iter().cloned());
+            args.extend(["-p".to_owned(), String::new()]);
+            args
+        }
+    }
+}
+
+pub fn classify_health(stderr_lines: &[String], io_error: Option<&io::Error>) -> HealthCode {
+    if let Some(err) = io_error {
+        match err.kind() {
+            io::ErrorKind::NotFound => return HealthCode::AgentMissing,
+            io::ErrorKind::PermissionDenied => return HealthCode::AgentBlocked,
+            _ => {}
+        }
+    }
+    let joined = stderr_lines.join("\n").to_ascii_lowercase();
+    const AUTH_SIGNALS: [&str; 9] = [
+        "not logged in",
+        "authentication failed",
+        "failed to authenticate",
+        "unauthorized",
+        "invalid api key",
+        "invalid_grant",
+        "oauth",
+        "credentials",
+        "sign in first",
+    ];
+    if AUTH_SIGNALS.iter().any(|signal| joined.contains(signal)) {
+        return HealthCode::AgentAuth;
+    }
+    HealthCode::AgentFailed
+}
+
+pub fn classify_tool_kind(tool_name: &str) -> ToolKind {
+    match tool_name.trim().to_ascii_lowercase().as_str() {
+        "bash" | "shell" | "execute" | "command_execution" | "run_command"
+        | "run_shell_command" => ToolKind::Shell,
+        "read" | "read_file" | "view_file" | "cat" => ToolKind::Read,
+        "edit" | "edit_file" | "multiedit" | "patch" | "replace_file_content" => ToolKind::Edit,
+        "write" | "write_file" | "notebookedit" | "create_file" => ToolKind::Write,
+        "glob" | "grep" | "ls" | "find" | "search" | "ripgrep" | "list_dir" => ToolKind::Search,
+        "webfetch" | "websearch" | "web_search" | "fetch" => ToolKind::Web,
+        "task" | "agent" | "subagent" | "spawn_worker" | "collab_tool_call" => ToolKind::Subagent,
+        "todowrite" | "todo_list" => ToolKind::Todo,
+        name if name.starts_with("mcp__") || name.contains("mcp") => ToolKind::Mcp,
+        _ => ToolKind::Generic,
+    }
+}
+
+fn tool_resource(tool_name: &str, input: &Value) -> String {
+    for key in ["command", "file_path", "path", "url", "pattern", "query"] {
+        if let Some(val) = input.get(key).and_then(Value::as_str) {
+            return val.to_owned();
+        }
+    }
+    tool_name.to_owned()
+}
+
+fn summarize_tool(name: &str, input: &Value) -> String {
+    for key in [
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "notebook_path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ] {
+        if let Some(val) = input.get(key).and_then(Value::as_str) {
+            let single_line = val.lines().next().unwrap_or(val).trim();
+            if !single_line.is_empty() {
+                let clipped: String = single_line.chars().take(120).collect();
+                return format!("{name}: {clipped}");
+            }
+        }
+    }
+    name.to_owned()
+}
+
+fn summarize_partial_tool_json(name: &str, partial_json: &str) -> Option<String> {
+    for key in [
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "notebook_path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ] {
+        if let Some(val) = extract_partial_json_string_field(partial_json, key) {
+            let single_line = val.lines().next().unwrap_or(&val).trim();
+            if !single_line.is_empty() {
+                let clipped: String = single_line.chars().take(120).collect();
+                return Some(format!("{name}: {clipped}"));
+            }
+        }
+    }
+    None
+}
+
+fn extract_partial_json_string_field(partial: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut offset = 0usize;
+    while let Some(found) = partial[offset..].find(&needle) {
+        let after_key = offset + found + needle.len();
+        let rest = partial[after_key..].trim_start();
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            let value_start = after_colon.trim_start();
+            if let Some(quoted) = value_start.strip_prefix('"') {
+                return parse_complete_json_string_literal(quoted);
+            }
+        }
+        offset = after_key;
+    }
+    None
+}
+
+fn parse_complete_json_string_literal(input: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'u' => {
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        hex.push(chars.next()?);
+                    }
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    if let Some(decoded) = char::from_u32(code) {
+                        out.push(decoded);
+                    }
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+fn preview_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= OUTPUT_PREVIEW_CHARS {
+        trimmed.to_owned()
+    } else {
+        let mut out: String = trimmed.chars().take(OUTPUT_PREVIEW_CHARS).collect();
+        out.push('…');
+        out
+    }
+}
+
+enum ActiveStreamBlock {
+    Thinking,
+    Text,
+    ToolUse {
+        call_id: String,
+        name: String,
+        partial_json: String,
+        emitted_summary: String,
+    },
+}
+
+pub struct EventParser {
+    provider: Provider,
+    last_cumulative_cost_usd: f64,
+    active_stream_message_id: Option<String>,
+    streamed_text_in_message: bool,
+    streamed_thinking_in_message: bool,
+    gemini_streamed_delta: bool,
+    final_text: String,
+    tool_names_by_id: HashMap<String, (String, Value)>,
+    emitted_tool_summaries: HashMap<String, String>,
+    active_blocks: HashMap<usize, ActiveStreamBlock>,
+    codex_item_text: HashMap<String, String>,
+    codex_started_tools: HashSet<String>,
+}
+
+impl EventParser {
+    pub fn new(provider: Provider) -> Self {
+        Self {
+            provider,
+            last_cumulative_cost_usd: 0.0,
+            active_stream_message_id: None,
+            streamed_text_in_message: false,
+            streamed_thinking_in_message: false,
+            gemini_streamed_delta: false,
+            final_text: String::new(),
+            tool_names_by_id: HashMap::new(),
+            emitted_tool_summaries: HashMap::new(),
+            active_blocks: HashMap::new(),
+            codex_item_text: HashMap::new(),
+            codex_started_tools: HashSet::new(),
+        }
+    }
+
+    pub fn parse_value(
+        &mut self,
+        event: &Value,
+        interrupted: bool,
+        policy: Option<&PermissionPolicy>,
+    ) -> Vec<NormalizedEvent> {
+        match self.provider {
+            Provider::Claude => self.parse_claude(event, interrupted, policy),
+            Provider::Codex => self.parse_codex(event, interrupted),
+            Provider::Gemini => self.parse_gemini(event, interrupted),
+        }
+    }
+
+    fn emit_claude_tool_start(
+        &mut self,
+        call_id: String,
+        name: String,
+        summary: String,
+        raw_input: Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) {
+        if raw_input.is_object() && !raw_input.as_object().is_some_and(serde_json::Map::is_empty)
+            || !self.tool_names_by_id.contains_key(&call_id)
+        {
+            self.tool_names_by_id
+                .insert(call_id.clone(), (name.clone(), raw_input.clone()));
+        }
+        let should_emit = match self.emitted_tool_summaries.get(&call_id) {
+            None => true,
+            Some(prev) => prev != &summary && summary.len() > prev.len(),
+        };
+        if should_emit {
+            self.emitted_tool_summaries
+                .insert(call_id.clone(), summary.clone());
+            out.push(NormalizedEvent::ToolStart {
+                call_id,
+                kind: classify_tool_kind(&name),
+                name,
+                summary,
+                raw_input,
+            });
+        }
+    }
+
+    fn parse_claude(
+        &mut self,
+        event: &Value,
+        interrupted: bool,
+        policy: Option<&PermissionPolicy>,
+    ) -> Vec<NormalizedEvent> {
+        let mut out = Vec::new();
+        match event["type"].as_str() {
+            Some("system") if event["subtype"] == "init" => {
+                if let Some(session_id) = event["session_id"].as_str() {
+                    out.push(NormalizedEvent::SessionStarted {
+                        session_id: session_id.to_owned(),
+                        model: event["model"].as_str().map(str::to_owned),
+                    });
+                }
+            }
+            Some("stream_event") => {
+                let inner = &event["event"];
+                match inner["type"].as_str() {
+                    Some("message_start") => {
+                        self.active_stream_message_id =
+                            inner["message"]["id"].as_str().map(str::to_owned);
+                        self.streamed_text_in_message = false;
+                        self.streamed_thinking_in_message = false;
+                        self.active_blocks.clear();
+                    }
+                    Some("content_block_start") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        let block = &inner["content_block"];
+                        match block["type"].as_str() {
+                            Some("thinking" | "redacted_thinking") => {
+                                self.active_blocks
+                                    .insert(index, ActiveStreamBlock::Thinking);
+                                let initial = block["thinking"].as_str().unwrap_or_default();
+                                if !initial.is_empty() {
+                                    self.streamed_thinking_in_message = true;
+                                }
+                                out.push(NormalizedEvent::ThinkingDelta(initial.to_owned()));
+                            }
+                            Some("text") => {
+                                self.active_blocks.insert(index, ActiveStreamBlock::Text);
+                                if let Some(initial) =
+                                    block["text"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_text_in_message = true;
+                                    self.final_text.push_str(initial);
+                                    out.push(NormalizedEvent::TextDelta(initial.to_owned()));
+                                }
+                            }
+                            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                                let call_id = block["id"].as_str().unwrap_or_default().to_owned();
+                                let name = block["name"].as_str().unwrap_or("tool").to_owned();
+                                let initial_input = block["input"].clone();
+                                let summary = summarize_tool(&name, &initial_input);
+                                self.active_blocks.insert(
+                                    index,
+                                    ActiveStreamBlock::ToolUse {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        partial_json: String::new(),
+                                        emitted_summary: summary.clone(),
+                                    },
+                                );
+                                self.emit_claude_tool_start(
+                                    call_id,
+                                    name,
+                                    summary,
+                                    initial_input,
+                                    &mut out,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        let delta = &inner["delta"];
+                        match delta["type"].as_str() {
+                            Some("text_delta") => {
+                                if let Some(text) = delta["text"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_text_in_message = true;
+                                    self.final_text.push_str(text);
+                                    out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if let Some(thinking) =
+                                    delta["thinking"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_thinking_in_message = true;
+                                    out.push(NormalizedEvent::ThinkingDelta(thinking.to_owned()));
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(chunk) = delta["partial_json"].as_str() {
+                                    let enriched = if let Some(ActiveStreamBlock::ToolUse {
+                                        call_id,
+                                        name,
+                                        partial_json,
+                                        emitted_summary,
+                                    }) = self.active_blocks.get_mut(&index)
+                                    {
+                                        if partial_json.len() < MAX_PARTIAL_TOOL_JSON_BYTES {
+                                            partial_json.push_str(chunk);
+                                        }
+                                        if *emitted_summary == *name {
+                                            if let Some(rich) =
+                                                summarize_partial_tool_json(name, partial_json)
+                                            {
+                                                *emitted_summary = rich.clone();
+                                                Some((call_id.clone(), name.clone(), rich))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((call_id, name, summary)) = enriched {
+                                        self.emit_claude_tool_start(
+                                            call_id,
+                                            name,
+                                            summary,
+                                            Value::Object(serde_json::Map::new()),
+                                            &mut out,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        if let Some(ActiveStreamBlock::ToolUse {
+                            call_id,
+                            name,
+                            partial_json,
+                            ..
+                        }) = self.active_blocks.remove(&index)
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&partial_json) {
+                                let summary = summarize_tool(&name, &parsed);
+                                self.emit_claude_tool_start(
+                                    call_id, name, summary, parsed, &mut out,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("assistant") => {
+                let msg_id = event["message"]["id"].as_str();
+                let matches_streamed = match (msg_id, self.active_stream_message_id.as_deref()) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, _) | (_, None) => true,
+                };
+                if let Some(items) = event["message"]["content"].as_array() {
+                    for item in items {
+                        match item["type"].as_str() {
+                            Some("text") => {
+                                if !(matches_streamed && self.streamed_text_in_message) {
+                                    if let Some(text) =
+                                        item["text"].as_str().filter(|t| !t.is_empty())
+                                    {
+                                        self.final_text.push_str(text);
+                                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                                    }
+                                }
+                            }
+                            Some("thinking") => {
+                                if !(matches_streamed && self.streamed_thinking_in_message) {
+                                    if let Some(thinking) =
+                                        item["thinking"].as_str().filter(|t| !t.is_empty())
+                                    {
+                                        out.push(NormalizedEvent::ThinkingDelta(
+                                            thinking.to_owned(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                                let call_id = item["id"].as_str().unwrap_or_default().to_owned();
+                                let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                                let input = item["input"].clone();
+                                let summary = summarize_tool(&name, &input);
+                                self.emit_claude_tool_start(
+                                    call_id, name, summary, input, &mut out,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let usage_val = &event["message"]["usage"];
+                if usage_val.is_object() {
+                    let input = usage_val["input_tokens"].as_u64().unwrap_or(0);
+                    let cached_read = usage_val["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                    let cache_create = usage_val["cache_creation_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let output = usage_val["output_tokens"].as_u64().unwrap_or(0);
+                    let context_used = input
+                        .saturating_add(cached_read)
+                        .saturating_add(cache_create);
+                    if context_used > 0 || output > 0 {
+                        out.push(NormalizedEvent::UsageDelta {
+                            input,
+                            cached_read,
+                            output,
+                            cost_usd: None,
+                            context_used: Some(context_used),
+                        });
+                    }
+                }
+            }
+            Some("user") => {
+                self.active_stream_message_id = None;
+                self.streamed_text_in_message = false;
+                self.streamed_thinking_in_message = false;
+                self.active_blocks.clear();
+                if let Some(items) = event["message"]["content"].as_array() {
+                    for item in items {
+                        if item["type"] == "tool_result" {
+                            let call_id =
+                                item["tool_use_id"].as_str().unwrap_or_default().to_owned();
+                            let ok = item["is_error"] != true;
+                            let mut content_str = match &item["content"] {
+                                Value::Null => String::new(),
+                                Value::String(text) => text.clone(),
+                                Value::Array(parts) => parts
+                                    .iter()
+                                    .filter_map(|p| p["text"].as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                other => other.to_string(),
+                            };
+                            if content_str.trim().is_empty() {
+                                let result_meta = event
+                                    .get("tool_use_result")
+                                    .or_else(|| event["message"].get("tool_use_result"));
+                                if let Some(meta) = result_meta {
+                                    if let Some(text) =
+                                        meta.as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = text.to_owned();
+                                    } else if let Some(stdout) =
+                                        meta["stdout"].as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = stdout.to_owned();
+                                    } else if let Some(stderr) =
+                                        meta["stderr"].as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = stderr.to_owned();
+                                    }
+                                }
+                            }
+                            out.push(NormalizedEvent::ToolEnd {
+                                call_id: call_id.clone(),
+                                ok,
+                                output_preview: preview_text(&content_str),
+                                exit_code: None,
+                            });
+                            if ok {
+                                if let Some((name, input)) = self.tool_names_by_id.get(&call_id) {
+                                    if let Some(path) = input
+                                        .get("file_path")
+                                        .or_else(|| input.get("path"))
+                                        .or_else(|| input.get("notebook_path"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        let kind = match classify_tool_kind(name) {
+                                            ToolKind::Write => Some(PatchKind::Add),
+                                            ToolKind::Edit => Some(PatchKind::Update),
+                                            _ => None,
+                                        };
+                                        if let Some(kind) = kind {
+                                            out.push(NormalizedEvent::FileChanged {
+                                                path: path.to_owned(),
+                                                kind,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("control_request") => {
+                let req = &event["request"];
+                if req["subtype"] == "can_use_tool" {
+                    let req_id = event["request_id"].as_str().unwrap_or_default().to_owned();
+                    let tool = req["tool_name"].as_str().unwrap_or("tool").to_owned();
+                    let input = req["input"].clone();
+                    let prod_gate_reason = policy
+                        .and_then(|p| {
+                            p.evaluate(&tool, &tool_resource(&tool, &input), &input)
+                                .prod_gate
+                        })
+                        .or_else(|| crate::prodgate::ProdGate::check(&tool, &input))
+                        .map(|hit| hit.reason);
+                    out.push(NormalizedEvent::PermissionAsked {
+                        req_id,
+                        tool,
+                        input,
+                        prod_gate_reason,
+                    });
+                }
+            }
+            Some("rate_limit_event") => {
+                let info = &event["rate_limit_info"];
+                let windows = &info["unifiedWindows"];
+                let five = windows["five_hour"]["utilization"]
+                    .as_f64()
+                    .map(|u| (u * 100.0) as f32);
+                let seven = windows["seven_day"]["utilization"]
+                    .as_f64()
+                    .map(|u| (u * 100.0) as f32);
+                let resets_at = info["resetsAt"]
+                    .as_i64()
+                    .map(|ts| ts.to_string())
+                    .or_else(|| info["resetsAt"].as_str().map(str::to_owned));
+                out.push(NormalizedEvent::RateLimit {
+                    five_hour_pct: five,
+                    seven_day_pct: seven,
+                    resets_at,
+                });
+            }
+            Some("result") => {
+                if let Some(total_cost) = event["total_cost_usd"].as_f64() {
+                    let delta = (total_cost - self.last_cumulative_cost_usd).max(0.0);
+                    self.last_cumulative_cost_usd = total_cost;
+                    let usage_val = &event["usage"];
+                    out.push(NormalizedEvent::UsageDelta {
+                        input: usage_val["input_tokens"].as_u64().unwrap_or(0),
+                        cached_read: usage_val["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                        output: usage_val["output_tokens"].as_u64().unwrap_or(0),
+                        cost_usd: Some(delta),
+                        context_used: None,
+                    });
+                }
+                let raw_is_error = event["is_error"] == true;
+                let was_interrupted = interrupted && event["subtype"] == "error_during_execution";
+                let final_text = if !self.final_text.is_empty() {
+                    std::mem::take(&mut self.final_text)
+                } else {
+                    event["result"].as_str().unwrap_or_default().to_owned()
+                };
+                self.active_stream_message_id = None;
+                self.streamed_text_in_message = false;
+                self.streamed_thinking_in_message = false;
+                self.active_blocks.clear();
+                self.emitted_tool_summaries.clear();
+                out.push(NormalizedEvent::TurnFinished {
+                    interrupted: was_interrupted,
+                    is_error: raw_is_error && !was_interrupted,
+                    error_code: (raw_is_error && !was_interrupted)
+                        .then_some(HealthCode::AgentFailed),
+                    final_text,
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn codex_incremental_delta(&mut self, item_id: &str, full_text: &str, remove: bool) -> String {
+        let previous = if remove {
+            self.codex_item_text.remove(item_id).unwrap_or_default()
+        } else {
+            self.codex_item_text
+                .get(item_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let delta = if let Some(suffix) = full_text.strip_prefix(&previous) {
+            suffix.to_owned()
+        } else if full_text == previous {
+            String::new()
+        } else {
+            full_text.to_owned()
+        };
+        if !remove {
+            self.codex_item_text
+                .insert(item_id.to_owned(), full_text.to_owned());
+        }
+        delta
+    }
+
+    fn emit_codex_tool_start(
+        &mut self,
+        call_id: &str,
+        item: &Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) {
+        if !self.codex_started_tools.insert(call_id.to_owned()) {
+            return;
+        }
+        match item["type"].as_str() {
+            Some("command_execution") => {
+                let cmd = item["command"].as_str().unwrap_or_default();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Shell,
+                    name: "command_execution".into(),
+                    summary: format!("shell: {}", preview_text(cmd)),
+                    raw_input: json!({ "command": cmd }),
+                });
+            }
+            Some("file_change") => {
+                let first_path = item["changes"]
+                    .as_array()
+                    .and_then(|c| c.first())
+                    .and_then(|c| c["path"].as_str())
+                    .unwrap_or("files");
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Edit,
+                    name: "file_change".into(),
+                    summary: format!("Edit: {first_path}"),
+                    raw_input: item.clone(),
+                });
+            }
+            Some("mcp_tool_call") => {
+                let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_owned();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Mcp,
+                    summary: summarize_tool(&tool, &item["arguments"]),
+                    name: tool,
+                    raw_input: item["arguments"].clone(),
+                });
+            }
+            Some("collab_tool_call") => {
+                let tool = item["tool"].as_str().unwrap_or("collab").to_owned();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Subagent,
+                    summary: format!("subagent: {tool}"),
+                    name: tool,
+                    raw_input: item.clone(),
+                });
+            }
+            Some("web_search") => {
+                let query = item["query"].as_str().unwrap_or_default();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Web,
+                    name: "web_search".into(),
+                    summary: format!("web_search: {}", preview_text(query)),
+                    raw_input: json!({ "query": query }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_codex(&mut self, event: &Value, interrupted: bool) -> Vec<NormalizedEvent> {
+        let mut out = Vec::new();
+        match event["type"].as_str() {
+            Some("thread.started") => {
+                if let Some(thread_id) = event["thread_id"].as_str() {
+                    out.push(NormalizedEvent::SessionStarted {
+                        session_id: thread_id.to_owned(),
+                        model: None,
+                    });
+                }
+            }
+            Some("item.started") => {
+                let item = &event["item"];
+                let call_id = item["id"].as_str().unwrap_or_default();
+                match item["type"].as_str() {
+                    Some("reasoning") => {
+                        let initial = item["text"].as_str().unwrap_or_default();
+                        let delta = self.codex_incremental_delta(call_id, initial, false);
+                        out.push(NormalizedEvent::ThinkingDelta(delta));
+                    }
+                    Some("agent_message") => {
+                        if let Some(text) = item["text"].as_str().filter(|t| !t.is_empty()) {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
+                        }
+                    }
+                    Some(
+                        "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                        | "web_search",
+                    ) => {
+                        self.emit_codex_tool_start(call_id, item, &mut out);
+                    }
+                    _ => {}
+                }
+            }
+            Some("item.updated") => {
+                let item = &event["item"];
+                let call_id = item["id"].as_str().unwrap_or_default();
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                out.push(NormalizedEvent::ThinkingDelta(delta));
+                            }
+                        }
+                    }
+                    Some(
+                        "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                        | "web_search",
+                    ) => {
+                        self.emit_codex_tool_start(call_id, item, &mut out);
+                    }
+                    _ => {}
+                }
+            }
+            Some("item.completed") => {
+                let item = &event["item"];
+                let call_id = item["id"].as_str().unwrap_or_default().to_owned();
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(&call_id, text, true);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(&call_id, text, true);
+                            if !delta.is_empty() {
+                                out.push(NormalizedEvent::ThinkingDelta(delta));
+                            }
+                        }
+                    }
+                    Some("command_execution") => {
+                        self.emit_codex_tool_start(&call_id, item, &mut out);
+                        self.codex_started_tools.remove(&call_id);
+                        let status = item["status"].as_str().unwrap_or("completed");
+                        let exit_code = item["exit_code"].as_i64().map(|c| c as i32);
+                        let output = item["aggregated_output"].as_str().unwrap_or_default();
+                        out.push(NormalizedEvent::ToolEnd {
+                            call_id,
+                            ok: status == "completed" && exit_code.unwrap_or(0) == 0,
+                            output_preview: preview_text(output),
+                            exit_code,
+                        });
+                    }
+                    Some("file_change") => {
+                        let had_tool_card = self.codex_started_tools.remove(&call_id);
+                        let mut changed_paths = Vec::new();
+                        if let Some(changes) = item["changes"].as_array() {
+                            for change in changes {
+                                if let Some(path) = change["path"].as_str() {
+                                    changed_paths.push(path.to_owned());
+                                    let kind = match change["kind"].as_str() {
+                                        Some("add") => PatchKind::Add,
+                                        Some("delete") => PatchKind::Delete,
+                                        _ => PatchKind::Update,
+                                    };
+                                    out.push(NormalizedEvent::FileChanged {
+                                        path: path.to_owned(),
+                                        kind,
+                                    });
+                                }
+                            }
+                        }
+                        if had_tool_card {
+                            let ok = item["status"].as_str().unwrap_or("completed") != "failed";
+                            out.push(NormalizedEvent::ToolEnd {
+                                call_id,
+                                ok,
+                                output_preview: changed_paths.join(", "),
+                                exit_code: None,
+                            });
+                        }
+                    }
+                    Some("mcp_tool_call" | "collab_tool_call" | "web_search") => {
+                        self.emit_codex_tool_start(&call_id, item, &mut out);
+                        self.codex_started_tools.remove(&call_id);
+                        let ok = item["error"].is_null() && item["status"] != "failed";
+                        let preview = item["error"]
+                            .as_str()
+                            .or_else(|| item["result"].as_str())
+                            .map(preview_text)
+                            .unwrap_or_else(|| {
+                                if item["result"].is_null() {
+                                    String::new()
+                                } else {
+                                    preview_text(&item["result"].to_string())
+                                }
+                            });
+                        out.push(NormalizedEvent::ToolEnd {
+                            call_id,
+                            ok,
+                            output_preview: preview,
+                            exit_code: None,
+                        });
+                    }
+                    Some("error") => {
+                        if let Some(msg) = item["message"].as_str() {
+                            out.push(NormalizedEvent::StderrLine(msg.to_owned()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("turn.completed") => {
+                self.codex_item_text.clear();
+                self.codex_started_tools.clear();
+                let usage_val = &event["usage"];
+                if usage_val.is_object() {
+                    out.push(NormalizedEvent::UsageDelta {
+                        input: usage_val["input_tokens"].as_u64().unwrap_or(0),
+                        cached_read: usage_val["cached_input_tokens"].as_u64().unwrap_or(0),
+                        output: usage_val["output_tokens"].as_u64().unwrap_or(0),
+                        cost_usd: None,
+                        context_used: None,
+                    });
+                }
+                out.push(NormalizedEvent::TurnFinished {
+                    interrupted,
+                    is_error: false,
+                    error_code: None,
+                    final_text: std::mem::take(&mut self.final_text),
+                });
+            }
+            Some("turn.failed" | "error") => {
+                let msg = event["error"]["message"]
+                    .as_str()
+                    .or_else(|| event["message"].as_str())
+                    .unwrap_or("Codex turn failed");
+                out.push(NormalizedEvent::StderrLine(msg.to_owned()));
+                if event["type"] == "turn.failed" {
+                    self.codex_item_text.clear();
+                    self.codex_started_tools.clear();
+                    out.push(NormalizedEvent::TurnFinished {
+                        interrupted,
+                        is_error: !interrupted,
+                        error_code: (!interrupted).then_some(HealthCode::AgentFailed),
+                        final_text: std::mem::take(&mut self.final_text),
+                    });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn parse_gemini(&mut self, event: &Value, interrupted: bool) -> Vec<NormalizedEvent> {
+        let mut out = Vec::new();
+        match event["type"].as_str() {
+            Some("init") => {
+                self.gemini_streamed_delta = false;
+                if let Some(session_id) = event["session_id"].as_str() {
+                    out.push(NormalizedEvent::SessionStarted {
+                        session_id: session_id.to_owned(),
+                        model: event["model"].as_str().map(str::to_owned),
+                    });
+                }
+            }
+            Some("thought" | "thinking") => {
+                if let Some(thought) = event["content"]
+                    .as_str()
+                    .or_else(|| event["text"].as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                }
+            }
+            Some("message") if event["role"] == "assistant" => {
+                if let Some(thought) = event["thought"].as_str().filter(|t| !t.is_empty()) {
+                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                }
+                if let Some(text) = event["content"].as_str().filter(|t| !t.is_empty()) {
+                    let is_delta = event["delta"] == true;
+                    if is_delta {
+                        self.gemini_streamed_delta = true;
+                        self.final_text.push_str(text);
+                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                    } else if !self.gemini_streamed_delta || !self.final_text.ends_with(text) {
+                        self.final_text.push_str(text);
+                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let call_id = event["tool_id"].as_str().unwrap_or_default().to_owned();
+                let name = event["tool_name"].as_str().unwrap_or("tool").to_owned();
+                let input = event["parameters"].clone();
+                self.tool_names_by_id
+                    .insert(call_id.clone(), (name.clone(), input.clone()));
+                out.push(NormalizedEvent::ToolStart {
+                    call_id,
+                    kind: classify_tool_kind(&name),
+                    summary: summarize_tool(&name, &input),
+                    name,
+                    raw_input: input,
+                });
+            }
+            Some("tool_result") => {
+                let call_id = event["tool_id"].as_str().unwrap_or_default().to_owned();
+                let ok = event["status"] == "success";
+                let output = event["output"]
+                    .as_str()
+                    .or_else(|| event["error"]["message"].as_str())
+                    .unwrap_or_default();
+                out.push(NormalizedEvent::ToolEnd {
+                    call_id: call_id.clone(),
+                    ok,
+                    output_preview: preview_text(output),
+                    exit_code: None,
+                });
+                if ok {
+                    if let Some((name, input)) = self.tool_names_by_id.get(&call_id) {
+                        if let Some(path) = input
+                            .get("file_path")
+                            .or_else(|| input.get("path"))
+                            .and_then(Value::as_str)
+                        {
+                            let kind = match classify_tool_kind(name) {
+                                ToolKind::Write => Some(PatchKind::Add),
+                                ToolKind::Edit => Some(PatchKind::Update),
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                out.push(NormalizedEvent::FileChanged {
+                                    path: path.to_owned(),
+                                    kind,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Some("error") => {
+                if let Some(msg) = event["message"].as_str() {
+                    out.push(NormalizedEvent::StderrLine(msg.to_owned()));
+                }
+            }
+            Some("result") => {
+                self.gemini_streamed_delta = false;
+                let stats = &event["stats"];
+                if stats.is_object() {
+                    out.push(NormalizedEvent::UsageDelta {
+                        input: stats["input_tokens"].as_u64().unwrap_or(0),
+                        cached_read: stats["cached"].as_u64().unwrap_or(0),
+                        output: stats["output_tokens"].as_u64().unwrap_or(0),
+                        cost_usd: None,
+                        context_used: None,
+                    });
+                }
+                let is_error = event["status"] != "success" && !interrupted;
+                out.push(NormalizedEvent::TurnFinished {
+                    interrupted,
+                    is_error,
+                    error_code: is_error.then_some(HealthCode::AgentFailed),
+                    final_text: std::mem::take(&mut self.final_text),
+                });
+            }
+            _ => {}
+        }
+        out
     }
 }
 
@@ -178,6 +1764,8 @@ struct Execution {
     clock: fn() -> usage::Tick,
     limits: LimitPolicy,
     mode: PermissionMode,
+    options: LaunchOptions,
+    active_pid: Arc<AtomicU32>,
 }
 
 impl Execution {
@@ -185,7 +1773,9 @@ impl Execution {
         &self,
         route: &Route,
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let now = (self.clock)();
         let (candidates, exclusions) =
@@ -195,7 +1785,15 @@ impl Execution {
             route.target,
         );
         if route.request.split {
-            return self.run_split(&route.request.units, ranked, &exclusions, sender, cancel);
+            return self.run_split(
+                &route.request.units,
+                ranked,
+                &exclusions,
+                sender,
+                norm_sender,
+                cancel,
+                control,
+            );
         }
         let preferred = route
             .preferred
@@ -216,7 +1814,9 @@ impl Execution {
             &route.request.units[0],
             Some(choice.reason),
             sender,
+            norm_sender,
             cancel,
+            control,
         )
     }
 
@@ -235,13 +1835,16 @@ impl Execution {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_split(
         &self,
         units: &[String],
         ranked: Result<Vec<Candidate>, String>,
         exclusions: &[routing::Exclusion],
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let ranked = routing::require_ranked(ranked, exclusions).map_err(io::Error::other)?;
         let plan = routing::allocate(units.len(), &ranked);
@@ -269,18 +1872,29 @@ impl Execution {
                 units.len(),
                 routing::describe(candidate)
             );
-            self.dispatch(candidate, unit, Some(reason), sender, cancel)?;
+            self.dispatch(
+                candidate,
+                unit,
+                Some(reason),
+                sender,
+                norm_sender,
+                cancel,
+                control,
+            )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         candidate: &Candidate,
         prompt: &str,
         reason: Option<String>,
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let index = candidate.profile;
         let profile = &self.profiles[index];
@@ -295,11 +1909,15 @@ impl Execution {
                 reason,
                 configuration: candidate.configuration.clone(),
                 mode: self.mode,
+                options: self.options.clone(),
             },
             &self.workspace,
             prompt.to_owned(),
             sender,
+            norm_sender,
             cancel,
+            control,
+            &self.active_pid,
             self.clock,
             None,
         )?;
@@ -319,7 +1937,9 @@ impl Execution {
                 &candidate.configuration,
                 prompt,
                 sender,
+                norm_sender,
                 cancel,
+                control,
             );
         };
         if cancel.load(Ordering::Relaxed) {
@@ -337,11 +1957,13 @@ impl Execution {
             prompt,
             &claim,
             sender,
+            norm_sender,
             cancel,
+            control,
         )
     }
 
-    fn handoff_target(&self, index: usize) -> Option<(usize, std::process::Command, Handoff)> {
+    fn handoff_target(&self, index: usize) -> Option<(usize, Command, Handoff)> {
         if let Some((to, command)) = self.alternate(index) {
             return Some((to, command, Handoff::SameProvider));
         }
@@ -355,13 +1977,16 @@ impl Execution {
         Some((to, command, Handoff::CrossProvider))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snooze_until_reset(
         &self,
         interrupted: (usize, &Checkpoint),
         configuration: &Configuration,
         prompt: &str,
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let (index, checkpoint) = interrupted;
         if !self.limits.auto_resume_on_reset {
@@ -391,7 +2016,9 @@ impl Execution {
             prompt,
             &claim,
             sender,
+            norm_sender,
             cancel,
+            control,
         )
     }
 
@@ -414,13 +2041,16 @@ impl Execution {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resume(
         &self,
         index: usize,
         prompt: &str,
         claim: Claim,
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let (to, profile) = self
             .profiles
@@ -443,23 +2073,30 @@ impl Execution {
             prompt,
             &claim,
             sender,
+            norm_sender,
             cancel,
+            control,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn continue_with(
         &self,
-        selection: (usize, usize, std::process::Command),
+        selection: (usize, usize, Command),
         configuration: &Configuration,
         prompt: &str,
         claim: &Claim,
         sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let (index, to, command) = selection;
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let mut options = self.options.clone();
+        options.resume_session = None;
         if run(
             Launch {
                 command,
@@ -468,11 +2105,15 @@ impl Execution {
                 reason: None,
                 configuration: configuration.clone(),
                 mode: self.mode,
+                options,
             },
             &self.workspace,
             prompt.to_owned(),
             sender,
+            norm_sender,
             cancel,
+            control,
+            &self.active_pid,
             self.clock,
             Some(Continuation {
                 claim,
@@ -489,7 +2130,7 @@ impl Execution {
         Ok(())
     }
 
-    fn alternate(&self, index: usize) -> Option<(usize, std::process::Command)> {
+    fn alternate(&self, index: usize) -> Option<(usize, Command)> {
         usage::alternates(&self.profiles, index, (self.clock)())
             .into_iter()
             .find_map(|candidate| {
@@ -504,12 +2145,13 @@ impl Execution {
 }
 
 struct Launch {
-    command: std::process::Command,
+    command: Command,
     profile: Profile,
     index: usize,
     reason: Option<String>,
     configuration: Configuration,
     mode: PermissionMode,
+    options: LaunchOptions,
 }
 
 struct Continuation<'a> {
@@ -518,12 +2160,16 @@ struct Continuation<'a> {
     profile: &'a Profile,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     launch: Launch,
-    workspace: &std::path::Path,
+    workspace: &Path,
     prompt: String,
     sender: &SyncSender<Event>,
+    norm_sender: &Sender<NormalizedEvent>,
     cancel: &AtomicBool,
+    control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
+    active_pid: &AtomicU32,
     clock: fn() -> usage::Tick,
     continuation: Option<Continuation<'_>>,
 ) -> io::Result<Option<Progress>> {
@@ -534,23 +2180,35 @@ fn run(
         reason,
         configuration,
         mode,
+        options,
     } = launch;
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
     command.args(configuration.arguments());
-    command.args(permissions::dispatch_arguments(profile.provider, mode));
+    command.args(build_provider_arguments(profile.provider, mode, &options));
     permissions::refuse_bypass(command.get_args()).map_err(io::Error::other)?;
     command
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let prompt = match &continuation {
         Some(next) => next.claim.start(next.profile, workspace, &prompt)?,
         None => prompt,
     };
-    let mut child = command.spawn()?;
+    process_tree::own_group(&mut command);
+    let mut child = command.spawn().inspect_err(|error| {
+        let code = classify_health(&[], Some(error));
+        let _ = norm_sender.send(NormalizedEvent::TurnFinished {
+            interrupted: false,
+            is_error: true,
+            error_code: Some(code),
+            final_text: error.to_string(),
+        });
+    })?;
+    let child_pid = child.id();
+    active_pid.store(child_pid, Ordering::Release);
     if let Some(next) = continuation {
         let _ = sender.send(Event::Continuing {
             from: next.from,
@@ -558,40 +2216,170 @@ fn run(
         });
     }
     let stdout = child.stdout.take().expect("mission stdout is piped");
+    let stderr = child.stderr.take().expect("mission stderr is piped");
     let stdout_sender = sender.clone();
+    let stdout_norm = norm_sender.clone();
+    let stderr_norm = norm_sender.clone();
     let _ = sender.send(Event::Running {
         profile: index,
         reason,
     });
     let limited = Arc::new(AtomicBool::new(false));
     let output_limit = Arc::clone(&limited);
-    let reader =
-        thread::spawn(move || read_output(&profile, stdout, &stdout_sender, &output_limit, clock));
+    let reader_cancel = Arc::new(AtomicBool::new(false));
+    let output_cancel = Arc::clone(&reader_cancel);
+    let stderr_cancel = Arc::clone(&reader_cancel);
+    let policy = options.policy.clone();
+    let persistent_claude = profile.provider == Provider::Claude && options.persistent_stdio;
+
+    let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stderr_collect = Arc::clone(&stderr_lines);
+    let stderr_reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if stderr_cancel.load(Ordering::Acquire) {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let _ = stderr_norm.send(NormalizedEvent::StderrLine(trimmed.to_owned()));
+            let mut guard = stderr_collect
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.len() >= STDERR_TAIL_LIMIT {
+                guard.remove(0);
+            }
+            guard.push(trimmed.to_owned());
+        }
+    });
+
     let mut stdin = child.stdin.take().expect("mission stdin is piped");
-    let writer = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
+    let (writer, control_handle) = if persistent_claude {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        *control.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctrl_tx);
+        let handle = thread::spawn(move || -> io::Result<()> {
+            writeln!(stdin, "{}", claude_user_turn_json(&prompt))?;
+            stdin.flush()?;
+            for msg in ctrl_rx {
+                match msg {
+                    ControlMessage::Interrupt => {
+                        let req_id = uuid::Uuid::new_v4().to_string();
+                        let _ = writeln!(stdin, "{}", claude_interrupt_request_json(&req_id));
+                        let _ = stdin.flush();
+                    }
+                    ControlMessage::PermissionResponse {
+                        req_id,
+                        allow,
+                        steer_msg,
+                    } => {
+                        let _ = writeln!(
+                            stdin,
+                            "{}",
+                            claude_permission_response_json(&req_id, allow, steer_msg.as_deref())
+                        );
+                        let _ = stdin.flush();
+                    }
+                }
+            }
+            Ok(())
+        });
+        (handle, true)
+    } else {
+        let handle = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
+        (handle, false)
+    };
+
+    let reader_control = Arc::clone(control);
+    let reader = thread::spawn(move || {
+        read_output(
+            &profile,
+            stdout,
+            &stdout_sender,
+            &stdout_norm,
+            &output_limit,
+            &output_cancel,
+            &policy,
+            persistent_claude.then_some(reader_control),
+            clock,
+        )
+    });
+
     let status = loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Acquire) {
+            reader_cancel.store(true, Ordering::Release);
+            if control_handle {
+                if let Some(tx) = control
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    let _ = tx.send(ControlMessage::Interrupt);
+                }
+                for _ in 0..10 {
+                    if child.try_wait()?.is_some() {
+                        break;
+                    }
+                    thread::sleep(CANCEL_POLL);
+                }
+            }
+            active_pid.store(0, Ordering::Release);
+            process_tree::kill_tree(child_pid);
             let _ = child.kill();
-            child.wait()?;
+            let _ = child.wait();
+            control
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let _ = norm_sender.send(NormalizedEvent::TurnFinished {
+                interrupted: true,
+                is_error: false,
+                error_code: None,
+                final_text: String::new(),
+            });
             return Ok(None);
         }
         if limited.load(Ordering::Acquire) {
+            active_pid.store(0, Ordering::Release);
+            process_tree::kill_tree(child_pid);
             let _ = child.kill();
             break child.wait()?;
         }
         if let Some(status) = child.try_wait()? {
+            active_pid.store(0, Ordering::Release);
             break status;
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(CANCEL_POLL);
     };
+    control
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
     let (progress, completed) = reader
         .join()
         .map_err(|_| io::Error::other("Mission output reader stopped"))??;
+    let _ = stderr_reader.join();
     if limited.load(Ordering::Acquire) {
         return Ok((!completed).then_some(progress));
     }
     if !status.success() {
-        return Err(io::Error::other(format!("Provider exited with {status}")));
+        let captured = stderr_lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let code = classify_health(&captured, None);
+        let detail = if captured.is_empty() {
+            format!("Provider exited with {status}")
+        } else {
+            format!("Provider exited with {status}: {}", captured.join(" | "))
+        };
+        let _ = norm_sender.send(NormalizedEvent::TurnFinished {
+            interrupted: false,
+            is_error: true,
+            error_code: Some(code),
+            final_text: detail.clone(),
+        });
+        return Err(io::Error::other(detail));
     }
     writer
         .join()
@@ -629,21 +2417,36 @@ pub(crate) fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
         (Provider::Codex, Some("item.completed")) if event["item"]["type"] == "agent_message" => {
             event["item"]["text"].as_str().into_iter().collect()
         }
+        (Provider::Gemini, Some("message")) if event["role"] == "assistant" => {
+            event["content"].as_str().into_iter().collect()
+        }
         _ => Vec::new(),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_output(
     profile: &Profile,
     stdout: impl io::Read,
     sender: &SyncSender<Event>,
+    norm_sender: &Sender<NormalizedEvent>,
     limited: &AtomicBool,
+    cancel: &AtomicBool,
+    policy: &PermissionPolicy,
+    control: Option<Arc<Mutex<Option<Sender<ControlMessage>>>>>,
     clock: fn() -> usage::Tick,
 ) -> io::Result<(Progress, bool)> {
     let mut progress = Progress::default();
     let mut completed = false;
+    let mut parser = EventParser::new(profile.provider);
     for line in BufReader::new(stdout).lines() {
+        if cancel.load(Ordering::Acquire) {
+            return Ok((progress, completed));
+        }
         let line = line?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok((progress, completed));
+        }
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -656,6 +2459,7 @@ fn read_output(
                     && event["is_error"] == false
             }
             Provider::Codex => event["type"] == "turn.completed",
+            Provider::Gemini => event["type"] == "result" && event["status"] == "success",
         };
         let limit = match profile.provider {
             Provider::Claude => Usage::observe_claude(profile, &event, observed)?,
@@ -663,10 +2467,57 @@ fn read_output(
                 Usage::record_codex_limit(profile, observed)?;
                 true
             }
-            Provider::Codex => false,
+            Provider::Codex | Provider::Gemini => false,
         };
         if limit {
             limited.store(true, Ordering::Release);
+        }
+        for normalized in parser.parse_value(&event, false, Some(policy)) {
+            if let (
+                NormalizedEvent::PermissionAsked {
+                    ref req_id,
+                    ref tool,
+                    ref input,
+                    ..
+                },
+                Some(ctrl),
+            ) = (&normalized, &control)
+            {
+                let resolved = policy.evaluate(tool, &tool_resource(tool, input), input);
+                match resolved.effect {
+                    PermissionEffect::Allow => {
+                        if let Some(tx) =
+                            ctrl.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
+                        {
+                            let _ = tx.send(ControlMessage::PermissionResponse {
+                                req_id: req_id.clone(),
+                                allow: true,
+                                steer_msg: None,
+                            });
+                        }
+                        continue;
+                    }
+                    PermissionEffect::Deny => {
+                        if let Some(tx) =
+                            ctrl.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
+                        {
+                            let _ = tx.send(ControlMessage::PermissionResponse {
+                                req_id: req_id.clone(),
+                                allow: false,
+                                steer_msg: resolved.reason.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    PermissionEffect::Ask => {}
+                }
+            }
+            let _ = norm_sender.send(normalized);
+        }
+        if profile.provider == Provider::Claude && event["type"] == "result" {
+            if let Some(ctrl) = &control {
+                ctrl.lock().unwrap_or_else(PoisonError::into_inner).take();
+            }
         }
         for text in output_text(profile.provider, &event) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -704,6 +2555,12 @@ fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
             }
             _ => {}
         },
+        (Provider::Gemini, Some("message")) if event["role"] == "assistant" => {
+            progress.assistant_messages += 1;
+        }
+        (Provider::Gemini, Some("tool_result")) if event["status"] == "success" => {
+            progress.completed_tool_events += 1;
+        }
         _ => {}
     }
 }
@@ -722,6 +2579,439 @@ fn codex_limit(event: &Value) -> bool {
             });
     }
     false
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[test]
+    fn builds_resume_and_persistent_arguments_for_all_three_providers() {
+        let options = LaunchOptions {
+            resume_session: Some("sess-123".into()),
+            mcp_config: Some(PathBuf::from("/tmp/mcp.json")),
+            extra_args: vec![],
+            policy: PermissionPolicy::for_mode(PermissionMode::WorkspaceAuto),
+            persistent_stdio: true,
+        };
+        let claude =
+            build_provider_arguments(Provider::Claude, PermissionMode::WorkspaceAuto, &options);
+        assert!(claude.contains(&"--input-format".to_owned()));
+        assert!(claude.contains(&"--permission-prompt-tool".to_owned()));
+        assert!(claude.contains(&"stdio".to_owned()));
+        assert!(claude
+            .windows(2)
+            .any(|pair| pair == ["--resume", "sess-123"]));
+        assert!(claude
+            .windows(2)
+            .any(|pair| pair == ["--mcp-config", "/tmp/mcp.json"]));
+
+        let codex =
+            build_provider_arguments(Provider::Codex, PermissionMode::WorkspaceAuto, &options);
+        assert_eq!(codex[0], "exec");
+        assert_eq!(codex[1], "resume");
+        assert!(codex.contains(&"sess-123".to_owned()));
+        assert_eq!(codex.last().map(String::as_str), Some("-"));
+
+        let gemini =
+            build_provider_arguments(Provider::Gemini, PermissionMode::WorktreeAuto, &options);
+        assert!(gemini.windows(2).any(|pair| pair == ["-o", "stream-json"]));
+        assert!(gemini
+            .windows(2)
+            .any(|pair| pair == ["--approval-mode", "yolo"]));
+        assert!(gemini
+            .windows(2)
+            .any(|pair| pair == ["--resume", "sess-123"]));
+    }
+
+    #[test]
+    fn parses_claude_codex_and_gemini_normalized_events_and_diffs_cumulative_cost() {
+        let mut claude = EventParser::new(Provider::Claude);
+        let init = claude.parse_value(
+            &json!({"type":"system","subtype":"init","session_id":"c-1","model":"claude-opus-4"}),
+            false,
+            None,
+        );
+        assert_eq!(
+            init,
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "c-1".into(),
+                model: Some("claude-opus-4".into()),
+            }]
+        );
+
+        let perm = claude.parse_value(
+            &json!({
+                "type":"control_request",
+                "request_id":"req-9",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"git push --force"}}
+            }),
+            false,
+            None,
+        );
+        assert!(matches!(
+            &perm[0],
+            NormalizedEvent::PermissionAsked { req_id, prod_gate_reason: Some(_), .. } if req_id == "req-9"
+        ));
+
+        let turn1 = claude.parse_value(
+            &json!({"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.10,"result":"done"}),
+            false,
+            None,
+        );
+        assert!(matches!(
+            &turn1[0],
+            NormalizedEvent::UsageDelta { cost_usd: Some(c), .. } if (*c - 0.10).abs() < 1e-6
+        ));
+        let turn2 = claude.parse_value(
+            &json!({"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0.15}),
+            true,
+            None,
+        );
+        assert!(matches!(
+            &turn2[0],
+            NormalizedEvent::UsageDelta { cost_usd: Some(c), .. } if (*c - 0.05).abs() < 1e-6
+        ));
+        assert!(matches!(
+            &turn2[1],
+            NormalizedEvent::TurnFinished {
+                interrupted: true,
+                is_error: false,
+                ..
+            }
+        ));
+
+        let mut codex = EventParser::new(Provider::Codex);
+        let started = codex.parse_value(
+            &json!({"type":"thread.started","thread_id":"t-42"}),
+            false,
+            None,
+        );
+        assert_eq!(
+            started,
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "t-42".into(),
+                model: None,
+            }]
+        );
+        let changed = codex.parse_value(
+            &json!({"type":"item.completed","item":{"id":"i1","type":"file_change","changes":[{"path":"src/lib.rs","kind":"update"}],"status":"completed"}}),
+            false,
+            None,
+        );
+        assert_eq!(
+            changed,
+            vec![NormalizedEvent::FileChanged {
+                path: "src/lib.rs".into(),
+                kind: PatchKind::Update,
+            }]
+        );
+
+        let mut gemini = EventParser::new(Provider::Gemini);
+        let g_init = gemini.parse_value(
+            &json!({"type":"init","session_id":"g-7","model":"gemini-2.5-pro"}),
+            false,
+            None,
+        );
+        assert_eq!(
+            g_init,
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "g-7".into(),
+                model: Some("gemini-2.5-pro".into()),
+            }]
+        );
+        let g_msg = gemini.parse_value(
+            &json!({"type":"message","role":"assistant","content":"Hello from Gemini","delta":true}),
+            false,
+            None,
+        );
+        assert_eq!(
+            g_msg,
+            vec![NormalizedEvent::TextDelta("Hello from Gemini".into())]
+        );
+    }
+
+    #[test]
+    fn encodes_claude_stdio_interrupt_and_permission_control_messages() {
+        let irq: Value = serde_json::from_str(&claude_interrupt_request_json("irq-1")).unwrap();
+        assert_eq!(irq["type"], "control_request");
+        assert_eq!(irq["request"]["subtype"], "interrupt");
+
+        let allow: Value =
+            serde_json::from_str(&claude_permission_response_json("r-1", true, None)).unwrap();
+        assert_eq!(allow["response"]["response"]["behavior"], "allow");
+
+        let deny: Value = serde_json::from_str(&claude_permission_response_json(
+            "r-2",
+            false,
+            Some("Use --dry-run instead"),
+        ))
+        .unwrap();
+        assert_eq!(deny["response"]["response"]["behavior"], "deny");
+        assert_eq!(
+            deny["response"]["response"]["message"],
+            "Use --dry-run instead"
+        );
+    }
+
+    #[test]
+    fn classifies_health_codes_accurately() {
+        assert_eq!(
+            classify_health(
+                &[],
+                Some(&io::Error::new(io::ErrorKind::NotFound, "no bin"))
+            ),
+            HealthCode::AgentMissing
+        );
+        assert_eq!(
+            classify_health(
+                &[],
+                Some(&io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            ),
+            HealthCode::AgentBlocked
+        );
+        assert_eq!(
+            classify_health(&["Error: invalid_grant OAuth token expired".into()], None),
+            HealthCode::AgentAuth
+        );
+        assert_eq!(
+            classify_health(&["fatal: disk full".into()], None),
+            HealthCode::AgentFailed
+        );
+    }
+
+    #[test]
+    fn process_tree_kill_terminates_shell_and_grandchild_cleanly() {
+        let mut command = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "ping", "-n", "20", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 20"]);
+            cmd
+        };
+        let mut child = process_tree::own_group(&mut command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        thread::sleep(Duration::from_millis(120));
+        let started = std::time::Instant::now();
+        process_tree::kill_tree(child.id());
+        let _ = child.wait().unwrap();
+        let remaining: Vec<String> = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+        let _ = remaining;
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parses_realistic_claude_partial_stream_with_thinking_write_bash_and_text_without_duplicates()
+    {
+        let stream = [
+            json!({"type":"system","subtype":"init","session_id":"sess-gridfall","model":"claude-opus-4-6"}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan the HTML5 canvas game."}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_1","content":[
+                {"type":"thinking","thinking":"Plan the HTML5 canvas game."}
+            ]}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_write","name":"Write","input":{}}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"C:\\\\Users\\\\j\\\\gridfall.html\","}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"content\":\"<!doctype html>\"}"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":1}}),
+            json!({"type":"assistant","message":{"id":"msg_1","content":[
+                {"type":"thinking","thinking":"Plan the HTML5 canvas game."},
+                {"type":"tool_use","id":"toolu_write","name":"Write","input":{"file_path":"C:\\Users\\j\\gridfall.html","content":"<!doctype html>"}}
+            ]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_write","content":"File created successfully","is_error":false}]}}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{}}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"start C:\\\\Users\\\\j\\\\gridfall.html\"}"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_2","content":[
+                {"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"start C:\\Users\\j\\gridfall.html"}}
+            ]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":null,"is_error":false}]},"tool_use_result":{"stdout":"","stderr":"Launched browser"}}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_3"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Built "}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Gridfall!"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_3","content":[{"type":"text","text":"Built Gridfall!"}]}}),
+            json!({"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.04,"result":"Built Gridfall!"}),
+        ];
+
+        let mut parser = EventParser::new(Provider::Claude);
+        let mut events = Vec::new();
+        for item in &stream {
+            events.extend(parser.parse_value(item, false, None));
+        }
+
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_text, "Plan the HTML5 canvas game.");
+
+        let write_starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ToolStart {
+                    call_id, summary, ..
+                } if call_id == "toolu_write" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            write_starts,
+            ["Write", "Write: C:\\Users\\j\\gridfall.html"]
+        );
+
+        let bash_starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ToolStart {
+                    call_id, summary, ..
+                } if call_id == "toolu_bash" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bash_starts,
+            ["Bash", "Bash: start C:\\Users\\j\\gridfall.html"]
+        );
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd {
+                call_id,
+                ok: true,
+                output_preview,
+                ..
+            } if call_id == "toolu_write" && output_preview == "File created successfully"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd {
+                call_id,
+                ok: true,
+                output_preview,
+                ..
+            } if call_id == "toolu_bash" && output_preview == "Launched browser"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::FileChanged { path, kind: PatchKind::Add }
+            if path == "C:\\Users\\j\\gridfall.html"
+        )));
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, "Built Gridfall!");
+    }
+
+    #[test]
+    fn parses_codex_incremental_updates_and_gemini_deltas_without_duplication() {
+        let mut codex = EventParser::new(Provider::Codex);
+        let codex_stream = [
+            json!({"type":"thread.started","thread_id":"th-9"}),
+            json!({"type":"item.started","item":{"id":"r1","type":"reasoning","text":"Check"}}),
+            json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"Check files"}}),
+            json!({"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"Check files."}}),
+            json!({"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test"}}),
+            json!({"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test","aggregated_output":"ok","exit_code":0,"status":"completed"}}),
+            json!({"type":"item.started","item":{"id":"f1","type":"file_change","changes":[{"path":"src/app.rs","kind":"update"}]}}),
+            json!({"type":"item.completed","item":{"id":"f1","type":"file_change","changes":[{"path":"src/app.rs","kind":"update"}],"status":"completed"}}),
+            json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"All "}}),
+            json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"All green!"}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}),
+        ];
+        let mut codex_events = Vec::new();
+        for item in &codex_stream {
+            codex_events.extend(codex.parse_value(item, false, None));
+        }
+        let reasoning: String = codex_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "Check files.");
+        let msg: String = codex_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msg, "All green!");
+        assert!(codex_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, .. } if call_id == "c1")));
+        assert!(codex_events.iter().any(
+            |e| matches!(e, NormalizedEvent::ToolEnd { call_id, ok: true, .. } if call_id == "c1")
+        ));
+        assert!(codex_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, .. } if call_id == "f1")));
+        assert!(codex_events.iter().any(
+            |e| matches!(e, NormalizedEvent::ToolEnd { call_id, ok: true, .. } if call_id == "f1")
+        ));
+
+        let mut gemini = EventParser::new(Provider::Gemini);
+        let gemini_stream = [
+            json!({"type":"init","session_id":"gem-1","model":"gemini-2.5-pro"}),
+            json!({"type":"thought","content":"Inspect workspace"}),
+            json!({"type":"tool_use","tool_id":"gt1","tool_name":"write_file","parameters":{"file_path":"game.html"}}),
+            json!({"type":"tool_result","tool_id":"gt1","status":"success","output":"Wrote game.html"}),
+            json!({"type":"message","role":"assistant","content":"Done ","delta":true}),
+            json!({"type":"message","role":"assistant","content":"now.","delta":true}),
+            json!({"type":"message","role":"assistant","content":"Done now.","delta":false}),
+            json!({"type":"result","status":"success","stats":{"input_tokens":20,"cached":0,"output_tokens":8}}),
+        ];
+        let mut gem_events = Vec::new();
+        for item in &gemini_stream {
+            gem_events.extend(gemini.parse_value(item, false, None));
+        }
+        let gem_text: String = gem_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gem_text, "Done now.");
+        assert!(gem_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ThinkingDelta(t) if t == "Inspect workspace")));
+        assert!(gem_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, summary, .. } if call_id == "gt1" && summary == "write_file: game.html")));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::FileChanged {
+                path,
+                kind: PatchKind::Add
+            } if path == "game.html"
+        )));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -780,7 +3070,7 @@ if test "$1" = auth; then
     exit
 fi
 printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 if test "$profile" = first; then
     case "$prompt" in *"Keep the finished step") ;; *) exit 7 ;; esac
     printf 'done\n' >> completed
@@ -910,7 +3200,7 @@ for arg; do
     fi
 done
 printf '%s %s\n' "$profile" "$*" >> "$work/.git/arguments"
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 if ! test -f "$work/.git/limited"; then
     : > "$work/.git/limited"
     printf 'done\n' >> completed
@@ -1282,8 +3572,9 @@ fi
                 .unwrap();
             assert!(
                 child.status.success(),
-                "{}",
-                String::from_utf8_lossy(&child.stdout)
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
             );
             assert!(Claim::pending(&profiles, &workspace).unwrap().is_none());
             assert!(claim
@@ -1323,21 +3614,31 @@ fi
             Profile::named_fixture(&root, Provider::Claude, name, PathBuf::from(&executable))
         });
         let mut app = crate::App::live(workspace);
-        app.live.as_mut().unwrap().profiles = profiles.into();
+        let live = app.live.as_mut().unwrap();
+        live.profiles = profiles.into();
+        live.pending = Claim::pending(&live.profiles, &live.workspace).unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        let notice: String = (0..80).map(|x| buffer[(x, 22)].symbol()).collect();
-        assert!(notice.contains("Interrupted continuation pending"));
+        let notice: String = (0..80).map(|x| buffer[(x, 23)].symbol()).collect();
+        assert!(
+            notice.contains("Interrupted cont") && notice.contains("F4 Abandon"),
+            "{notice}"
+        );
         if std::env::var("AC_RECOVERY_TEST_ACTION").unwrap() == "abandon" {
             let button = app.live.as_ref().unwrap().abandon_area;
             app.click(button.x, button.y);
             assert!(app.notice.contains("abandoned"));
             return;
         }
-        app.input = "Keep the finished step".into();
-        app.click(app.send_area.x, app.send_area.y);
+        app.click(app.input_area.x + 1, app.input_area.y + 1);
+        assert!(app.editing);
+        app.composer.set_text("Keep the finished step");
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while app.mission_running() {
             assert!(std::time::Instant::now() < deadline);
@@ -1511,7 +3812,7 @@ case "$1" in
     -c) if test "$5" = login; then printf '%s\n' 'Logged in using ChatGPT' >&2; exit; fi ;;
 esac
 mkdir running.lock || exit 5
-prompt=$(cat)
+prompt=$(read_prompt "$@")
 profile=${CLAUDE_CONFIG_DIR##*/}
 test -n "$CLAUDE_CONFIG_DIR" || profile=${CODEX_HOME##*/}
 printf '%s|%s|%s\n' "$profile" "$*" "$prompt" >> starts

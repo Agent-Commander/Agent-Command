@@ -6,7 +6,10 @@ use crate::{
 };
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyEvent,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -75,16 +78,17 @@ impl Host for TerminalHost {
     }
 
     fn profiles(&self, root: &Path) -> io::Result<Vec<Profile>> {
-        auth::profiles(root)
+        auth::all_profiles(root)
     }
 
     fn signed_in(&self, profile: &Profile) -> bool {
-        profile.signed_in()
+        profile.detect_passive().logged_in
     }
 
     fn suspend(&mut self) -> io::Result<()> {
         execute!(
             io::stdout(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen,
             Show
@@ -126,7 +130,13 @@ impl Host for TerminalHost {
 
     fn restore(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        )
     }
 
     fn disconnect(&mut self, profile: &Profile) -> io::Result<()> {
@@ -154,6 +164,7 @@ pub(crate) enum Action {
     ConnectNew,
     CommanderProfile,
     CommanderMode,
+    ToggleProdGate,
     UpdateCheck,
     AutoResume,
     SnoozeMissions,
@@ -171,7 +182,7 @@ pub(crate) enum Action {
 }
 
 #[derive(Debug, Default)]
-struct Clis([Option<Found>; 2]);
+struct Clis([Option<Found>; 3]);
 
 impl Clis {
     fn located(host: Option<&dyn Host>) -> Self {
@@ -204,6 +215,7 @@ fn locate(host: &dyn Host, provider: Provider) -> Option<Found> {
 #[derive(Debug)]
 pub(crate) struct SettingsView {
     focus: usize,
+    scroll: usize,
     confirm: Option<usize>,
     clis: Clis,
     installing: Option<Provider>,
@@ -215,8 +227,8 @@ pub(crate) struct ConnectForm {
     pub(crate) origin: Origin,
     clis: Clis,
     installing: Option<Provider>,
-    chosen: [bool; 2],
-    signed_in: [bool; 2],
+    chosen: [bool; 3],
+    signed_in: [bool; 3],
     pub(crate) name: String,
     focus: usize,
     pub(crate) status: String,
@@ -236,17 +248,11 @@ pub(crate) enum Panel {
 }
 
 fn provider_slot(provider: Provider) -> usize {
-    match provider {
-        Provider::Claude => 0,
-        Provider::Codex => 1,
-    }
+    provider.slot()
 }
 
 fn provider_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "Claude Code",
-        Provider::Codex => "Codex CLI",
-    }
+    provider.title()
 }
 
 fn truncated(text: &str, width: usize) -> String {
@@ -314,12 +320,12 @@ fn button(label: impl AsRef<str>, action: Action) -> Segment {
 type Row = Vec<Segment>;
 
 impl ConnectForm {
-    fn new(origin: Origin, host: Option<&dyn Host>, signed_in: [bool; 2]) -> Self {
+    fn new(origin: Origin, host: Option<&dyn Host>, signed_in: [bool; 3]) -> Self {
         let mut form = Self {
             origin,
             clis: Clis::default(),
             installing: None,
-            chosen: [false; 2],
+            chosen: [false; 3],
             signed_in,
             name: String::new(),
             focus: 0,
@@ -384,7 +390,7 @@ impl ConnectForm {
     fn rows(&self, editing_name: bool, width: usize) -> Vec<Row> {
         let mut rows: Vec<Row> = vec![
             vec![text(
-                "Pick Claude, Codex or both. One provider is enough to continue.",
+                "Pick Claude, Codex, or Gemini. One provider is enough to continue.",
                 Tone::Muted,
             )],
             vec![],
@@ -493,6 +499,7 @@ impl SettingsView {
     fn new(host: Option<&dyn Host>) -> Self {
         Self {
             focus: 0,
+            scroll: 0,
             confirm: None,
             clis: Clis::located(host),
             installing: None,
@@ -511,7 +518,7 @@ impl App {
         self.panel = Some(Panel::Connect(form));
     }
 
-    fn signed_in_providers(&self) -> [bool; 2] {
+    fn signed_in_providers(&self) -> [bool; 3] {
         Provider::ALL.map(|provider| {
             self.live.as_ref().is_some_and(|live| {
                 live.profiles
@@ -566,15 +573,21 @@ impl App {
                 vec![Action::ConfirmInstall, Action::CancelInstall]
             }
             Some(Panel::Settings(view)) => {
-                let count = self.live.as_ref().map_or(0, |live| live.profiles.len());
-                let mut actions: Vec<Action> = (0..count)
-                    .flat_map(|index| [Action::Reconnect(index), Action::Disconnect(index)])
-                    .collect();
+                let mut actions: Vec<Action> = Vec::new();
+                if let Some(live) = &self.live {
+                    for (index, profile) in live.profiles.iter().enumerate() {
+                        actions.push(Action::Reconnect(index));
+                        if !profile.is_system_default() {
+                            actions.push(Action::Disconnect(index));
+                        }
+                    }
+                }
                 actions.extend(view.clis.missing().into_iter().map(Action::Install));
                 actions.extend([
                     Action::ConnectNew,
                     Action::CommanderProfile,
                     Action::CommanderMode,
+                    Action::ToggleProdGate,
                     Action::UpdateCheck,
                     Action::AutoResume,
                     Action::SnoozeMissions,
@@ -645,6 +658,8 @@ impl App {
             KeyCode::Esc => self.escape_panel(),
             KeyCode::Up | KeyCode::Left | KeyCode::BackTab => self.move_focus(false),
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => self.move_focus(true),
+            KeyCode::PageUp => self.panel_scroll(-6),
+            KeyCode::PageDown => self.panel_scroll(6),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(action) = self.focused_action() {
                     self.activate(action);
@@ -705,6 +720,16 @@ impl App {
         }
     }
 
+    pub(crate) fn panel_scroll(&mut self, delta: isize) {
+        if let Some(Panel::Settings(view)) = &mut self.panel {
+            if delta < 0 {
+                view.scroll = view.scroll.saturating_sub(delta.unsigned_abs());
+            } else {
+                view.scroll = view.scroll.saturating_add(delta as usize);
+            }
+        }
+    }
+
     fn escape_panel(&mut self) {
         if self.confirming() {
             return self.activate(Action::CancelDisconnect);
@@ -714,7 +739,10 @@ impl App {
         }
         match &self.panel {
             Some(Panel::Connect(_)) => self.activate(Action::Leave),
-            _ => self.panel = None,
+            _ => {
+                self.panel = None;
+                self.editing = true;
+            }
         }
     }
 
@@ -741,6 +769,11 @@ impl App {
                 self.set_commander_mode(mode);
                 let notice = std::mem::take(&mut self.notice);
                 self.set_panel_status(notice);
+            }
+            Action::ToggleProdGate => {
+                self.settings.prod_gate = !self.settings.prod_gate;
+                let state = on_off(self.settings.prod_gate);
+                self.save_setting(format!("ProdGate floor: {state}"));
             }
             Action::UpdateCheck => self.toggle_update_check(),
             Action::AutoResume => {
@@ -769,7 +802,10 @@ impl App {
                 let label = self.slot_label(self.settings.text_gen_profile.as_deref());
                 self.save_setting(format!("Text generation profile: {label}"));
             }
-            Action::Close => self.panel = None,
+            Action::Close => {
+                self.panel = None;
+                self.editing = true;
+            }
             Action::Toggle(provider) => self.toggle_provider(provider),
             Action::Name => {}
             Action::Connect => self.connect_chosen(),
@@ -907,7 +943,7 @@ impl App {
             form.status = if form.missing() {
                 "Rechecked PATH.".into()
             } else {
-                "Rechecked PATH: Claude and Codex found.".into()
+                "Rechecked PATH: Claude, Codex, and Gemini found.".into()
             };
         }
     }
@@ -919,10 +955,14 @@ impl App {
         match form.origin {
             Origin::Onboarding => {
                 self.panel = None;
+                self.editing = true;
                 self.notice = NO_PROVIDER_HINT.into();
             }
             Origin::Settings => self.open_settings(),
-            Origin::Direct => self.panel = None,
+            Origin::Direct => {
+                self.panel = None;
+                self.editing = true;
+            }
         }
     }
 
@@ -964,12 +1004,17 @@ impl App {
         let origin = form_origin(&self.panel);
         if connected && origin == Some(Origin::Onboarding) {
             self.panel = None;
+            self.editing = true;
+            self.show_welcome = false;
             self.notice = summary;
         } else if connected && origin == Some(Origin::Settings) {
             self.open_settings();
+            self.show_welcome = false;
             self.set_panel_status(summary);
         } else if connected {
             self.panel = None;
+            self.editing = true;
+            self.show_welcome = false;
             self.notice = summary;
         } else {
             self.set_panel_status(summary);
@@ -1255,32 +1300,48 @@ impl App {
     fn open_connect_for(&mut self, provider: Provider) {
         self.open_connect(Origin::Direct);
         if let Some(Panel::Connect(form)) = &mut self.panel {
-            form.chosen = [false; 2];
+            form.chosen = [false; 3];
         }
         self.toggle_provider(provider);
     }
 
     pub(crate) fn request_update(&mut self) {
-        let Some(latest) = self.update_available.clone() else {
-            self.notice = format!(
-                "Agent Command {} is up to date, or no newer release has been found yet.",
-                update::CURRENT
-            );
+        let latest = self
+            .update_available
+            .clone()
+            .or_else(|| self.update_state.available_version().map(str::to_owned));
+        let Some(latest) = latest else {
+            if self.host.is_some() && self.live.is_some() {
+                self.trigger_live_update_check();
+            } else {
+                self.notice = format!(
+                    "Agent Command {} is up to date, or no newer release has been found yet.",
+                    update::CURRENT
+                );
+            }
             return;
         };
         if let Some(blocker) = self.update_blocker() {
             self.notice = blocker.into();
             return;
         }
+        self.update_state = update::UpdateState::Downloading { pct: 10 };
         let host = self.host.as_mut().expect("checked by update_blocker");
         match host.suspend().and_then(|()| host.update(&latest)) {
             Ok(applied) => {
+                if let update::Applied::ReplacedInPlace { ref executable } = applied {
+                    self.relaunch_executable = Some(executable.clone());
+                }
                 self.exit_message = Some(update::finished_message(&latest, applied));
                 self.quit = true;
             }
             Err(error) => {
                 let restored = host.restore();
                 self.full_redraw = true;
+                self.update_state = update::UpdateState::Available {
+                    tag: format!("v{latest}"),
+                    current: update::CURRENT.to_owned(),
+                };
                 self.notice = format!(
                     "Update to {latest} failed: {error}. Click Update or press F6 to retry."
                 );
@@ -1378,7 +1439,7 @@ impl App {
                 let label_width = profile_label_width(profiles, width);
                 for (index, profile) in profiles.iter().enumerate() {
                     let active = signed_in.get(index).copied().unwrap_or(false);
-                    rows.push(vec![
+                    let mut row = vec![
                         text(
                             format!(
                                 "{:<label_width$}",
@@ -1392,9 +1453,14 @@ impl App {
                             text("○ signed out  ", Tone::Warn)
                         },
                         button("Reconnect", Action::Reconnect(index)),
-                        text(" ", Tone::Plain),
-                        button("Disconnect", Action::Disconnect(index)),
-                    ]);
+                    ];
+                    if profile.is_system_default() {
+                        row.push(text("  (system default)", Tone::Muted));
+                    } else {
+                        row.push(text(" ", Tone::Plain));
+                        row.push(button("Disconnect", Action::Disconnect(index)));
+                    }
+                    rows.push(row);
                 }
             }
         }
@@ -1441,6 +1507,10 @@ impl App {
                 Action::CommanderMode,
             ),
         ]);
+        rows.push(vec![
+            text("ProdGate floor       ", Tone::Plain),
+            button(on_off(self.settings.prod_gate), Action::ToggleProdGate),
+        ]);
         let mut updates = vec![
             text("Check for updates    ", Tone::Plain),
             button(
@@ -1479,6 +1549,7 @@ impl App {
             ),
             Tone::Muted,
         )]);
+        rows.push(vec![button("Close", Action::Close)]);
         rows
     }
 
@@ -1525,14 +1596,26 @@ impl App {
         };
         let status_rows = wrapped(&status, inner_width, STATUS_MAX_ROWS);
         let content_rows = rows.len() + status_rows.len() + 2;
-        let height = (content_rows as u16 + 2).min(area.height.saturating_sub(1));
+        let max_modal_h = area.height.saturating_sub(2).max(4);
+        let height = (content_rows as u16 + 2).min(max_modal_h);
         let modal = Rect::new(
             area.x + (area.width - width) / 2,
-            area.y + 1 + (area.height.saturating_sub(1) - height) / 2,
+            area.y + 1 + (max_modal_h.saturating_sub(height)) / 2,
             width,
             height,
         );
         let theme = self.theme.clone();
+        let backdrop = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        );
+        f.render_widget(Clear, backdrop);
+        f.render_widget(
+            Block::default().style(Style::default().bg(color(&theme.background))),
+            backdrop,
+        );
         f.render_widget(Clear, modal);
         f.render_widget(
             Block::bordered()
@@ -1561,21 +1644,50 @@ impl App {
             inner.height.saturating_sub(1),
         );
         let allowed = self.panel_actions();
+        let focused = self.focused_action();
+        let visible_h = usize::from(body.height).max(1);
+        let max_scroll = all_rows.len().saturating_sub(visible_h);
+        let scroll = if let Some(Panel::Settings(view)) = &mut self.panel {
+            if let Some(focused_row) = focused.and_then(|target| {
+                all_rows
+                    .iter()
+                    .position(|row| row.iter().any(|seg| seg.action == Some(target)))
+            }) {
+                if focused_row < view.scroll {
+                    view.scroll = focused_row;
+                } else if focused_row >= view.scroll + visible_h {
+                    view.scroll = focused_row + 1 - visible_h;
+                }
+            }
+            view.scroll = view.scroll.min(max_scroll);
+            view.scroll
+        } else {
+            0
+        };
         let painter = Painter {
-            focused: self.focused_action(),
+            focused,
             allowed: &allowed,
             theme: &theme,
         };
         let mut hits = Vec::new();
-        for (offset, row) in all_rows.iter().enumerate() {
+        for (offset, row) in all_rows.iter().skip(scroll).take(visible_h).enumerate() {
             let y = body.y + offset as u16;
             if y >= body.bottom() {
                 break;
             }
             hits.extend(painter.row(f, row, Rect::new(body.x, y, body.width, 1)));
         }
+        let footer_text = if max_scroll > 0 {
+            format!(
+                "{footer} · PgUp/PgDn scroll ({}/{})",
+                scroll + 1,
+                max_scroll + 1
+            )
+        } else {
+            footer.to_owned()
+        };
         let footer_area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
-        painter.row(f, &vec![text(footer, Tone::Muted)], footer_area);
+        painter.row(f, &vec![text(footer_text, Tone::Muted)], footer_area);
         self.panel_hits = hits;
     }
 }

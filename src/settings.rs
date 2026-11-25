@@ -10,10 +10,19 @@ use std::{
 pub(crate) const NO_UPDATE_CHECK: &str = "AGENT_COMMAND_NO_UPDATE_CHECK";
 const SETTINGS_FILE: &str = "settings.toml";
 const THEME_FILE: &str = "theme.toml";
+pub(crate) const SOUL_FILE: &str = "SOUL.md";
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct Settings {
+pub struct Settings {
     pub(crate) check_for_updates: bool,
     pub(crate) auto_resume_on_reset: bool,
     pub(crate) snooze_limited_missions: bool,
@@ -23,6 +32,10 @@ pub(crate) struct Settings {
     pub(crate) text_gen_profile: Option<String>,
     pub(crate) goal_turn_cap: u32,
     pub(crate) commander_permission: PermissionMode,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) prod_gate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) soul_path: Option<PathBuf>,
 }
 
 pub(crate) const DEFAULT_GOAL_TURN_CAP: u32 = 10;
@@ -38,6 +51,8 @@ impl Default for Settings {
             text_gen_profile: None,
             goal_turn_cap: DEFAULT_GOAL_TURN_CAP,
             commander_permission: PermissionMode::COMMANDER_DEFAULT,
+            prod_gate: true,
+            soul_path: None,
         }
     }
 }
@@ -89,13 +104,23 @@ pub(crate) fn launch_update_check(settings: &Settings, no_update_check: Option<&
     settings.check_for_updates && !forced_off(no_update_check)
 }
 
-fn config_directory() -> Option<PathBuf> {
+pub fn config_directory() -> Option<PathBuf> {
     let under = |variable: &str, suffix: &str| {
         env::var_os(variable).map(|base| PathBuf::from(base).join(suffix))
     };
     under("XDG_CONFIG_HOME", "agent-command")
         .or_else(|| under("APPDATA", "agent-command"))
         .or_else(|| under("HOME", ".config/agent-command"))
+}
+
+pub fn default_soul_path() -> Option<PathBuf> {
+    config_directory().map(|dir| dir.join(SOUL_FILE))
+}
+
+impl Settings {
+    pub fn effective_soul_path(&self) -> Option<PathBuf> {
+        self.soul_path.clone().or_else(default_soul_path)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -182,6 +207,7 @@ mod tests {
             text_gen_profile: Some("claude/light".into()),
             goal_turn_cap: 4,
             commander_permission: PermissionMode::ReadOnly,
+            ..Settings::default()
         };
         configured.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();

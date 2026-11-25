@@ -15,11 +15,16 @@ fn command_routes_to_ui_outside_checkout() {
     let status = Command::new(binary)
         .args(["--snapshot"])
         .arg(&path)
+        .env("COLUMNS", "120")
+        .env("LINES", "40")
         .current_dir(std::env::temp_dir())
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(std::fs::read_to_string(&path).unwrap().contains("#111419"));
+    let svg = std::fs::read_to_string(&path).unwrap();
+    assert!(svg.contains("#101011"));
+    assert!(svg.contains("agent-command"));
+    assert!(!svg.contains("PRIVATEER"));
     std::fs::remove_file(path).unwrap();
 }
 
@@ -166,9 +171,12 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(String::from_utf8_lossy(&reviewed.stderr).contains("no recorded changes"));
     let playtester = run(&["spawn", "quinn", "playtester"]);
     assert!(String::from_utf8_lossy(&playtester.stdout).contains("(playtester, read-only)"));
-    assert!(root
+    assert!(!root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
-        .is_dir());
+        .exists());
+    let canonical = base.canonicalize().unwrap().display().to_string();
+    let expected_dir = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    assert!(status.contains(expected_dir), "{status}");
     let diff = run(&["diff", "echo"]);
     assert!(!diff.status.success());
     assert!(String::from_utf8_lossy(&diff.stderr).contains("plain directory"));
@@ -184,6 +192,7 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(!run(&["settle", "echo"]).status.success());
     assert!(run(&["unsettle", "echo"]).status.success());
     assert!(run(&["remove", "echo"]).status.success());
+    assert!(base.is_dir());
     assert!(!run(&["status", "echo"]).status.success());
     assert!(!run(&["unknown"]).status.success());
     std::fs::remove_dir_all(root).unwrap();
@@ -219,7 +228,7 @@ fn triage_reports_json_without_a_terminal_and_never_prints_secrets() {
         .as_array()
         .is_some_and(|lines| !lines.is_empty()));
     let usage = Command::new(env!("CARGO_BIN_EXE_agent-command"))
-        .args(["triage", "--pipe", "gemini"])
+        .args(["triage", "--pipe", "unknown"])
         .output()
         .unwrap();
     assert!(!usage.status.success());
@@ -267,9 +276,10 @@ fn mcp_stdio_binary_answers_initialize_tools_and_refuses_traversal() {
     assert!(line(2).contains("delegate_task"));
     assert!(line(3).contains("-32602"));
     assert!(line(4).contains("\"isError\":false"));
-    assert!(root
+    assert!(!root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
-        .is_dir());
+        .exists());
+    assert!(base.is_dir());
     std::fs::remove_dir_all(root).unwrap();
 }
 

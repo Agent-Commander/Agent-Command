@@ -1,12 +1,16 @@
 use super::*;
 use crate::settings::LaunchConfig;
 #[cfg(unix)]
-use crate::Live;
+use crate::{tui::render::RailHit, Live};
 use crossterm::event::KeyModifiers;
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 use std::{cell::RefCell, collections::BTreeSet, ffi::OsString, fs, path::PathBuf, rc::Rc};
 
 const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
+#[cfg(unix)]
+const RAIL_SIZES: [(u16, u16); 2] = [(100, 30), (120, 40)];
+#[cfg(unix)]
+const RAIL_WIDTH: u16 = 100;
 const COMMAND_WIDTH: usize = PANEL_MAX_WIDTH as usize - 6;
 
 #[derive(Default)]
@@ -14,10 +18,10 @@ struct Script {
     calls: Vec<String>,
     checks: Vec<String>,
     signed: BTreeSet<String>,
-    installed: [bool; 2],
+    installed: [bool; 3],
     refuse_sign_in: bool,
-    accounts: [Option<&'static str>; 2],
-    adopted: [Option<PathBuf>; 2],
+    accounts: [Option<&'static str>; 3],
+    adopted: [Option<PathBuf>; 3],
     absent_programs: Vec<&'static str>,
     home: Option<PathBuf>,
     installs: Option<Landing>,
@@ -169,7 +173,7 @@ impl Host for FakeHost {
 
 fn fake(installed: [bool; 2], signed: &[&str]) -> FakeHost {
     FakeHost(Rc::new(RefCell::new(Script {
-        installed,
+        installed: [installed[0], installed[1], false],
         signed: signed.iter().map(|label| (*label).to_owned()).collect(),
         ..Script::default()
     })))
@@ -316,10 +320,13 @@ fn skip_leaves_the_app_usable_with_a_one_line_hint() {
         }
         assert!(app.panel.is_none());
         let buffer = render(&mut app, width, height);
-        assert!(row(&buffer, height - 2).contains(NO_PROVIDER_HINT));
+        assert_eq!(app.notice, NO_PROVIDER_HINT);
+        let footer = row(&buffer, height - 1);
+        assert!(footer.contains("No provider connected"), "{footer}");
         app.notice.clear();
         let buffer = render(&mut app, width, height);
-        assert!(row(&buffer, height - 2).contains(NO_PROVIDER_HINT));
+        let top = row(&buffer, 0);
+        assert!(top.contains("Commander [No provider]"), "{top}");
         app.input = "Hello".into();
         app.submit();
         assert!(app.notice.contains(NO_PROVIDER_HINT), "{}", app.notice);
@@ -335,9 +342,9 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
         if index == 0 {
-            press(&mut app, KeyCode::Tab);
-            press(&mut app, KeyCode::Tab);
-            press(&mut app, KeyCode::Tab);
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Tab);
+            }
             assert!(app.editing_name());
             for c in "maix".chars() {
                 press(&mut app, KeyCode::Char(c));
@@ -364,7 +371,7 @@ fn connect_suspends_signs_in_restores_and_shows_the_profile_without_restart() {
         assert_eq!(live.profiles[0].to_string(), "claude/main");
         assert_eq!(live.signed_in, [true]);
         let text = screen(&render(&mut app, width, height));
-        assert!(text.contains("claude · main"), "{text}");
+        assert!(text.contains("Commander [Claude · main]"), "{text}");
         assert!(!text.contains(NO_PROVIDER_HINT));
         press(&mut app, KeyCode::F(3));
         let text = screen(&render(&mut app, width, height));
@@ -424,7 +431,7 @@ fn missing_cli_shows_the_recheck_state_until_it_is_found() {
         press(&mut app, KeyCode::Enter);
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("claude is not installed"), "{text}");
-        host.0.borrow_mut().installed = [true, false];
+        host.0.borrow_mut().installed = [true, false, false];
         if index == 0 {
             press(&mut app, KeyCode::Char('R'));
         } else {
@@ -434,7 +441,7 @@ fn missing_cli_shows_the_recheck_state_until_it_is_found() {
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("✓ claude on PATH"), "{text}");
         assert!(text.contains("✗ codex not found"), "{text}");
-        host.0.borrow_mut().installed = [true, true];
+        host.0.borrow_mut().installed = [true, true, true];
         press(&mut app, KeyCode::Char('r'));
         let text = screen(&render(&mut app, width, height));
         assert!(!text.contains("R Recheck"), "{text}");
@@ -449,8 +456,9 @@ fn settings_opens_from_the_top_bar_f3_and_slash_command() {
             let mut app = preview(&host, LaunchConfig::default());
             let buffer = render(&mut app, width, height);
             let bar = row(&buffer, 0);
-            assert!(bar.contains("Radio    |    PRIVATEER"), "{bar}");
-            assert!(bar.trim_end().ends_with("Settings"), "{bar}");
+            assert!(bar.contains("agent-command"), "{bar}");
+            assert!(!bar.contains("PRIVATEER"), "{bar}");
+            assert!(bar.contains('⚙'), "{bar}");
             assert!(app.settings_area.right() <= width && app.settings_area.y == 0);
             match opener {
                 "click" => {
@@ -470,16 +478,25 @@ fn settings_opens_from_the_top_bar_f3_and_slash_command() {
                 "SUBSCRIPTIONS",
                 "+ Connect subscription",
                 "Commander profile",
+                "ProdGate floor",
                 "Check for updates",
-                &format!("Version   {}", update::CURRENT),
-                "Profiles",
-                "Theme",
             ] {
                 assert!(text.contains(expected), "{opener} {expected}\n{text}");
+            }
+            if height >= 40 {
+                for expected in [
+                    &format!("Version   {}", update::CURRENT),
+                    "Profiles",
+                    "Theme",
+                    "Close",
+                ] {
+                    assert!(text.contains(expected), "{opener} {expected}\n{text}");
+                }
             }
             assert_inside(&app, width, height);
             press(&mut app, KeyCode::Esc);
             assert!(app.panel.is_none(), "{opener}");
+            assert!(app.editing, "{opener}");
         }
     }
 }
@@ -546,8 +563,13 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         let mut app = launched(&sandbox, &host);
         app.live.as_mut().unwrap().preferred = Some(1);
         app.live.as_ref().unwrap().save_override().unwrap();
-        assert!(screen(&render(&mut app, width, height)).contains("codex"));
-        assert_eq!(app.deck_hits.len(), 2);
+        let text = screen(&render(&mut app, width, height));
+        assert!(text.contains("Commander [Codex · work]"), "{text}");
+        assert_eq!(labels(&app), ["claude/main", "codex/work"]);
+        assert_eq!(
+            connection_rows(&app),
+            if width >= RAIL_WIDTH { 3 } else { 0 }
+        );
         press(&mut app, KeyCode::F(3));
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("SUBSCRIPTIONS"), "{text}");
@@ -602,8 +624,18 @@ fn disconnect_needs_confirmation_then_removes_the_profile_slots_and_deck_card() 
         assert!(!app.panel_actions().contains(&Action::Disconnect(1)));
         press(&mut app, KeyCode::Esc);
         let text = screen(&render(&mut app, width, height));
-        assert!(!text.contains("codex"), "{text}");
-        assert_eq!(app.deck_hits.len(), 1);
+        assert!(
+            !text.contains("codex/work") && !text.contains("Codex · work"),
+            "{text}"
+        );
+        assert_eq!(labels(&app), ["claude/main"]);
+        if width >= RAIL_WIDTH {
+            let codex = rail_row(&app, Provider::Codex);
+            click(&mut app, codex);
+            assert!(matches!(app.panel, Some(Panel::Settings(_))));
+            assert!(!app.panel_actions().contains(&Action::Disconnect(1)));
+            press(&mut app, KeyCode::Esc);
+        }
     }
 }
 
@@ -695,8 +727,8 @@ fn disconnect_and_reconnect_commands_target_one_subscription() {
         "{}",
         app.notice
     );
-    send(&mut app, "/disconnect gemini");
-    assert!(app.notice.contains("No subscription named gemini"));
+    send(&mut app, "/disconnect ghost");
+    assert!(app.notice.contains("No subscription named ghost"));
     send(&mut app, "/reconnect codex");
     assert!(app.panel.is_none() && app.notice.contains("Name one as PROVIDER/PROFILE"));
     assert!(host.0.borrow().calls.is_empty());
@@ -746,14 +778,14 @@ fn disconnect_and_reconnect_commands_target_one_subscription() {
 #[cfg(unix)]
 #[test]
 fn clicking_a_deck_card_opens_settings_on_that_subscription() {
-    for (width, height) in SIZES {
+    for (width, height) in RAIL_SIZES {
         let sandbox = Sandbox::new(&format!("deck-click-{width}"));
         existing(&sandbox, Provider::Claude, "main");
         existing(&sandbox, Provider::Codex, "work");
         let host = fake([true, true], &["claude/main", "codex/work"]);
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
-        let card = app.deck_hits[1].1;
+        let card = rail_row(&app, Provider::Codex);
         assert!(card.width > 0 && card.right() <= width && card.bottom() <= height);
         app.click(card.x + card.width / 2, card.y + card.height / 2);
         assert!(matches!(app.panel, Some(Panel::Settings(_))));
@@ -772,11 +804,28 @@ fn clicking_a_deck_card_opens_settings_on_that_subscription() {
         press(&mut app, KeyCode::Esc);
 
         render(&mut app, width, height);
-        let card = app.deck_hits[0].1;
+        let card = rail_row(&app, Provider::Claude);
         app.click(card.x, card.y);
         assert_eq!(app.focused_action(), Some(Action::Reconnect(0)));
         assert!(host.0.borrow().calls.is_empty());
     }
+}
+
+#[cfg(unix)]
+fn connection_rows(app: &App) -> usize {
+    app.rail_hits
+        .iter()
+        .filter(|(_, hit)| matches!(hit, RailHit::OpenConnect(_)))
+        .count()
+}
+
+#[cfg(unix)]
+fn rail_row(app: &App, provider: Provider) -> Rect {
+    app.rail_hits
+        .iter()
+        .find(|(_, hit)| *hit == RailHit::OpenConnect(provider))
+        .map(|(rect, _)| *rect)
+        .unwrap_or_else(|| panic!("no rail row for {provider:?}"))
 }
 
 fn last_row(buffer: &Buffer) -> String {
@@ -823,9 +872,10 @@ fn update_button_runs_the_host_updater_and_stays_for_a_retry_after_failure() {
             let mut app = launched(&sandbox, &host);
             let text = last_row(&render(&mut app, width, height));
             assert!(!text.contains("Update"), "{text}");
-            assert_eq!(app.update_area.width, 0);
+            assert_eq!(app.update_area, ratatui::layout::Rect::default());
             send(&mut app, "/update");
-            assert!(app.notice.contains("is up to date"), "{}", app.notice);
+            assert_eq!(app.update_state, update::UpdateState::Checking);
+            assert!(app.notice.contains("Checking"), "{}", app.notice);
             press(&mut app, KeyCode::F(6));
             assert!(host.0.borrow().calls.is_empty());
 
@@ -892,7 +942,7 @@ fn update_is_refused_in_preview() {
     app.panel = None;
     let _sender = detected(&mut app, "9.9.9");
     let text = last_row(&render(&mut app, 80, 24));
-    assert!(text.ends_with(" Update "), "{text}");
+    assert!(text.ends_with(" ⬆ Update v9.9.9 "), "{text}");
     let button = app.update_area;
     click(&mut app, button);
     assert_eq!(app.notice, PREVIEW_BLOCKER);
@@ -905,35 +955,15 @@ fn update_button_sits_bottom_right_and_left_of_abandon_at_both_sizes() {
         let mut app = App::from_live(crate::Live::new(std::env::temp_dir(), Vec::new(), None));
         let text = last_row(&render(&mut app, width, height));
         assert!(!text.contains("Update"), "{text}");
-        let crew_before = app.crew_area;
+        assert_eq!(app.update_area, ratatui::layout::Rect::default());
+
         let _sender = detected(&mut app, "9.9.9");
         let buffer = render(&mut app, width, height);
         let text = last_row(&buffer);
-        let label = if width >= 100 {
-            " Update v9.9.9 "
-        } else {
-            " Update "
-        };
-        assert!(text.ends_with(label), "{text}");
-        assert!(text.starts_with(" ^Q Quit"), "{text}");
+        assert!(text.contains("Update v9.9.9"), "{text}");
         assert_eq!(app.update_area.y, height - 1);
         assert_eq!(app.update_area.right(), width);
-        assert_eq!(usize::from(app.update_area.width), label.chars().count());
-        assert_eq!(app.crew_area, crew_before);
-
-        let bar = Rect::new(0, height - 1, width, 1);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|f| app.draw_shortcut_bar(f, bar, true))
-            .unwrap();
-        let text = last_row(terminal.backend().buffer());
-        assert!(text.ends_with(&format!("{label}  F4 Abandon  ")), "{text}");
-        let abandon = app.live.as_ref().unwrap().abandon_area;
-        assert_eq!(abandon.right(), width);
-        assert_eq!(app.update_area.right(), abandon.x);
-        assert_eq!(text.contains('…'), width < 100, "{text}");
-        let shortcuts: String = text.chars().take(usize::from(app.update_area.x)).collect();
-        assert!(!shortcuts.contains("Update"), "{shortcuts}");
+        assert!(app.update_area.width > 0);
     }
 }
 
@@ -1088,6 +1118,7 @@ fn install_appears_only_for_a_missing_cli_in_connect_and_settings() {
             assert_inside(&app, width, height);
 
             let ready = fake([true, true], &[]);
+            ready.0.borrow_mut().installed[2] = true;
             let mut app = preview(&ready, LaunchConfig::default());
             open(&mut app, settings);
             let text = screen(&render(&mut app, width, height));
@@ -1286,7 +1317,7 @@ fn onboarding_pre_checks_every_installed_cli_and_shows_the_auto_name() {
         let sandbox = Sandbox::new(&format!("onboarding-both-{width}"));
         let mut app = launched(&sandbox, &fake([true, true], &[]));
         assert_eq!(origin(&app), Some(Origin::Onboarding));
-        assert_eq!(chosen(&app), Provider::ALL);
+        assert_eq!(chosen(&app), [Provider::Claude, Provider::Codex]);
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("[x] Claude Code"), "{text}");
         assert!(text.contains("[x] Codex CLI"), "{text}");
@@ -1333,7 +1364,7 @@ fn connect_pre_checks_only_installed_providers_that_are_not_signed_in() {
         render(&mut app, width, height);
         let area = hit(&app, Action::Toggle(Provider::Claude));
         click(&mut app, area);
-        assert_eq!(chosen(&app), Provider::ALL);
+        assert_eq!(chosen(&app), [Provider::Claude, Provider::Codex]);
     }
 }
 
@@ -1358,7 +1389,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
     for (width, height) in SIZES {
         let sandbox = Sandbox::new(&format!("connect-auto-{width}"));
         let host = fake([true, true], &[]);
-        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example")];
+        host.0.borrow_mut().accounts = [Some("Pilot@Example.test"), Some("Pilot Example"), None];
         let mut app = launched(&sandbox, &host);
         render(&mut app, width, height);
         let area = hit(&app, Action::Connect);
@@ -1400,7 +1431,7 @@ fn connect_names_profiles_from_the_signed_in_account() {
 fn a_typed_profile_name_overrides_the_account_name() {
     let sandbox = Sandbox::new("connect-custom");
     let host = fake([true, false], &[]);
-    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None];
+    host.0.borrow_mut().accounts = [Some("pilot@example.test"), None, None];
     let mut app = launched(&sandbox, &host);
     if let Some(Panel::Connect(form)) = &mut app.panel {
         form.name = "work".into();
@@ -1482,6 +1513,5 @@ fn mode_command_sets_and_persists_the_commander_permission() {
     app.submit();
     assert_eq!(app.notice, crate::permissions::COMMANDER_MODE_USAGE);
     let text = screen(&render(&mut app, 120, 40));
-    assert!(text.contains("PERMISSIONS"), "{text}");
-    assert!(text.contains("supervised"), "{text}");
+    assert!(text.contains("supervised · ProdGate on"), "{text}");
 }

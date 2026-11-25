@@ -1,16 +1,249 @@
-use crate::{auth::Provider, specialists::Isolation};
+use crate::{
+    auth::Provider,
+    prodgate::{ProdGate, ProdGateDecision},
+    specialists::Isolation,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::ffi::OsStr;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum PermissionMode {
+pub enum PermissionMode {
     ReadOnly,
     #[default]
     Supervised,
     AutoAcceptEdits,
     WorktreeAuto,
     WorkspaceAuto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionEffect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub action: String,
+    pub resource: String,
+    pub effect: PermissionEffect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionResolution {
+    pub effect: PermissionEffect,
+    pub reason: Option<String>,
+    pub prod_gate: Option<ProdGateDecision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionPolicy {
+    pub overrides: Vec<PermissionRule>,
+    pub restrictions: Vec<PermissionRule>,
+    pub fallbacks: Vec<PermissionRule>,
+    pub prod_gate_enabled: bool,
+    pub extra_denied_commands: Vec<String>,
+    pub unattended: bool,
+}
+
+impl Default for PermissionPolicy {
+    fn default() -> Self {
+        Self {
+            overrides: Vec::new(),
+            restrictions: Vec::new(),
+            fallbacks: Vec::new(),
+            prod_gate_enabled: true,
+            extra_denied_commands: Vec::new(),
+            unattended: false,
+        }
+    }
+}
+
+impl PermissionPolicy {
+    pub fn for_mode(mode: PermissionMode) -> Self {
+        let mut policy = Self::default();
+        match mode {
+            PermissionMode::ReadOnly => {
+                for tool in ["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch"] {
+                    policy.push_override(tool, "*", PermissionEffect::Allow);
+                }
+                for tool in ["Edit", "Write", "NotebookEdit", "Bash", "execute", "shell"] {
+                    policy.push_restriction(tool, "*", PermissionEffect::Deny);
+                }
+            }
+            PermissionMode::Supervised => {
+                for tool in ["Read", "Glob", "Grep", "LS"] {
+                    policy.push_override(tool, "*", PermissionEffect::Allow);
+                }
+                policy.push_override("*", "*", PermissionEffect::Ask);
+            }
+            PermissionMode::AutoAcceptEdits => {
+                for tool in [
+                    "Read",
+                    "Glob",
+                    "Grep",
+                    "LS",
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                ] {
+                    policy.push_override(tool, "*", PermissionEffect::Allow);
+                }
+            }
+            PermissionMode::WorktreeAuto | PermissionMode::WorkspaceAuto => {
+                policy.push_override("*", "*", PermissionEffect::Allow);
+            }
+        }
+        policy
+    }
+
+    pub fn push_override(
+        &mut self,
+        action: impl Into<String>,
+        resource: impl Into<String>,
+        effect: PermissionEffect,
+    ) {
+        self.overrides.push(PermissionRule {
+            action: action.into(),
+            resource: resource.into(),
+            effect,
+        });
+    }
+
+    pub fn push_restriction(
+        &mut self,
+        action: impl Into<String>,
+        resource: impl Into<String>,
+        effect: PermissionEffect,
+    ) {
+        self.restrictions.push(PermissionRule {
+            action: action.into(),
+            resource: resource.into(),
+            effect,
+        });
+    }
+
+    pub fn push_fallback(
+        &mut self,
+        action: impl Into<String>,
+        resource: impl Into<String>,
+        effect: PermissionEffect,
+    ) {
+        self.fallbacks.push(PermissionRule {
+            action: action.into(),
+            resource: resource.into(),
+            effect,
+        });
+    }
+
+    pub fn evaluate(&self, tool_name: &str, resource: &str, input: &Value) -> PermissionResolution {
+        let mut effect = PermissionEffect::Ask;
+        let mut reason: Option<String> = None;
+
+        for rule in &self.overrides {
+            if rule_matches(rule, tool_name, resource) {
+                effect = rule.effect;
+            }
+        }
+
+        let prod_gate = if self.prod_gate_enabled {
+            ProdGate::check_with_extra(tool_name, input, &self.extra_denied_commands)
+        } else {
+            None
+        };
+
+        let mut restricted_to_ask_or_deny = false;
+        if let Some(hit) = &prod_gate {
+            let floor = if self.unattended {
+                PermissionEffect::Deny
+            } else {
+                PermissionEffect::Ask
+            };
+            if floor > effect {
+                effect = floor;
+            }
+            reason = Some(hit.reason.clone());
+            restricted_to_ask_or_deny = true;
+        }
+
+        for rule in &self.restrictions {
+            if rule_matches(rule, tool_name, resource) && rule.effect > effect {
+                effect = rule.effect;
+                if rule.effect >= PermissionEffect::Ask {
+                    restricted_to_ask_or_deny = true;
+                }
+                if reason.is_none() {
+                    reason = Some(format!(
+                        "Restricted by policy rule ({}: {}).",
+                        rule.action, rule.resource
+                    ));
+                }
+            }
+        }
+
+        if effect == PermissionEffect::Ask && !restricted_to_ask_or_deny {
+            for rule in &self.fallbacks {
+                if rule_matches(rule, tool_name, resource) {
+                    effect = rule.effect;
+                }
+            }
+        }
+
+        if self.unattended && effect == PermissionEffect::Ask {
+            effect = PermissionEffect::Deny;
+            if reason.is_none() {
+                reason = Some("Unattended execution denies interactive permission prompts.".into());
+            }
+        }
+
+        PermissionResolution {
+            effect,
+            reason,
+            prod_gate,
+        }
+    }
+}
+
+fn rule_matches(rule: &PermissionRule, action: &str, resource: &str) -> bool {
+    glob_match(
+        &rule.action.to_ascii_lowercase(),
+        &action.to_ascii_lowercase(),
+    ) && glob_match(&rule.resource, resource)
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+    while t < txt.len() {
+        if p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star_idx = Some(p);
+            match_idx = t;
+            p += 1;
+        } else if let Some(star) = star_idx {
+            p = star + 1;
+            match_idx += 1;
+            t = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 pub(crate) const MODE_USAGE: &str =
@@ -57,7 +290,7 @@ impl PermissionMode {
 
     pub(crate) const COMMANDER_DEFAULT: Self = Self::WorkspaceAuto;
 
-    pub(crate) fn flag(self) -> &'static str {
+    pub fn flag(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised => "supervised",
@@ -88,14 +321,20 @@ impl PermissionMode {
     }
 
     pub(crate) fn default_for_role(role: &str) -> Self {
+        Self::default_for_role_with_isolation(role, None)
+    }
+
+    pub fn default_for_role_with_isolation(role: &str, isolation: Option<&Isolation>) -> Self {
         let role = role.to_ascii_lowercase();
         let mentions = |words: &[&str]| words.iter().any(|word| role.contains(word));
         if mentions(&READ_ONLY_ROLE_WORDS) {
             Self::ReadOnly
         } else if mentions(&EDITING_ROLE_WORDS) {
             Self::AutoAcceptEdits
+        } else if matches!(isolation, Some(Isolation::Worktree { .. })) {
+            Self::WorktreeAuto
         } else {
-            Self::Supervised
+            Self::WorkspaceAuto
         }
     }
 
@@ -109,7 +348,7 @@ impl PermissionMode {
         }
     }
 
-    fn claude_arguments(self) -> Vec<&'static str> {
+    pub(crate) fn claude_arguments(self) -> Vec<&'static str> {
         match self {
             Self::ReadOnly => vec![
                 "--permission-mode",
@@ -136,6 +375,16 @@ impl PermissionMode {
             }
         }
     }
+
+    fn gemini_approval_arguments(self) -> Vec<&'static str> {
+        match self {
+            Self::ReadOnly => vec!["--approval-mode", "plan"],
+            Self::Supervised => vec!["--approval-mode", "default"],
+            Self::AutoAcceptEdits => vec!["--approval-mode", "auto_edit"],
+            Self::WorkspaceAuto => vec!["--approval-mode", "auto_edit", "--skip-trust"],
+            Self::WorktreeAuto => vec!["--approval-mode", "yolo", "--skip-trust"],
+        }
+    }
 }
 
 pub(crate) fn dispatch_arguments(provider: Provider, mode: PermissionMode) -> Vec<&'static str> {
@@ -156,6 +405,11 @@ pub(crate) fn dispatch_arguments(provider: Provider, mode: PermissionMode) -> Ve
             mode.codex_sandbox(),
             "-",
         ],
+        Provider::Gemini => {
+            let mut arguments = vec!["-o", "stream-json"];
+            arguments.extend(mode.gemini_approval_arguments());
+            arguments
+        }
     }
 }
 
@@ -175,6 +429,7 @@ pub(crate) fn refuse_bypass<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
 
     fn joined(provider: Provider, mode: PermissionMode) -> String {
@@ -228,7 +483,27 @@ mod tests {
     }
 
     #[test]
-    fn read_only_locks_every_write_tool_on_both_providers() {
+    fn gemini_argv_uses_approval_mode_and_skip_trust_safely() {
+        assert_eq!(
+            joined(Provider::Gemini, PermissionMode::ReadOnly),
+            "-o stream-json --approval-mode plan"
+        );
+        assert_eq!(
+            joined(Provider::Gemini, PermissionMode::AutoAcceptEdits),
+            "-o stream-json --approval-mode auto_edit"
+        );
+        assert_eq!(
+            joined(Provider::Gemini, PermissionMode::WorkspaceAuto),
+            "-o stream-json --approval-mode auto_edit --skip-trust"
+        );
+        assert_eq!(
+            joined(Provider::Gemini, PermissionMode::WorktreeAuto),
+            "-o stream-json --approval-mode yolo --skip-trust"
+        );
+    }
+
+    #[test]
+    fn read_only_locks_every_write_tool_on_all_providers() {
         let claude = dispatch_arguments(Provider::Claude, PermissionMode::ReadOnly);
         let disallowed = claude
             .iter()
@@ -248,6 +523,10 @@ mod tests {
             .unwrap();
         assert_eq!(sandbox, "read-only");
         assert!(!codex.contains(&"workspace-write"));
+        let gemini = dispatch_arguments(Provider::Gemini, PermissionMode::ReadOnly);
+        assert!(gemini
+            .windows(2)
+            .any(|pair| pair == ["--approval-mode", "plan"]));
     }
 
     #[test]
@@ -300,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn role_defaults_follow_the_ladder() {
+    fn role_defaults_never_cripple_builders_or_commander_with_supervised() {
         for role in ["playtester", "Reviewer", "QA", "security-audit"] {
             assert_eq!(
                 PermissionMode::default_for_role(role),
@@ -313,12 +592,66 @@ mod tests {
                 PermissionMode::AutoAcceptEdits
             );
         }
+        let worktree = Isolation::Worktree {
+            repository: PathBuf::from("repo"),
+        };
         for role in ["lead", "entry", "builder", "commander"] {
             assert_eq!(
                 PermissionMode::default_for_role(role),
-                PermissionMode::Supervised
+                PermissionMode::WorkspaceAuto
+            );
+            assert_eq!(
+                PermissionMode::default_for_role_with_isolation(role, Some(&worktree)),
+                PermissionMode::WorktreeAuto
             );
         }
+    }
+
+    #[test]
+    fn three_layer_policy_enforces_monotone_restrictions_and_prod_gate_over_overrides_and_fallbacks(
+    ) {
+        let mut policy = PermissionPolicy::for_mode(PermissionMode::WorkspaceAuto);
+        policy.push_fallback("Bash", "*", PermissionEffect::Allow);
+
+        let safe = policy.evaluate("Bash", "cargo test", &json!({"command": "cargo test"}));
+        assert_eq!(safe.effect, PermissionEffect::Allow);
+        assert!(safe.prod_gate.is_none());
+
+        let prod_hit = policy.evaluate(
+            "Bash",
+            "git push --force",
+            &json!({"command": "git push origin main --force"}),
+        );
+        assert_eq!(prod_hit.effect, PermissionEffect::Ask);
+        assert!(prod_hit.prod_gate.is_some());
+
+        policy.unattended = true;
+        let unattended_hit = policy.evaluate(
+            "Bash",
+            "kubectl delete pod web",
+            &json!({"command": "kubectl delete pod web"}),
+        );
+        assert_eq!(unattended_hit.effect, PermissionEffect::Deny);
+
+        let mut supervised = PermissionPolicy::for_mode(PermissionMode::Supervised);
+        supervised.push_fallback("WebFetch", "https://docs.rs/*", PermissionEffect::Allow);
+        supervised.push_restriction(
+            "WebFetch",
+            "https://internal.corp/*",
+            PermissionEffect::Deny,
+        );
+        assert_eq!(
+            supervised
+                .evaluate("WebFetch", "https://docs.rs/ratatui", &json!({}))
+                .effect,
+            PermissionEffect::Allow
+        );
+        assert_eq!(
+            supervised
+                .evaluate("WebFetch", "https://internal.corp/secret", &json!({}))
+                .effect,
+            PermissionEffect::Deny
+        );
     }
 
     #[test]

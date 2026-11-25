@@ -39,7 +39,6 @@ pub struct TokenBurnPalette {
     pub reset_six_hours: Color,
     pub reset_day: Color,
     pub reset_later: Color,
-    pub reset_due: Color,
 }
 
 impl Default for TokenBurnPalette {
@@ -59,10 +58,9 @@ impl Default for TokenBurnPalette {
             depleted: rgb(0xff4d5e),
             unknown: rgb(0x5d6570),
             reset_hour: rgb(0x3ddc97),
-            reset_six_hours: rgb(0xf5b041),
-            reset_day: rgb(0x5ab0ff),
-            reset_later: rgb(0xc792ff),
-            reset_due: rgb(0xff6b3d),
+            reset_six_hours: rgb(0xffbc26),
+            reset_day: rgb(0x44adff),
+            reset_later: rgb(0xb680ff),
         }
     }
 }
@@ -107,8 +105,7 @@ impl TokenBurnPalette {
 
     pub fn reset_color(&self, bucket: ResetBucket) -> Color {
         match bucket {
-            ResetBucket::Missing => self.muted,
-            ResetBucket::Due => self.reset_due,
+            ResetBucket::Missing | ResetBucket::Due => self.muted,
             ResetBucket::WithinHour => self.reset_hour,
             ResetBucket::WithinSixHours => self.reset_six_hours,
             ResetBucket::WithinDay => self.reset_day,
@@ -118,12 +115,46 @@ impl TokenBurnPalette {
 
     pub fn tier_color(&self, tier: &str) -> Color {
         match tier.trim().to_ascii_uppercase().as_str() {
-            "MAX" => self.tier_max,
-            "PRO" => self.tier_pro,
-            "PLUS" => self.tier_plus,
+            "MAX" | "ULTRA" | "ENTERPRISE" => self.tier_max,
+            "PRO" | "WORKSPACE" | "VERTEX" => self.tier_pro,
+            "PLUS" | "GOOGLE" | "BEDROCK" => self.tier_plus,
             "" => self.unknown,
             _ => self.accent,
         }
+    }
+}
+
+pub fn normalize_tier(raw: Option<&str>) -> String {
+    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("max") {
+        "max".into()
+    } else if lower.contains("ultra") {
+        "ultra".into()
+    } else if lower.contains("enterprise") {
+        "enterprise".into()
+    } else if lower.contains("team") {
+        "team".into()
+    } else if lower.contains("workspace") {
+        "workspace".into()
+    } else if lower.contains("pro") {
+        "pro".into()
+    } else if lower.contains("plus") {
+        "plus".into()
+    } else if lower.contains("bedrock") {
+        "bedrock".into()
+    } else if lower.contains("vertex") {
+        "vertex".into()
+    } else if lower.contains("foundry") {
+        "foundry".into()
+    } else if lower.contains("google") || lower.contains("oauth") {
+        "google".into()
+    } else if lower.contains("api") {
+        "api".into()
+    } else {
+        lower
     }
 }
 
@@ -459,6 +490,251 @@ pub fn render_deck_as(
     }
 }
 
+pub const RING_CELL_WIDTH: u16 = 8;
+pub const RING_CELL_HEIGHT: u16 = 4;
+pub const RING_TILE_HEIGHT: u16 = RING_CELL_HEIGHT;
+const BRAILLE_BASE: u32 = 0x2800;
+const BRAILLE_DOT_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+const RING_STROKE: f64 = 0.62;
+const RING_SPACING: f64 = 2.6;
+const RING_TEXT_GAP: usize = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingDot {
+    Empty,
+    Track(usize),
+    Fill(usize),
+}
+
+pub fn ring_dot_grid(
+    width_cells: u16,
+    height_cells: u16,
+    rings: &[Option<f64>],
+) -> Vec<Vec<RingDot>> {
+    let columns = usize::from(width_cells) * 2;
+    let rows = usize::from(height_cells) * 4;
+    let center_x = (columns as f64 - 1.0) / 2.0;
+    let center_y = (rows as f64 - 1.0) / 2.0;
+    let outer_radius = (columns.min(rows) as f64) / 2.0 - 0.5;
+    (0..rows)
+        .map(|row| {
+            (0..columns)
+                .map(|column| {
+                    let dx = column as f64 - center_x;
+                    let dy = row as f64 - center_y;
+                    classify_dot(dx, dy, outer_radius, rings)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn classify_dot(dx: f64, dy: f64, outer_radius: f64, rings: &[Option<f64>]) -> RingDot {
+    let distance = dx.hypot(dy);
+    let Some(index) = (0..rings.len()).find(|index| {
+        let radius = outer_radius - *index as f64 * RING_SPACING;
+        radius > 0.0 && (distance - radius).abs() <= RING_STROKE
+    }) else {
+        return RingDot::Empty;
+    };
+    let sweep = clockwise_fraction_from_top(dx, dy);
+    match clamp_percent(rings[index]) {
+        Some(percent) if sweep < percent / 100.0 => RingDot::Fill(index),
+        _ => RingDot::Track(index),
+    }
+}
+
+pub fn clockwise_fraction_from_top(dx: f64, dy: f64) -> f64 {
+    let degrees = dx.atan2(-dy).to_degrees();
+    degrees.rem_euclid(360.0) / 360.0
+}
+
+fn ring_track_color(rings: &[Option<f64>], index: usize, palette: &TokenBurnPalette) -> Color {
+    match clamp_percent(rings[index]) {
+        Some(_) => palette.border,
+        None => palette.unknown,
+    }
+}
+
+fn braille_cell(
+    dots: &[Vec<RingDot>],
+    cell_x: usize,
+    cell_y: usize,
+    rings: &[Option<f64>],
+    palette: &TokenBurnPalette,
+) -> Span<'static> {
+    let mut members = Vec::new();
+    for (row_offset, bits) in BRAILLE_DOT_BITS.iter().enumerate() {
+        for (column_offset, bit) in bits.iter().enumerate() {
+            members.push((
+                dots[cell_y * 4 + row_offset][cell_x * 2 + column_offset],
+                *bit,
+            ));
+        }
+    }
+    let ring = members
+        .iter()
+        .filter_map(|(dot, _)| match dot {
+            RingDot::Fill(index) | RingDot::Track(index) => Some(*index),
+            RingDot::Empty => None,
+        })
+        .min();
+    let (pattern, color) = match ring {
+        Some(ring) if members.iter().any(|(dot, _)| *dot == RingDot::Fill(ring)) => (
+            dot_pattern(&members, |dot| dot == RingDot::Fill(ring)),
+            palette.allowance_color(rings[ring]),
+        ),
+        Some(ring) => (
+            dot_pattern(&members, |dot| dot == RingDot::Track(ring)),
+            ring_track_color(rings, ring, palette),
+        ),
+        None => (0, palette.muted),
+    };
+    if pattern == 0 {
+        return Span::raw(" ");
+    }
+    let symbol = char::from_u32(BRAILLE_BASE + u32::from(pattern)).unwrap_or(' ');
+    Span::styled(symbol.to_string(), Style::default().fg(color))
+}
+
+fn dot_pattern(members: &[(RingDot, u8)], include: impl Fn(RingDot) -> bool) -> u8 {
+    members
+        .iter()
+        .filter(|(dot, _)| include(*dot))
+        .fold(0, |pattern, (_, bit)| pattern | bit)
+}
+
+pub fn braille_ring_lines(
+    rings: &[Option<f64>],
+    width_cells: u16,
+    height_cells: u16,
+    palette: &TokenBurnPalette,
+) -> Vec<Line<'static>> {
+    let rings = if rings.is_empty() { &[None][..] } else { rings };
+    let dots = ring_dot_grid(width_cells, height_cells, rings);
+    let mut lines: Vec<Vec<Span<'static>>> = (0..usize::from(height_cells))
+        .map(|cell_y| {
+            (0..usize::from(width_cells))
+                .map(|cell_x| braille_cell(&dots, cell_x, cell_y, rings, palette))
+                .collect()
+        })
+        .collect();
+    if rings.len() == 1 {
+        overlay_center_label(&mut lines, rings[0], palette);
+    }
+    lines.into_iter().map(Line::from).collect()
+}
+
+fn overlay_center_label(
+    lines: &mut [Vec<Span<'static>>],
+    remaining: Option<f64>,
+    palette: &TokenBurnPalette,
+) {
+    let label =
+        clamp_percent(remaining).map_or_else(|| "--".to_owned(), |p| format!("{:.0}", p.floor()));
+    let Some(row) = lines.get_mut(lines.len() / 2) else {
+        return;
+    };
+    let chars: Vec<char> = label.chars().collect();
+    let start = (row.len().saturating_sub(chars.len())) / 2;
+    let fits = row
+        .get(start..start + chars.len())
+        .is_some_and(|cells| cells.iter().all(|cell| cell.content == " "));
+    if !fits {
+        return;
+    }
+    let style = Style::default()
+        .fg(palette.allowance_color(remaining))
+        .add_modifier(Modifier::BOLD);
+    for (offset, ch) in chars.into_iter().enumerate() {
+        row[start + offset] = Span::styled(ch.to_string(), style);
+    }
+}
+
+pub fn ring_glyph(remaining_percent: Option<f64>) -> &'static str {
+    match clamp_percent(remaining_percent) {
+        None => "○",
+        Some(p) if p < 12.5 => "○",
+        Some(p) if p < 37.5 => "◔",
+        Some(p) if p < 62.5 => "◑",
+        Some(p) if p < 87.5 => "◕",
+        Some(_) => "●",
+    }
+}
+
+pub fn compact_ring(remaining_percent: Option<f64>, palette: &TokenBurnPalette) -> Span<'static> {
+    Span::styled(
+        ring_glyph(remaining_percent),
+        Style::default()
+            .fg(palette.allowance_color(remaining_percent))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+impl AccountCard {
+    pub fn ring_windows(&self) -> Vec<Option<f64>> {
+        match (
+            clamp_percent(self.primary_remaining),
+            clamp_percent(self.secondary_remaining),
+        ) {
+            (Some(primary), Some(secondary)) => vec![Some(primary), Some(secondary)],
+            (Some(only), None) | (None, Some(only)) => vec![Some(only)],
+            (None, None) => vec![None],
+        }
+    }
+
+    pub fn headline_remaining(&self) -> Option<f64> {
+        clamp_percent(self.primary_remaining).or(clamp_percent(self.secondary_remaining))
+    }
+
+    pub fn ring_tile_lines(&self, width: u16, palette: &TokenBurnPalette) -> Vec<Line<'static>> {
+        let rings = self.ring_windows();
+        let ring_lines = braille_ring_lines(&rings, RING_CELL_WIDTH, RING_CELL_HEIGHT, palette);
+        let text_width =
+            usize::from(width).saturating_sub(usize::from(RING_CELL_WIDTH) + RING_TEXT_GAP);
+        let text_lines = self.ring_text_lines(rings.len() > 1, palette);
+        ring_lines
+            .into_iter()
+            .zip(text_lines)
+            .map(|(ring, text)| {
+                let mut spans = ring.spans;
+                spans.push(Span::raw(" ".repeat(RING_TEXT_GAP)));
+                spans.extend(fit_line(text, text_width).spans);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    fn ring_text_lines(&self, dual: bool, palette: &TokenBurnPalette) -> [Vec<Span<'static>>; 4] {
+        let headline = self.headline_remaining();
+        let title = vec![Span::styled(
+            format!("{} · {}", self.provider, self.profile),
+            Style::default()
+                .fg(palette.foreground)
+                .add_modifier(Modifier::BOLD),
+        )];
+        let allowance = vec![
+            Span::styled(
+                format!("{} left", percent_label(headline)),
+                Style::default()
+                    .fg(palette.allowance_color(headline))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            tier_pill(&self.tier, palette),
+        ];
+        let reset = vec![reset_badge(self.seconds_until_reset, palette)];
+        if !dual {
+            return [title, allowance, reset, Vec::new()];
+        }
+        let weekly = vec![Span::styled(
+            format!("7d {}", percent_label(self.secondary_remaining)),
+            Style::default().fg(palette.allowance_color(self.secondary_remaining)),
+        )];
+        [title, allowance, weekly, reset]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,8 +822,8 @@ mod tests {
         let p = TokenBurnPalette::default();
         for (seconds, bucket, color, label) in [
             (None, ResetBucket::Missing, p.muted, "-"),
-            (Some(-90), ResetBucket::Due, p.reset_due, "due"),
-            (Some(0), ResetBucket::Due, p.reset_due, "due"),
+            (Some(-90), ResetBucket::Due, p.muted, "due"),
+            (Some(0), ResetBucket::Due, p.muted, "due"),
             (Some(30), ResetBucket::WithinHour, p.reset_hour, "1m"),
             (Some(HOUR), ResetBucket::WithinHour, p.reset_hour, "1h 00m"),
             (
@@ -694,5 +970,204 @@ mod tests {
                 assert!(line.width() <= 118);
             }
         }
+    }
+
+    fn dots(rings: &[Option<f64>]) -> Vec<RingDot> {
+        ring_dot_grid(RING_CELL_WIDTH, RING_CELL_HEIGHT, rings)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn ring_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn braille_ring_sweeps_clockwise_from_twelve_oclock() {
+        assert_eq!(clockwise_fraction_from_top(0.0, -1.0), 0.0);
+        assert!((clockwise_fraction_from_top(1.0, 0.0) - 0.25).abs() < 1e-9);
+        assert!((clockwise_fraction_from_top(0.0, 1.0) - 0.5).abs() < 1e-9);
+        assert!((clockwise_fraction_from_top(-1.0, 0.0) - 0.75).abs() < 1e-9);
+        let full = dots(&[Some(100.0)]);
+        assert!(full.contains(&RingDot::Fill(0)));
+        assert!(!full.contains(&RingDot::Track(0)));
+        let empty = dots(&[Some(0.0)]);
+        assert!(empty.contains(&RingDot::Track(0)));
+        assert!(!empty.contains(&RingDot::Fill(0)));
+        let grid = ring_dot_grid(RING_CELL_WIDTH, RING_CELL_HEIGHT, &[Some(50.0)]);
+        let half = usize::from(RING_CELL_WIDTH);
+        for row in &grid {
+            for (column, dot) in row.iter().enumerate() {
+                if *dot == RingDot::Fill(0) {
+                    assert!(column >= half, "fill must stay on the right half");
+                }
+            }
+        }
+        let ring_cells = full.iter().filter(|dot| **dot != RingDot::Empty).count();
+        assert_eq!(
+            ring_cells,
+            empty.iter().filter(|dot| **dot != RingDot::Empty).count()
+        );
+    }
+
+    #[test]
+    fn single_ring_is_a_closed_braille_circle_with_a_center_label() {
+        let p = TokenBurnPalette::default();
+        let lines = braille_ring_lines(&[Some(64.0)], RING_CELL_WIDTH, RING_CELL_HEIGHT, &p);
+        assert_eq!(lines.len(), usize::from(RING_CELL_HEIGHT));
+        let text = ring_text(&lines);
+        assert!(text[2].contains("64"), "{text:?}");
+        for line in &lines {
+            assert_eq!(line.width(), usize::from(RING_CELL_WIDTH));
+        }
+        let symbols: Vec<char> = text.iter().flat_map(|row| row.chars()).collect();
+        assert!(symbols
+            .iter()
+            .all(|ch| *ch == ' ' || ch.is_ascii_digit() || ('\u{2800}'..='\u{28FF}').contains(ch)));
+        let first = &lines[0].spans;
+        assert!(first.iter().any(|span| span.style.fg == Some(p.healthy)));
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg == Some(p.border)));
+        let low = braille_ring_lines(&[Some(12.0)], RING_CELL_WIDTH, RING_CELL_HEIGHT, &p);
+        assert!(low
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg == Some(p.depleted)));
+    }
+
+    #[test]
+    fn unknown_ring_is_muted_and_labelled_dashes_never_zero_or_full() {
+        let p = TokenBurnPalette::default();
+        let lines = braille_ring_lines(&[None], RING_CELL_WIDTH, RING_CELL_HEIGHT, &p);
+        let text = ring_text(&lines).join("\n");
+        assert!(text.contains("--"), "{text}");
+        assert!(!text.contains('0'));
+        let colors: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.content != " ")
+            .map(|span| span.style.fg)
+            .collect();
+        assert!(colors.iter().all(|fg| *fg == Some(p.unknown)), "{colors:?}");
+        assert!(!dots(&[None]).contains(&RingDot::Fill(0)));
+        assert_eq!(
+            braille_ring_lines(&[], RING_CELL_WIDTH, RING_CELL_HEIGHT, &p),
+            lines
+        );
+    }
+
+    #[test]
+    fn dual_windows_render_concentric_rings_and_single_window_one_ring() {
+        let both = dots(&[Some(64.0), Some(30.0)]);
+        for index in [0, 1] {
+            assert!(both
+                .iter()
+                .any(|dot| matches!(dot, RingDot::Fill(i) | RingDot::Track(i) if *i == index)));
+        }
+        let card = |primary, secondary| AccountCard {
+            primary_remaining: primary,
+            secondary_remaining: secondary,
+            ..AccountCard::default()
+        };
+        assert_eq!(
+            card(Some(64.0), Some(30.0)).ring_windows(),
+            [Some(64.0), Some(30.0)]
+        );
+        assert_eq!(card(None, Some(30.0)).ring_windows(), [Some(30.0)]);
+        assert_eq!(card(Some(150.0), None).ring_windows(), [Some(100.0)]);
+        assert_eq!(card(None, None).ring_windows(), [None]);
+        assert_eq!(card(None, Some(30.0)).headline_remaining(), Some(30.0));
+        assert_eq!(card(Some(f64::NAN), None).headline_remaining(), None);
+        let p = TokenBurnPalette::default();
+        let lines = braille_ring_lines(
+            &[Some(64.0), Some(30.0)],
+            RING_CELL_WIDTH,
+            RING_CELL_HEIGHT,
+            &p,
+        );
+        let colors: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.fg)
+            .collect();
+        assert!(colors.contains(&p.healthy));
+    }
+
+    #[test]
+    fn compact_ring_glyphs_follow_remaining_allowance() {
+        let p = TokenBurnPalette::default();
+        for (remaining, glyph, color) in [
+            (None, "○", p.unknown),
+            (Some(5.0), "○", p.depleted),
+            (Some(19.0), "◔", p.depleted),
+            (Some(50.0), "◑", p.healthy),
+            (Some(70.0), "◕", p.healthy),
+            (Some(100.0), "●", p.healthy),
+        ] {
+            let span = compact_ring(remaining, &p);
+            assert_eq!(span.content, glyph, "{remaining:?}");
+            assert_eq!(span.style.fg, Some(color), "{remaining:?}");
+        }
+    }
+
+    #[test]
+    fn ring_tiles_show_name_percent_tier_and_reset_within_width() {
+        let p = TokenBurnPalette::default();
+        for card in cards() {
+            for width in [20u16, 24, 29] {
+                let lines = card.ring_tile_lines(width, &p);
+                assert_eq!(lines.len(), usize::from(RING_TILE_HEIGHT));
+                for line in &lines {
+                    assert!(line.width() <= usize::from(width), "{width}");
+                }
+            }
+        }
+        let text = ring_text(&cards()[0].ring_tile_lines(29, &p)).join("\n");
+        assert!(text.contains("claude · work"), "{text}");
+        assert!(
+            text.contains("64% left") && text.contains(" MAX "),
+            "{text}"
+        );
+        assert!(
+            text.contains("7d 12%") && text.contains("↻ 3h 20m"),
+            "{text}"
+        );
+        let unknown = ring_text(&cards()[1].ring_tile_lines(29, &p)).join("\n");
+        assert!(
+            unknown.contains("20% left") && unknown.contains("↻ -"),
+            "{unknown}"
+        );
+        let missing = AccountCard {
+            provider: "gemini".into(),
+            profile: "x".into(),
+            ..AccountCard::default()
+        };
+        let none = ring_text(&missing.ring_tile_lines(29, &p)).join("\n");
+        assert!(none.contains("-- left") && !none.contains("0%"), "{none}");
+    }
+
+    #[test]
+    fn reset_proximity_uses_token_burn_colors() {
+        let p = TokenBurnPalette::default();
+        assert_eq!(p.reset_hour, rgb(0x3ddc97));
+        assert_eq!(p.reset_six_hours, rgb(0xffbc26));
+        assert_eq!(p.reset_day, rgb(0x44adff));
+        assert_eq!(p.reset_later, rgb(0xb680ff));
+        assert_eq!(p.reset_color(ResetBucket::Due), p.muted);
+        assert_eq!(p.reset_color(ResetBucket::Missing), p.muted);
+        assert_eq!(p.healthy, rgb(0x3ddc97));
+        assert_eq!(p.depleted, rgb(0xff4d5e));
+        assert_eq!(p.unknown, rgb(0x5d6570));
     }
 }

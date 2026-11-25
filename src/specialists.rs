@@ -7,6 +7,7 @@ use crate::{
     routing,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs,
@@ -17,7 +18,24 @@ use std::{
 pub(crate) const STATE_DIRECTORY: &str = "agent-command-orchestrator-v1";
 const SCHEMA: &str = "agent-command-orchestrator-v1";
 const ROSTER_FILE: &str = "roster.json";
-const COMMANDER_FILE: &str = "commander.jsonl";
+const ROSTER_LOCK_FILE: &str = ".roster.lock";
+const ROSTER_LOCK_WAIT_MS: u64 = 10;
+const ROSTER_LOCK_ATTEMPTS: usize = 500;
+const ROSTER_LOCK_STALE_SECS: u64 = 10;
+pub(crate) fn workspace_hash(workspace: &Path) -> String {
+    let canonical = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let normalized = canonical.to_string_lossy().to_ascii_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+fn workspace_commander_file(workspace: &Path) -> String {
+    format!("commander-{}.jsonl", workspace_hash(workspace))
+}
+
+fn workspace_transcript_file(workspace: &Path) -> String {
+    format!("transcript-{}.jsonl", workspace_hash(workspace))
+}
 const HISTORY_DIRECTORY: &str = "history";
 const WORKTREE_DIRECTORY: &str = "worktrees";
 const DIRECTORY_FALLBACK: &str = "workspaces";
@@ -296,41 +314,110 @@ impl Store {
     }
 
     pub(crate) fn save_roster(&self, crew: &[Member]) -> io::Result<()> {
-        let roster = RosterFile {
-            schema: SCHEMA.into(),
-            specialists: crew
-                .iter()
-                .filter(|member| !member.is_commander())
-                .map(|member| Record {
-                    name: member.name.clone(),
-                    role: member.role.clone(),
-                    task: member.mission.clone(),
-                    status: member.status,
-                    settled: member.settled,
-                    workspace: member.workspace.clone(),
-                    permission: Some(member.permission),
-                    review: member.review.clone(),
-                })
-                .collect(),
-        };
-        let path = self.directory()?.join(ROSTER_FILE);
-        let temporary = path.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
-        let mut file = fs::File::create_new(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, &roster)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(temporary, path)
+        let directory = self.directory()?;
+        let _lock = RosterLock::acquire(&directory)?;
+        write_roster_file(&directory, crew)
     }
 
-    pub(crate) fn load_commander(&self) -> io::Result<Vec<Entry>> {
+    pub(crate) fn save_roster_merging(&self, crew: &[Member], removed: &[&str]) -> io::Result<()> {
+        let directory = self.directory()?;
+        let _lock = RosterLock::acquire(&directory)?;
+        let existing = read_roster_records(&directory)?;
+        let mut merged: Vec<Record> = Vec::new();
+        for record in existing {
+            let is_removed = removed
+                .iter()
+                .any(|name| record.name.eq_ignore_ascii_case(name));
+            let in_crew = crew.iter().any(|member| {
+                !member.is_commander() && member.name.eq_ignore_ascii_case(&record.name)
+            });
+            if !is_removed && !in_crew {
+                merged.push(record);
+            }
+        }
+        for member in crew.iter().filter(|member| !member.is_commander()) {
+            merged.push(record_from_member(member));
+        }
+        write_roster_records(&directory, merged)
+    }
+
+    pub(crate) fn load_commander_for_workspace(&self, workspace: &Path) -> io::Result<Vec<Entry>> {
         match self.existing()? {
-            Some(directory) => read_entries(&directory.join(COMMANDER_FILE)),
+            Some(directory) => read_entries(&directory.join(workspace_commander_file(workspace))),
             None => Ok(Vec::new()),
         }
     }
 
-    pub(crate) fn append_commander(&self, entry: &Entry) -> io::Result<()> {
-        append_entry(&self.directory()?.join(COMMANDER_FILE), entry)
+    pub(crate) fn append_commander_for_workspace(
+        &self,
+        workspace: &Path,
+        entry: &Entry,
+    ) -> io::Result<()> {
+        append_entry(
+            &self.directory()?.join(workspace_commander_file(workspace)),
+            entry,
+        )
+    }
+
+    pub(crate) fn ledger_path_for_workspace(&self, workspace: &Path) -> io::Result<PathBuf> {
+        Ok(self
+            .directory()?
+            .join(format!("ledger-{}.json", workspace_hash(workspace))))
+    }
+
+    pub(crate) fn load_transcript_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> io::Result<Option<Vec<crate::markdown::TranscriptEntry>>> {
+        let Some(directory) = self.existing()? else {
+            return Ok(None);
+        };
+        let path = directory.join(workspace_transcript_file(workspace));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut entries = VecDeque::new();
+        for line in BufReader::new(file).lines() {
+            let text = line?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<crate::markdown::TranscriptEntry>(&text) {
+                entries.push_back(entry);
+                if entries.len() > FEED_LIMIT {
+                    entries.pop_front();
+                }
+            }
+        }
+        Ok(Some(crate::markdown::Transcript::normalize_loaded(
+            entries.into(),
+        )))
+    }
+
+    pub(crate) fn save_transcript_for_workspace(
+        &self,
+        workspace: &Path,
+        entries: &[crate::markdown::TranscriptEntry],
+    ) -> io::Result<()> {
+        let path = self.directory()?.join(workspace_transcript_file(workspace));
+        let start = entries.len().saturating_sub(FEED_LIMIT);
+        let mut buf = Vec::new();
+        for entry in &entries[start..] {
+            serde_json::to_writer(&mut buf, entry)?;
+            buf.push(b'\n');
+        }
+        let temporary = path.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
+        let mut file = fs::File::create_new(&temporary)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        drop(file);
+        if fs::rename(&temporary, &path).is_err() {
+            fs::write(&path, &buf)?;
+            let _ = fs::remove_file(&temporary);
+        }
+        Ok(())
     }
 
     pub(crate) fn append_history(&self, name: &str, entry: &Entry) -> io::Result<()> {
@@ -351,8 +438,7 @@ impl Store {
                 })
             }
             None => {
-                let path = self.subdirectory(DIRECTORY_FALLBACK)?.join(&key);
-                fs::create_dir(&path)?;
+                let path = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
                 Ok(Workspace {
                     path,
                     isolation: Isolation::Directory,
@@ -373,7 +459,12 @@ impl Store {
             .isolate(base, name, topic)
             .map_err(|error| format!("Cannot isolate {name}: {error}"))?;
         if let Err(refusal) = mode.require_isolation(Some(&workspace.isolation)) {
-            let _ = release_workspace(&workspace);
+            let fallback = self
+                .existing()
+                .ok()
+                .flatten()
+                .map(|dir| dir.join(DIRECTORY_FALLBACK));
+            let _ = release_workspace(&workspace, fallback.as_deref());
             return Err(refusal);
         }
         Ok(workspace)
@@ -392,16 +483,119 @@ impl Store {
 
     pub(crate) fn release(&self, member: &Member) -> io::Result<Option<String>> {
         let mut retained = None;
+        let existing_dir = self.existing()?;
+        let fallback_dir = existing_dir
+            .as_ref()
+            .map(|directory| directory.join(DIRECTORY_FALLBACK));
         if let Some(workspace) = &member.workspace {
-            retained = release_workspace(workspace)?;
+            retained = release_workspace(workspace, fallback_dir.as_deref())?;
         }
-        if let Some(directory) = self.existing()? {
+        if let Some(directory) = existing_dir {
             remove_if_present(&history_path(&directory, &member.name), |path| {
                 fs::remove_file(path)
             })?;
         }
         Ok(retained)
     }
+}
+
+struct RosterLock {
+    path: PathBuf,
+}
+
+impl RosterLock {
+    fn acquire(directory: &Path) -> io::Result<Self> {
+        let path = directory.join(ROSTER_LOCK_FILE);
+        for _ in 0..ROSTER_LOCK_ATTEMPTS {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| {
+                            age >= std::time::Duration::from_secs(ROSTER_LOCK_STALE_SECS)
+                        });
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(ROSTER_LOCK_WAIT_MS));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("Timed out waiting for roster lock {}", path.display()),
+        ))
+    }
+}
+
+impl Drop for RosterLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn record_from_member(member: &Member) -> Record {
+    Record {
+        name: member.name.clone(),
+        role: member.role.clone(),
+        task: member.mission.clone(),
+        status: member.status,
+        settled: member.settled,
+        workspace: member.workspace.clone(),
+        permission: Some(member.permission),
+        review: member.review.clone(),
+    }
+}
+
+fn read_roster_records(directory: &Path) -> io::Result<Vec<Record>> {
+    let bytes = match fs::read(directory.join(ROSTER_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let roster: RosterFile = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if roster.schema != SCHEMA {
+        return Err(io::Error::other(format!(
+            "Unsupported roster schema {}",
+            roster.schema
+        )));
+    }
+    Ok(roster.specialists)
+}
+
+fn write_roster_file(directory: &Path, crew: &[Member]) -> io::Result<()> {
+    let records: Vec<Record> = crew
+        .iter()
+        .filter(|member| !member.is_commander())
+        .map(record_from_member)
+        .collect();
+    write_roster_records(directory, records)
+}
+
+fn write_roster_records(directory: &Path, specialists: Vec<Record>) -> io::Result<()> {
+    let roster = RosterFile {
+        schema: SCHEMA.into(),
+        specialists,
+    };
+    let path = directory.join(ROSTER_FILE);
+    let temporary = path.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
+    let mut file = fs::File::create_new(&temporary)?;
+    serde_json::to_writer_pretty(&mut file, &roster)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, path)
 }
 
 pub(crate) fn removal_note(name: &str, retained: Option<&str>) -> String {
@@ -411,7 +605,10 @@ pub(crate) fn removal_note(name: &str, retained: Option<&str>) -> String {
     }
 }
 
-fn release_workspace(workspace: &Workspace) -> io::Result<Option<String>> {
+fn release_workspace(
+    workspace: &Workspace,
+    managed_fallback: Option<&Path>,
+) -> io::Result<Option<String>> {
     match &workspace.isolation {
         Isolation::Worktree { repository } => {
             branches::git(
@@ -430,7 +627,18 @@ fn release_workspace(workspace: &Workspace) -> io::Result<Option<String>> {
                 .map(|branch| branch.name.clone()))
         }
         Isolation::Directory => {
-            remove_if_present(&workspace.path, |path| fs::remove_dir_all(path))?;
+            if let Some(managed_root) = managed_fallback {
+                let managed = managed_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| managed_root.to_path_buf());
+                let target = workspace
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace.path.clone());
+                if target.starts_with(&managed) && target != managed {
+                    remove_if_present(&workspace.path, |path| fs::remove_dir_all(path))?;
+                }
+            }
             Ok(None)
         }
     }
@@ -695,8 +903,412 @@ pub(crate) enum Command {
     Mode {
         mode: PermissionMode,
     },
+    Help,
+    Unknown {
+        command: String,
+        suggestion: Option<String>,
+    },
     Message(String),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandHelp {
+    pub usage: &'static str,
+    pub summary: &'static str,
+}
+
+const HELP_ENTRIES: [CommandHelp; 21] = [
+    CommandHelp {
+        usage: "/help",
+        summary: "Show all slash commands and routing prefixes.",
+    },
+    CommandHelp {
+        usage: "/spawn NAME ROLE [--mode MODE] [TASK]",
+        summary: "Spawn a specialist in a git worktree (or project dir if not a git repo).",
+    },
+    CommandHelp {
+        usage: "/ask NAME TASK",
+        summary: "Delegate or queue a task on an existing specialist.",
+    },
+    CommandHelp {
+        usage: "/review NAME [--next-revision] [FOCUS]",
+        summary: "Run a read-only cross-family review of a specialist's changes.",
+    },
+    CommandHelp {
+        usage: "/roster",
+        summary: "Show active specialists and entry profile.",
+    },
+    CommandHelp {
+        usage: "/diff [NAME]",
+        summary: "Show changed files and line counts for a specialist branch.",
+    },
+    CommandHelp {
+        usage: "/pr [NAME] [--commit]",
+        summary: "Push a specialist branch and open a pull request with gh.",
+    },
+    CommandHelp {
+        usage: "/settle NAME",
+        summary: "Move a finished specialist into the Settled drawer.",
+    },
+    CommandHelp {
+        usage: "/unsettle NAME",
+        summary: "Return a settled specialist to the active queue.",
+    },
+    CommandHelp {
+        usage: "/settled",
+        summary: "Toggle the Settled drawer.",
+    },
+    CommandHelp {
+        usage: "/remove NAME",
+        summary: "Remove a specialist and clean up its worktree.",
+    },
+    CommandHelp {
+        usage: "/entry PROVIDER/PROFILE|auto",
+        summary: "Pin or reset the Commander entry profile.",
+    },
+    CommandHelp {
+        usage: "/mode read-only|supervised|auto-edits|workspace-auto",
+        summary: "Set Commander permission mode.",
+    },
+    CommandHelp {
+        usage: "/btw QUESTION (alias /side)",
+        summary: "Ask a side question without interrupting running work.",
+    },
+    CommandHelp {
+        usage: "/goal CRITERIA | /goal cancel",
+        summary: "Pin a multi-turn goal loop or cancel the active goal.",
+    },
+    CommandHelp {
+        usage: "/settings",
+        summary: "Open Settings panel.",
+    },
+    CommandHelp {
+        usage: "/connect",
+        summary: "Connect or add provider profiles.",
+    },
+    CommandHelp {
+        usage: "/disconnect [TARGET]",
+        summary: "Disconnect a provider profile.",
+    },
+    CommandHelp {
+        usage: "/reconnect [TARGET]",
+        summary: "Reconnect a provider profile.",
+    },
+    CommandHelp {
+        usage: "/update",
+        summary: "Check for and install an Agent Command update.",
+    },
+    CommandHelp {
+        usage: "/hard | /standard | /any | /urgent | /ordinary | /split",
+        summary: "Optional routing prefixes placed before a normal message.",
+    },
+];
+
+const KNOWN_SLASH_COMMANDS: [&str; 27] = [
+    "/help",
+    "/spawn",
+    "/ask",
+    "/review",
+    "/roster",
+    "/diff",
+    "/pr",
+    "/settle",
+    "/unsettle",
+    "/settled",
+    "/remove",
+    "/entry",
+    "/mode",
+    "/btw",
+    "/side",
+    "/goal",
+    "/settings",
+    "/connect",
+    "/disconnect",
+    "/reconnect",
+    "/update",
+    "/hard",
+    "/standard",
+    "/any",
+    "/urgent",
+    "/ordinary",
+    "/split",
+];
+
+const ROUTING_DIRECTIVES: [&str; 6] = [
+    "/urgent",
+    "/ordinary",
+    "/any",
+    "/standard",
+    "/hard",
+    "/split",
+];
+
+pub fn help_entries() -> &'static [CommandHelp] {
+    &HELP_ENTRIES
+}
+
+pub fn format_help() -> String {
+    let mut lines = vec!["Commands:".to_owned()];
+    for entry in HELP_ENTRIES {
+        lines.push(format!("  {:<48} {}", entry.usage, entry.summary));
+    }
+    lines.join("\n")
+}
+
+pub fn closest_command(input: &str) -> Option<String> {
+    let lowered = input.trim().to_ascii_lowercase();
+    if lowered == "/" {
+        return Some("/help".into());
+    }
+    let query = lowered.strip_prefix('/').unwrap_or(&lowered);
+    if query.is_empty() {
+        return Some("/help".into());
+    }
+    let mut best: Option<(usize, &str)> = None;
+    for candidate in KNOWN_SLASH_COMMANDS {
+        let name = candidate.strip_prefix('/').unwrap_or(candidate);
+        let distance = levenshtein(query, name);
+        let prefix_bonus = name.starts_with(query) && query.len() >= 2;
+        if distance <= 2 || prefix_bonus {
+            let rank = if prefix_bonus {
+                distance.min(1)
+            } else {
+                distance
+            };
+            if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+                best = Some((rank, candidate));
+            }
+        }
+    }
+    best.map(|(_, candidate)| candidate.to_owned())
+}
+
+pub fn unknown_command_message(command: &str, suggestion: Option<&str>) -> String {
+    match suggestion {
+        Some(candidate) => {
+            format!("Unknown command {command}. Did you mean {candidate}? Try /help.")
+        }
+        None => format!("Unknown command {command}. Try /help to see available commands."),
+    }
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    if left_chars.is_empty() {
+        return right_chars.len();
+    }
+    if right_chars.is_empty() {
+        return left_chars.len();
+    }
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0; right_chars.len() + 1];
+    for (i, left_ch) in left_chars.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_ch) in right_chars.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_ch != right_ch);
+            let deletion = previous[j + 1] + 1;
+            let insertion = current[j] + 1;
+            current[j + 1] = substitution.min(deletion).min(insertion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalTurn {
+    pub display_label: String,
+    pub model_prompt: String,
+}
+
+pub fn format_goal_turn(criteria: &str, turn: u32, cap: u32, marker: &str) -> GoalTurn {
+    let clean = criteria.split_whitespace().collect::<Vec<_>>().join(" ");
+    let display_label = format!("Goal ({turn}/{cap}): {clean}");
+    let model_prompt = format!(
+        "Pinned goal (turn {turn} of at most {cap}): {clean}\n\n\
+         Work toward this goal now. When the goal is fully met, end your reply with a line containing exactly {marker}. \
+         Otherwise say briefly what remains; you will get another turn."
+    );
+    GoalTurn {
+        display_label,
+        model_prompt,
+    }
+}
+
+pub fn split_goal_prompt(prompt: &str) -> (String, String) {
+    let mut lines = prompt.lines();
+    let first = lines.next().unwrap_or_default().trim().to_owned();
+    let rest: Vec<&str> = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    (first, rest.join(" "))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetCandidate {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub topic: String,
+    pub recency_rank: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetMatch {
+    Chosen(String),
+    Ambiguous(Vec<String>),
+    None,
+}
+
+const TARGET_AMBIGUITY_MARGIN: f64 = 0.6;
+const TARGET_RECENCY_SCALE: f64 = 0.4;
+const TARGET_AMBIGUOUS_LIMIT: usize = 3;
+
+const TARGET_STOP_WORDS: [&str; 32] = [
+    "the", "and", "for", "with", "this", "that", "from", "into", "about", "your", "have", "what",
+    "when", "where", "which", "please", "could", "would", "should", "check", "update", "status",
+    "tell", "show", "give", "make", "work", "task", "focus", "switch", "open", "back",
+];
+
+pub fn resolve_target(query: &str, candidates: &[TargetCandidate]) -> TargetMatch {
+    let terms = extract_topic_terms(query);
+    if terms.is_empty() || candidates.is_empty() {
+        return TargetMatch::None;
+    }
+    let mut scored: Vec<(f64, usize, &str)> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let name_words = fold_words(&candidate.name);
+            let role_words = fold_words(&candidate.role);
+            let topic_words = fold_words(&candidate.topic);
+            let mut topic_score = 0.0;
+            for term in &terms {
+                if candidate.name.eq_ignore_ascii_case(term) {
+                    topic_score += 3.0;
+                } else if name_words.iter().any(|word| word == term) {
+                    topic_score += 1.5;
+                } else if role_words.iter().any(|word| word == term) {
+                    topic_score += 1.25;
+                } else if topic_words.iter().any(|word| word == term) {
+                    topic_score += 1.0;
+                }
+            }
+            if topic_score <= 0.0 {
+                return None;
+            }
+            let recency_boost = TARGET_RECENCY_SCALE / (1.0 + candidate.recency_rank as f64);
+            Some((
+                topic_score + recency_boost,
+                candidate.recency_rank,
+                candidate.id.as_str(),
+            ))
+        })
+        .collect();
+    if scored.is_empty() {
+        return TargetMatch::None;
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(right.2))
+    });
+    if scored.len() == 1 || (scored[0].0 - scored[1].0) >= TARGET_AMBIGUITY_MARGIN {
+        TargetMatch::Chosen(scored[0].2.to_owned())
+    } else {
+        TargetMatch::Ambiguous(
+            scored
+                .into_iter()
+                .take(TARGET_AMBIGUOUS_LIMIT)
+                .map(|(_, _, id)| id.to_owned())
+                .collect(),
+        )
+    }
+}
+
+pub fn resolve_member_target(query: &str, crew: &[Member]) -> TargetMatch {
+    let mut active: Vec<&Member> = crew
+        .iter()
+        .filter(|member| !member.is_commander())
+        .collect();
+    active.sort_by(|left, right| {
+        right
+            .touched
+            .cmp(&left.touched)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let candidates: Vec<TargetCandidate> = active
+        .into_iter()
+        .enumerate()
+        .map(|(rank, member)| TargetCandidate {
+            id: member.name.clone(),
+            name: member.name.clone(),
+            role: member.role.clone(),
+            topic: member.mission.clone(),
+            recency_rank: rank,
+        })
+        .collect();
+    resolve_target(query, &candidates)
+}
+
+fn extract_topic_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in split_token_spans(text) {
+        let is_two_letter_acronym =
+            raw.len() == 2 && raw.bytes().all(|byte| byte.is_ascii_uppercase());
+        let is_version = raw.chars().any(|ch| ch.is_ascii_digit())
+            && raw
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-');
+        let folded = raw.to_ascii_lowercase();
+        let keep = if is_two_letter_acronym || is_version {
+            true
+        } else {
+            folded.chars().count() >= 3 && !TARGET_STOP_WORDS.contains(&folded.as_str())
+        };
+        if keep && !terms.contains(&folded) {
+            terms.push(folded);
+        }
+    }
+    terms
+}
+
+fn fold_words(text: &str) -> Vec<String> {
+    split_token_spans(text)
+        .into_iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn split_token_spans(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (index, ch) in text.char_indices() {
+        let keep = ch.is_alphanumeric() || ch == '.';
+        if keep {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(begin) = start.take() {
+            let trimmed = text[begin..index].trim_matches('.');
+            if !trimmed.is_empty() {
+                tokens.push(trimmed);
+            }
+        }
+    }
+    if let Some(begin) = start {
+        let trimmed = text[begin..].trim_matches('.');
+        if !trimmed.is_empty() {
+            tokens.push(trimmed);
+        }
+    }
+    tokens
+}
+
+const HELP_USAGE: &str = "Usage: /help";
 
 const SPAWN_USAGE: &str =
     "Usage: /spawn NAME ROLE [--mode read-only|supervised|auto-edits|worktree-auto|workspace-auto] [TASK]";
@@ -863,6 +1475,13 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
             }),
             _ => Err(crate::permissions::COMMANDER_MODE_USAGE.into()),
         },
+        "/help" | "/?" if rest.is_empty() => Ok(Command::Help),
+        "/help" | "/?" => Err(HELP_USAGE.into()),
+        other if ROUTING_DIRECTIVES.contains(&other) => Ok(Command::Message(input.into())),
+        other if other.starts_with('/') && !other[1..].contains('/') => Ok(Command::Unknown {
+            command: other.into(),
+            suggestion: closest_command(other),
+        }),
         _ => Ok(Command::Message(input.into())),
     }
 }
@@ -1126,7 +1745,7 @@ fn run_with(
         [verb @ ("settle" | "unsettle"), name] => {
             let index = position(&crew, name)?;
             let note = settle(&mut crew[index], verb == "settle").map_err(invalid)?;
-            store.save_roster(&crew)?;
+            store.save_roster_merging(&crew, &[])?;
             writeln!(out, "{note}")
         }
         ["spawn", name, role, ref rest @ ..] => {
@@ -1147,7 +1766,7 @@ fn run_with(
                 workspace_label(&member)
             )?;
             crew.push(member);
-            store.save_roster(&crew)
+            store.save_roster_merging(&crew, &[])
         }
         ["status", name] => {
             let member = &crew[position(&crew, name)?];
@@ -1177,7 +1796,7 @@ fn run_with(
         ["remove", name] => {
             let member = crew.remove(position(&crew, name)?);
             let retained = store.release(&member)?;
-            store.save_roster(&crew)?;
+            store.save_roster_merging(&crew, &[&member.name])?;
             writeln!(out, "{}", removal_note(&member.name, retained.as_deref()))
         }
         _ => Err(invalid(CLI_USAGE)),
@@ -1238,18 +1857,29 @@ fn unknown(name: &str) -> io::Error {
     invalid(format!("No specialist named {name}"))
 }
 
+pub(crate) fn display_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        raw
+    }
+}
+
 pub(crate) fn workspace_label(member: &Member) -> String {
     match &member.workspace {
         Some(Workspace {
             path,
             isolation: Isolation::Worktree { .. },
             ..
-        }) => format!("git worktree {}", path.display()),
+        }) => format!("git worktree {}", display_path(path)),
         Some(Workspace {
             path,
             isolation: Isolation::Directory,
             ..
-        }) => format!("directory {}", path.display()),
+        }) => format!("directory {}", display_path(path)),
         None => "preview only".into(),
     }
 }
@@ -1585,14 +2215,18 @@ pub(crate) mod tests {
         store
             .append_history("nova", &Entry::now("nova  working".into()))
             .unwrap();
+        let workspace = scratch.0.join("work");
         store
-            .append_commander(&Entry::now("YOU  hello".into()))
+            .append_commander_for_workspace(&workspace, &Entry::now("YOU  hello".into()))
             .unwrap();
         let crew = store.load_roster().unwrap();
         assert_eq!(crew.len(), 1);
         assert_eq!(crew[0].status, Status::Error);
         assert_eq!(crew[0].history[0].text, "nova  working");
-        assert_eq!(store.load_commander().unwrap()[0].text, "YOU  hello");
+        assert_eq!(
+            store.load_commander_for_workspace(&workspace).unwrap()[0].text,
+            "YOU  hello"
+        );
         let roster = scratch
             .0
             .join("profiles")
@@ -1655,10 +2289,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn outside_git_specialists_get_isolated_directories() {
+    fn outside_git_specialists_use_project_directory_and_remove_preserves_it() {
         let scratch = Scratch::new("cli-directory");
         let base = scratch.0.join("plain");
         fs::create_dir(&base).unwrap();
+        let sentinel = base.join("project.txt");
+        fs::write(&sentinel, "keep me").unwrap();
         let store = Store::new(scratch.0.join("profiles"));
         run_with(
             &store,
@@ -1669,7 +2305,14 @@ pub(crate) mod tests {
         .unwrap();
         let workspace = store.load_roster().unwrap()[0].workspace.clone().unwrap();
         assert_eq!(workspace.isolation, Isolation::Directory);
-        assert!(workspace.path.is_dir() && !workspace.path.starts_with(&base));
+        assert_eq!(workspace.path, base.canonicalize().unwrap());
+        assert!(!scratch
+            .0
+            .join("profiles")
+            .join(STATE_DIRECTORY)
+            .join(DIRECTORY_FALLBACK)
+            .join("echo")
+            .exists());
         run_with(
             &store,
             &base,
@@ -1677,7 +2320,8 @@ pub(crate) mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(!workspace.path.exists());
+        assert!(base.is_dir());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep me");
         assert!(run_with(&store, &base, &strings(&["bogus"]), &mut Vec::new()).is_err());
     }
 
@@ -1991,5 +2635,204 @@ pub(crate) mod tests {
         run_with(&store, &plain, &strings(&["spawn", "echo", "w"]), &mut out).unwrap();
         let error = run_with(&store, &plain, &strings(&["diff", "echo"]), &mut out).unwrap_err();
         assert!(error.to_string().contains("plain directory"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod cross_platform_tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ac-spec-{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn help_command_and_typo_guard_never_send_unknown_slash_commands_to_llm() {
+        assert_eq!(parse_command("/help").unwrap(), Command::Help);
+        assert_eq!(parse_command("/?").unwrap(), Command::Help);
+        assert_eq!(parse_command("/help extra").unwrap_err(), HELP_USAGE);
+        let help = format_help();
+        assert!(help.contains("/spawn"));
+        assert!(help.contains("/goal"));
+        assert!(help.contains("/help"));
+        assert!(!help_entries().is_empty());
+
+        assert_eq!(
+            parse_command("/spwn nova builder").unwrap(),
+            Command::Unknown {
+                command: "/spwn".into(),
+                suggestion: Some("/spawn".into()),
+            }
+        );
+        assert_eq!(
+            parse_command("/rostr").unwrap(),
+            Command::Unknown {
+                command: "/rostr".into(),
+                suggestion: Some("/roster".into()),
+            }
+        );
+        assert_eq!(
+            parse_command("/completelyunknowncmd").unwrap(),
+            Command::Unknown {
+                command: "/completelyunknowncmd".into(),
+                suggestion: None,
+            }
+        );
+        assert!(unknown_command_message("/spwn", Some("/spawn")).contains("Did you mean /spawn?"));
+        assert!(unknown_command_message("/foo", None).contains("Try /help"));
+
+        for routing_msg in [
+            "/hard Fix auth",
+            "/standard Check tests",
+            "/urgent Ship now",
+            "/ordinary Tidy docs",
+            "/any Explain this",
+            "/split a ;; b",
+            "/etc/hosts looks wrong",
+        ] {
+            assert_eq!(
+                parse_command(routing_msg).unwrap(),
+                Command::Message(routing_msg.into()),
+                "{routing_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_git_isolate_uses_actual_project_directory_and_release_never_deletes_it() {
+        let dir = TempDir::new("non-git");
+        let project = dir.0.join("my-project");
+        fs::create_dir_all(&project).unwrap();
+        let file = project.join("README.md");
+        fs::write(&file, "real user work").unwrap();
+
+        let store = Store::new(dir.0.join("profiles"));
+        let workspace = store.isolate(&project, "nova", "inspect").unwrap();
+        assert_eq!(workspace.isolation, Isolation::Directory);
+        assert_eq!(workspace.path, project.canonicalize().unwrap());
+        assert!(workspace.branch.is_none());
+
+        let member = Member::new("nova", "builder", Some("inspect"), Some(workspace));
+        store.release(&member).unwrap();
+        assert!(project.is_dir());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "real user work");
+    }
+
+    #[test]
+    fn roster_save_merging_preserves_concurrent_peer_specialists() {
+        let dir = TempDir::new("roster-merge");
+        let store = Store::new(dir.0.join("profiles"));
+        let tui_member = Member::new("alpha", "builder", Some("UI work"), None);
+        store
+            .save_roster_merging(&[Member::commander(), tui_member], &[])
+            .unwrap();
+
+        let daemon_member = Member::new("beta", "reviewer", Some("Check API"), None);
+        store
+            .save_roster_merging(&[Member::commander(), daemon_member], &[])
+            .unwrap();
+
+        let loaded = store.load_roster().unwrap();
+        let names: Vec<&str> = loaded.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "{names:?}");
+        assert!(names.contains(&"beta"), "{names:?}");
+
+        store
+            .save_roster_merging(&[Member::commander()], &["alpha"])
+            .unwrap();
+        let remaining = store.load_roster().unwrap();
+        let remaining_names: Vec<&str> = remaining.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(remaining_names, ["beta"]);
+    }
+
+    #[test]
+    fn goal_turn_formatting_separates_display_label_from_model_instruction() {
+        let turn = format_goal_turn("finish   testing\nnow", 1, 10, "GOAL_MET");
+        assert_eq!(turn.display_label, "Goal (1/10): finish testing now");
+        assert!(!turn.display_label.contains("Work toward"));
+        assert!(!turn.display_label.contains("GOAL_MET"));
+        assert!(!turn.model_prompt.contains("testingWork"));
+        assert!(turn
+            .model_prompt
+            .contains("finish testing now\n\nWork toward"));
+        assert!(turn.model_prompt.contains("GOAL_MET"));
+
+        let (head, body) = split_goal_prompt(&turn.model_prompt);
+        assert_eq!(
+            head,
+            "Pinned goal (turn 1 of at most 10): finish testing now"
+        );
+        assert!(body.starts_with("Work toward"));
+    }
+
+    #[test]
+    fn resolve_target_matches_whole_words_acronyms_versions_and_detects_ambiguity() {
+        let candidates = vec![
+            TargetCandidate {
+                id: "w-core".into(),
+                name: "core-refactor".into(),
+                role: "builder".into(),
+                topic: "Refactor core auth v1.3".into(),
+                recency_rank: 2,
+            },
+            TargetCandidate {
+                id: "w-score".into(),
+                name: "score-engine".into(),
+                role: "builder".into(),
+                topic: "Update score ranking for KR market".into(),
+                recency_rank: 0,
+            },
+            TargetCandidate {
+                id: "w-billing-a".into(),
+                name: "billing-a".into(),
+                role: "builder".into(),
+                topic: "Stripe billing webhook handler".into(),
+                recency_rank: 0,
+            },
+            TargetCandidate {
+                id: "w-billing-b".into(),
+                name: "billing-b".into(),
+                role: "builder".into(),
+                topic: "Stripe billing retry queue".into(),
+                recency_rank: 1,
+            },
+        ];
+
+        assert_eq!(
+            resolve_target("core", &candidates),
+            TargetMatch::Chosen("w-core".into())
+        );
+        assert_eq!(
+            resolve_target("KR", &candidates),
+            TargetMatch::Chosen("w-score".into())
+        );
+        assert_eq!(
+            resolve_target("v1.3", &candidates),
+            TargetMatch::Chosen("w-core".into())
+        );
+        assert_eq!(
+            resolve_target("billing", &candidates),
+            TargetMatch::Ambiguous(vec!["w-billing-a".into(), "w-billing-b".into()])
+        );
+        assert_eq!(
+            resolve_target("unrelated quantum", &candidates),
+            TargetMatch::None
+        );
     }
 }

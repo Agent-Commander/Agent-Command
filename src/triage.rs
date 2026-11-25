@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-const USAGE: &str = "agent-command triage [--json] [--pipe claude|codex]";
+const USAGE: &str = "agent-command triage [--json] [--pipe claude|codex|gemini]";
 const REDACTED: &str = "[REDACTED]";
 const SECRET_PREFIXES: [&str; 10] = [
     "sk-",
@@ -416,8 +416,15 @@ mod tests {
                 pipe: Some(Provider::Codex)
             }
         );
+        assert_eq!(
+            parse(&args(&["--pipe", "gemini"])).unwrap(),
+            Options {
+                json: false,
+                pipe: Some(Provider::Gemini)
+            }
+        );
         assert_eq!(parse(&args(&["--pipe"])).unwrap_err(), USAGE);
-        assert_eq!(parse(&args(&["--pipe", "gemini"])).unwrap_err(), USAGE);
+        assert_eq!(parse(&args(&["--pipe", "unknown"])).unwrap_err(), USAGE);
         assert_eq!(parse(&args(&["--token"])).unwrap_err(), USAGE);
     }
 
