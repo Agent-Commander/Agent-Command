@@ -235,6 +235,42 @@ pub(crate) fn diff_stat(worktree: &Path, branch: &Branch) -> io::Result<DiffStat
     Ok(DiffStat { files })
 }
 
+pub(crate) fn unified_diff(directory: &Path, branch: Option<&Branch>) -> io::Result<String> {
+    let args: Vec<&str> = match branch {
+        Some(branch) => vec!["diff", "--no-color", &branch.base_commit, "--"],
+        None => vec!["diff", "--no-color", "HEAD", "--"],
+    };
+    match git_raw(directory, &args) {
+        Ok(text) => Ok(text),
+        Err(_) => git_raw(directory, &["diff", "--no-color"]),
+    }
+}
+
+pub(crate) fn current_branch(directory: &Path) -> Option<String> {
+    git(directory, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            git(directory, &["rev-parse", "--short", "HEAD"])
+                .ok()
+                .filter(|sha| !sha.is_empty())
+        })
+}
+
+pub(crate) fn working_tree_stat(directory: &Path) -> io::Result<DiffStat> {
+    let tracked = git_raw(
+        directory,
+        &["diff", "--numstat", "-z", "--no-renames", "HEAD", "--"],
+    )
+    .or_else(|_| git_raw(directory, &["diff", "--numstat", "-z", "--no-renames"]))?;
+    let mut files = parse_numstat(&tracked);
+    if let Ok(extra) = untracked(directory) {
+        files.extend(extra);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(DiffStat { files })
+}
+
 pub(crate) struct PullRequest<'a> {
     pub(crate) specialist: &'a str,
     pub(crate) role: &'a str,

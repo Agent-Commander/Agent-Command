@@ -135,7 +135,7 @@ impl Usage {
             .min_by(f64::total_cmp)
     }
 
-    pub(crate) fn rows(self, now: Tick) -> [String; 2] {
+    pub fn rows(self, now: Tick) -> [String; 2] {
         let row = |name, window: Option<Window>| match window {
             Some(window) => {
                 let age = observation_age(window, now);
@@ -178,7 +178,7 @@ impl Usage {
         }
     }
 
-    pub(crate) fn latch_label(self, now: Tick) -> String {
+    pub fn latch_label(self, now: Tick) -> String {
         match self.latch.filter(|reset| *reset > now.wall) {
             Some(i64::MAX) => "Latched · reset unknown".into(),
             Some(reset) => format!("Latched {}", duration(reset.saturating_sub(now.wall))),

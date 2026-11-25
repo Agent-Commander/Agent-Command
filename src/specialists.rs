@@ -7,6 +7,7 @@ use crate::{
     routing,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs,
@@ -21,7 +22,16 @@ const ROSTER_LOCK_FILE: &str = ".roster.lock";
 const ROSTER_LOCK_WAIT_MS: u64 = 10;
 const ROSTER_LOCK_ATTEMPTS: usize = 500;
 const ROSTER_LOCK_STALE_SECS: u64 = 10;
-const COMMANDER_FILE: &str = "commander.jsonl";
+pub(crate) fn workspace_hash(workspace: &Path) -> String {
+    let canonical = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let normalized = canonical.to_string_lossy().to_ascii_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+fn workspace_commander_file(workspace: &Path) -> String {
+    format!("commander-{}.jsonl", workspace_hash(workspace))
+}
 const HISTORY_DIRECTORY: &str = "history";
 const WORKTREE_DIRECTORY: &str = "worktrees";
 const DIRECTORY_FALLBACK: &str = "workspaces";
@@ -327,15 +337,22 @@ impl Store {
         write_roster_records(&directory, merged)
     }
 
-    pub(crate) fn load_commander(&self) -> io::Result<Vec<Entry>> {
+    pub(crate) fn load_commander_for_workspace(&self, workspace: &Path) -> io::Result<Vec<Entry>> {
         match self.existing()? {
-            Some(directory) => read_entries(&directory.join(COMMANDER_FILE)),
+            Some(directory) => read_entries(&directory.join(workspace_commander_file(workspace))),
             None => Ok(Vec::new()),
         }
     }
 
-    pub(crate) fn append_commander(&self, entry: &Entry) -> io::Result<()> {
-        append_entry(&self.directory()?.join(COMMANDER_FILE), entry)
+    pub(crate) fn append_commander_for_workspace(
+        &self,
+        workspace: &Path,
+        entry: &Entry,
+    ) -> io::Result<()> {
+        append_entry(
+            &self.directory()?.join(workspace_commander_file(workspace)),
+            entry,
+        )
     }
 
     pub(crate) fn append_history(&self, name: &str, entry: &Entry) -> io::Result<()> {

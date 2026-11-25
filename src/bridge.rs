@@ -57,6 +57,16 @@ impl BridgeProvider {
     }
 }
 
+impl From<crate::auth::Provider> for BridgeProvider {
+    fn from(provider: crate::auth::Provider) -> Self {
+        match provider {
+            crate::auth::Provider::Claude => Self::Claude,
+            crate::auth::Provider::Codex => Self::Codex,
+            crate::auth::Provider::Gemini => Self::Gemini,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeInjection {
     pub args: Vec<String>,

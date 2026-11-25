@@ -183,7 +183,7 @@ pub(crate) fn external_mode(requested: PermissionMode) -> PermissionMode {
 
 impl Engine for NativeEngine {
     fn start(&self, member: &Member, task: &str, workspace: &Path) -> Result<Box<dyn Run>, String> {
-        let profiles = auth::profiles(&self.profile_root).map_err(|error| error.to_string())?;
+        let profiles = auth::all_profiles(&self.profile_root).map_err(|error| error.to_string())?;
         if profiles.is_empty() {
             return Err(format!("{}.", crate::panel::NO_PROVIDER_HINT));
         }

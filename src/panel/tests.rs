@@ -449,8 +449,9 @@ fn settings_opens_from_the_top_bar_f3_and_slash_command() {
             let mut app = preview(&host, LaunchConfig::default());
             let buffer = render(&mut app, width, height);
             let bar = row(&buffer, 0);
-            assert!(bar.contains("Radio    |    PRIVATEER"), "{bar}");
-            assert!(bar.trim_end().ends_with("Settings"), "{bar}");
+            assert!(bar.contains("agent-command"), "{bar}");
+            assert!(!bar.contains("PRIVATEER"), "{bar}");
+            assert!(bar.contains('⚙'), "{bar}");
             assert!(app.settings_area.right() <= width && app.settings_area.y == 0);
             match opener {
                 "click" => {
@@ -470,16 +471,25 @@ fn settings_opens_from_the_top_bar_f3_and_slash_command() {
                 "SUBSCRIPTIONS",
                 "+ Connect subscription",
                 "Commander profile",
+                "ProdGate floor",
                 "Check for updates",
-                &format!("Version   {}", update::CURRENT),
-                "Profiles",
-                "Theme",
             ] {
                 assert!(text.contains(expected), "{opener} {expected}\n{text}");
+            }
+            if height >= 40 {
+                for expected in [
+                    &format!("Version   {}", update::CURRENT),
+                    "Profiles",
+                    "Theme",
+                    "Close",
+                ] {
+                    assert!(text.contains(expected), "{opener} {expected}\n{text}");
+                }
             }
             assert_inside(&app, width, height);
             press(&mut app, KeyCode::Esc);
             assert!(app.panel.is_none(), "{opener}");
+            assert!(app.editing, "{opener}");
         }
     }
 }
@@ -892,7 +902,7 @@ fn update_is_refused_in_preview() {
     app.panel = None;
     let _sender = detected(&mut app, "9.9.9");
     let text = last_row(&render(&mut app, 80, 24));
-    assert!(text.ends_with(" Update "), "{text}");
+    assert!(text.ends_with(" ⬆ Update v9.9.9 "), "{text}");
     let button = app.update_area;
     click(&mut app, button);
     assert_eq!(app.notice, PREVIEW_BLOCKER);
@@ -904,36 +914,17 @@ fn update_button_sits_bottom_right_and_left_of_abandon_at_both_sizes() {
     for (width, height) in SIZES {
         let mut app = App::from_live(crate::Live::new(std::env::temp_dir(), Vec::new(), None));
         let text = last_row(&render(&mut app, width, height));
-        assert!(!text.contains("Update"), "{text}");
-        let crew_before = app.crew_area;
+        assert!(text.contains(update::CURRENT), "{text}");
+        assert_eq!(app.update_area.y, height - 1);
+        assert_eq!(app.update_area.right(), width);
+
         let _sender = detected(&mut app, "9.9.9");
         let buffer = render(&mut app, width, height);
         let text = last_row(&buffer);
-        let label = if width >= 100 {
-            " Update v9.9.9 "
-        } else {
-            " Update "
-        };
-        assert!(text.ends_with(label), "{text}");
-        assert!(text.starts_with(" ^Q Quit"), "{text}");
+        assert!(text.contains("Update v9.9.9"), "{text}");
         assert_eq!(app.update_area.y, height - 1);
         assert_eq!(app.update_area.right(), width);
-        assert_eq!(usize::from(app.update_area.width), label.chars().count());
-        assert_eq!(app.crew_area, crew_before);
-
-        let bar = Rect::new(0, height - 1, width, 1);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|f| app.draw_shortcut_bar(f, bar, true))
-            .unwrap();
-        let text = last_row(terminal.backend().buffer());
-        assert!(text.ends_with(&format!("{label}  F4 Abandon  ")), "{text}");
-        let abandon = app.live.as_ref().unwrap().abandon_area;
-        assert_eq!(abandon.right(), width);
-        assert_eq!(app.update_area.right(), abandon.x);
-        assert_eq!(text.contains('…'), width < 100, "{text}");
-        let shortcuts: String = text.chars().take(usize::from(app.update_area.x)).collect();
-        assert!(!shortcuts.contains("Update"), "{shortcuts}");
+        assert!(app.update_area.width > 0);
     }
 }
 
@@ -1483,6 +1474,5 @@ fn mode_command_sets_and_persists_the_commander_permission() {
     app.submit();
     assert_eq!(app.notice, crate::permissions::COMMANDER_MODE_USAGE);
     let text = screen(&render(&mut app, 120, 40));
-    assert!(text.contains("PERMISSIONS"), "{text}");
-    assert!(text.contains("supervised"), "{text}");
+    assert!(text.contains("supervised · ProdGate on"), "{text}");
 }

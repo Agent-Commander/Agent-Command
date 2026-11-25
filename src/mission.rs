@@ -232,7 +232,7 @@ impl Route {
 }
 
 impl Mission {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn held() -> (Self, std::sync::mpsc::Sender<Event>) {
         let (sender, events) = std::sync::mpsc::channel();
         let (_norm_tx, normalized) = mpsc::channel();

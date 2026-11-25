@@ -31,6 +31,7 @@ mod specialists;
 mod targeting;
 pub mod token_burn;
 mod triage;
+pub mod tui;
 pub mod update;
 pub mod usage;
 pub use cli::run_cli;
@@ -41,21 +42,15 @@ pub use specialists::{
 };
 
 use std::{
-    collections::VecDeque,
-    fs, io,
+    collections::{HashMap, VecDeque},
+    env, fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, TryRecvError},
-    time::SystemTime,
+    sync::mpsc::{Receiver, Sender, TryRecvError},
+    time::{Instant, SystemTime},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
-    Frame,
-};
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, style::Color, Frame};
 use serde::Deserialize;
 
 const PREVIEW_NOTICE: &str = "Preview only; no external dispatch.";
@@ -133,30 +128,6 @@ fn profile_route(
     ProfileRoute::Excluded(reason.into())
 }
 
-fn deck_card(
-    label: &str,
-    allowance: usage::Allowance,
-    route: Option<&ProfileRoute>,
-) -> token_burn::AccountCard {
-    let (provider, profile) = label.split_once('/').unwrap_or((label, ""));
-    let (route_model, route_metric) = match route {
-        _ if allowance.latched => (None, Some("latched".to_owned())),
-        Some(ProfileRoute::Routed { model, metric }) => (Some(model.clone()), Some(metric.clone())),
-        Some(ProfileRoute::Excluded(reason)) => (None, Some(reason.clone())),
-        None => (None, None),
-    };
-    token_burn::AccountCard {
-        provider: provider.into(),
-        profile: profile.into(),
-        tier: String::new(),
-        primary_remaining: allowance.five,
-        secondary_remaining: allowance.week,
-        seconds_until_reset: allowance.reset_in,
-        route_model,
-        route_metric,
-    }
-}
-
 fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
     fs::read_to_string(path)
         .ok()
@@ -164,43 +135,19 @@ fn deck_palette(path: &Path) -> token_burn::TokenBurnPalette {
         .unwrap_or_default()
 }
 
-fn deck_mode(area: Rect, compact_layout: bool) -> token_burn::DeckMode {
-    if compact_layout {
-        token_burn::DeckMode::Compact
-    } else {
-        token_burn::DeckMode::for_area(area)
-    }
-}
-
-const COMPACT_DECK_MAX_ROWS: usize = 3;
-const FULL_DECK_MAX_CARDS: usize = 3;
-const UPDATE_WIDE_MIN_WIDTH: u16 = 100;
-const ABANDON_LABEL: &str = "  F4 Abandon  ";
-const SHORTCUTS: &str =
-    " ^Q Quit    ^N New mission    ^P Pause / resume    ^L Clear feed    F7 Settled";
-
 fn framed(mut request: routing::Request, frame: impl Fn(&str) -> String) -> routing::Request {
     request.units = request.units.iter().map(|unit| frame(unit)).collect();
     request
 }
 
-struct SideAnswer {
-    thread: String,
-    entry: Entry,
-}
-
 struct Snooze {
     thread: String,
-    banner: Entry,
 }
 
 impl Snooze {
-    fn new(thread: &str, label: &str) -> Self {
+    fn new(thread: &str) -> Self {
         Self {
             thread: thread.into(),
-            banner: Entry::now(format!(
-                "SNOOZED  {label} Feed collapsed until the mission resumes."
-            )),
         }
     }
 }
@@ -240,39 +187,50 @@ enum ProfileRoute {
     Excluded(String),
 }
 
-struct Live {
-    workspace: PathBuf,
-    profiles: Vec<auth::Profile>,
-    profile_root: Option<PathBuf>,
-    preferred: Option<usize>,
+pub(crate) struct Live {
+    pub(crate) workspace: PathBuf,
+    pub(crate) profiles: Vec<auth::Profile>,
+    pub(crate) profile_root: Option<PathBuf>,
+    pub(crate) preferred: Option<usize>,
     pins: native::Pins,
     last_routed: Option<usize>,
-    profile_area: Rect,
+    pub(crate) profile_area: Rect,
     usage: Option<usage::Usage>,
     usage_checked_at: Option<u64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
-    pending: Option<(usize, checkpoint::Claim)>,
-    abandon_area: Rect,
-    runs: Vec<Run>,
-    store: Option<specialists::Store>,
-    queue: VecDeque<Delegation>,
+    pub(crate) pending: Option<(usize, checkpoint::Claim)>,
+    pub(crate) abandon_area: Rect,
+    pub(crate) runs: Vec<Run>,
+    pub(crate) store: Option<specialists::Store>,
+    pub(crate) queue: VecDeque<Delegation>,
     tools: branches::Tools,
     entry: Option<(String, &'static str)>,
     routes: Vec<ProfileRoute>,
-    allowances: Vec<usage::Allowance>,
-    signed_in: Vec<bool>,
+    pub(crate) allowances: Vec<usage::Allowance>,
+    pub(crate) signed_in: Vec<bool>,
+    pub(crate) bridge: Option<bridge::LoopbackBridge>,
+    pub(crate) commander_session_id: Option<String>,
+    pub(crate) commander_provider: Option<auth::Provider>,
+    pub(crate) soul_store: Option<soul::SoulStore>,
+    pub(crate) recent_shell_context: VecDeque<String>,
+    pub(crate) handoff_turns: Vec<soul::HandoffTurn>,
+    pub(crate) live_quota: Option<(Option<f32>, Option<f32>)>,
+    pub(crate) pending_prod_gates: HashMap<String, String>,
 }
 
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
 const EVENTS_PER_POLL: usize = 64;
 
-struct Run {
-    name: String,
-    mission: mission::Mission,
+pub(crate) struct Run {
+    pub(crate) name: String,
+    pub(crate) mission: mission::Mission,
     reply: String,
     continuation: Option<String>,
     reviewing: bool,
+    pub(crate) thinking_started_at: Option<Instant>,
+    pub(crate) tool_started_at: HashMap<String, Instant>,
+    pub(crate) saw_normalized_text: bool,
 }
 
 impl Run {
@@ -283,6 +241,9 @@ impl Run {
             reply: String::new(),
             continuation: None,
             reviewing,
+            thinking_started_at: None,
+            tool_started_at: HashMap::new(),
+            saw_normalized_text: false,
         }
     }
 
@@ -294,6 +255,14 @@ impl Run {
                 io::Error::other("Mission worker stopped"),
             ))),
         }
+    }
+
+    fn drain_normalized(&self) -> Vec<mission::NormalizedEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.mission.normalized.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }
 
@@ -325,6 +294,14 @@ impl Live {
             routes: Vec::new(),
             allowances: Vec::new(),
             signed_in: Vec::new(),
+            bridge: None,
+            commander_session_id: None,
+            commander_provider: None,
+            soul_store: soul::SoulStore::from_env(),
+            recent_shell_context: VecDeque::new(),
+            handoff_turns: Vec::new(),
+            live_quota: None,
+            pending_prod_gates: HashMap::new(),
         }
     }
 
@@ -332,11 +309,11 @@ impl Live {
         !self.runs.is_empty()
     }
 
-    fn running(&self, name: &str) -> bool {
+    pub(crate) fn running(&self, name: &str) -> bool {
         self.run_position(name).is_some()
     }
 
-    fn run_position(&self, name: &str) -> Option<usize> {
+    pub(crate) fn run_position(&self, name: &str) -> Option<usize> {
         self.runs
             .iter()
             .position(|run| run.name.eq_ignore_ascii_case(name))
@@ -357,7 +334,7 @@ impl Live {
         self.queue.remove(position)
     }
 
-    fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
+    pub(crate) fn reset_profiles(&mut self, profiles: Vec<auth::Profile>) {
         self.profiles = profiles;
         self.preferred = None;
         self.last_routed = None;
@@ -414,20 +391,6 @@ impl Live {
             .collect();
     }
 
-    fn deck_cards(&self) -> Vec<token_burn::AccountCard> {
-        self.profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| {
-                deck_card(
-                    &profile.to_string(),
-                    self.allowances.get(index).copied().unwrap_or_default(),
-                    self.routes.get(index),
-                )
-            })
-            .collect()
-    }
-
     fn entry_label(&self) -> String {
         self.entry.as_ref().map_or_else(
             || "no signed-in profile".into(),
@@ -465,7 +428,7 @@ impl Live {
             .map(|index| self.profiles[index].clone())
     }
 
-    fn displayed_profile(&self) -> usize {
+    pub(crate) fn displayed_profile(&self) -> usize {
         self.running_profile
             .or(self.preferred)
             .or(self.last_routed)
@@ -506,13 +469,11 @@ impl Live {
         }
     }
 
-    fn pin_label(&self, index: usize) -> String {
-        self.pins
-            .get(&self.profiles[index].to_string())
-            .map_or_else(
-                || "no model pin".into(),
-                |pin| format!("pin {}", pin.label()),
-            )
+    pub(crate) fn pin_label(&self, index: usize) -> Option<String> {
+        self.profiles
+            .get(index)
+            .and_then(|profile| self.pins.get(&profile.to_string()))
+            .map(native::Pin::label)
     }
 
     fn save_override(&self) -> io::Result<()> {
@@ -533,15 +494,7 @@ impl Live {
         catalog::Catalog::load(state.as_deref())
     }
 
-    fn route_mode(&self) -> &'static str {
-        if self.preferred.is_some() {
-            "Override"
-        } else {
-            "Auto"
-        }
-    }
-
-    fn refresh_usage(&mut self) {
+    pub(crate) fn refresh_usage(&mut self) {
         let now = usage::now();
         if self.usage_checked_at == Some(now.elapsed / 1_000_000_000) {
             return;
@@ -581,7 +534,7 @@ impl Live {
 }
 
 pub struct App {
-    live: Option<Live>,
+    pub(crate) live: Option<Live>,
     pub selected: usize,
     pub crew: Vec<Member>,
     pub input: String,
@@ -590,6 +543,7 @@ pub struct App {
     pub log: VecDeque<String>,
     pub log_times: VecDeque<String>,
     pub theme: Theme,
+    pub ui_palette: markdown::UiPalette,
     pub notice: String,
     theme_stamp: Option<SystemTime>,
     pub crew_area: Rect,
@@ -597,36 +551,67 @@ pub struct App {
     pub new_area: Rect,
     pub pause_area: Rect,
     pub send_area: Rect,
-    crew_row_height: u16,
-    crew_offset: usize,
     pub show_settled: bool,
     touch_clock: u64,
     pub deck_palette: token_burn::TokenBurnPalette,
     update_receiver: Option<Receiver<String>>,
     pub update_available: Option<String>,
+    pub update_state: update::UpdateState,
     pub update_area: Rect,
     exit_message: Option<String>,
-    deck_hits: Vec<(usize, Rect)>,
+    pub(crate) relaunch_executable: Option<PathBuf>,
     pub settings_area: Rect,
+    pub palette_area: Rect,
+    pub profile_area: Rect,
+    pub transcript_area: Rect,
     pub full_redraw: bool,
-    panel: Option<panel::Panel>,
+    pub(crate) panel: Option<panel::Panel>,
     panel_hits: Vec<(panel::Action, Rect)>,
     host: Option<Box<dyn panel::Host>>,
-    settings: settings::Settings,
-    launch: settings::LaunchConfig,
+    pub(crate) settings: settings::Settings,
+    pub(crate) launch: settings::LaunchConfig,
     goal: Option<goal::Goal>,
     side_chats: Vec<side::SideChat>,
-    side_answers: Vec<SideAnswer>,
     snoozes: Vec<Snooze>,
+    pub composer: editor::Composer,
+    pub autocomplete: editor::AutocompletePopup,
+    pub palette: palette::CommandPalette,
+    pub diff_modal: tui::diff_modal::DiffModal,
+    pub transcript: markdown::Transcript,
+    pub scroll: markdown::ScrollState,
+    pub(crate) specialist_transcripts: HashMap<String, markdown::Transcript>,
+    pub(crate) specialist_scrolls: HashMap<String, markdown::ScrollState>,
+    pub rail_open: bool,
+    pub rail_focused: bool,
+    pub show_welcome: bool,
+    pub github_status: github::GitHubAuthStatus,
+    pub auth_detections: Vec<auth::AuthDetection>,
+    pub git_snapshot: tui::events::GitSnapshot,
+    pub turn_changes: Vec<tui::events::ChangedFile>,
+    pub(crate) rail_hits: Vec<(Rect, tui::render::RailHit)>,
+    pub(crate) focus_banner_hits: Vec<(Rect, tui::render::FocusBannerHit)>,
+    pub(crate) welcome_hits: Vec<(Rect, tui::render::WelcomeHit)>,
+    pub(crate) bg_tx: Option<Sender<tui::events::AppEvent>>,
+    pub(crate) bg_rx: Option<Receiver<tui::events::AppEvent>>,
+    pub(crate) esc_armed_at: Option<Instant>,
+    pub(crate) ctrl_c_armed_at: Option<Instant>,
+    pub(crate) leader_armed_at: Option<Instant>,
+    pub(crate) external_editor_request: Option<String>,
 }
+
 impl Default for App {
     fn default() -> Self {
+        let mut transcript = markdown::Transcript::new();
+        transcript.push(markdown::TranscriptEntry::SystemNotice {
+            level: markdown::NoticeLevel::Info,
+            text: "Commander online. Ask anything, /help for commands, Ctrl+P for palette.".into(),
+        });
         Self {
             live: None,
             selected: 0,
             crew: vec![Member::commander()],
             input: String::new(),
-            editing: false,
+            editing: true,
             quit: false,
             log: VecDeque::from([
                 "SYSTEM  Commander online. Message Commander, or /spawn NAME ROLE [TASK]."
@@ -634,6 +619,7 @@ impl Default for App {
             ]),
             log_times: VecDeque::from([chrono::Local::now().format("%H:%M:%S").to_string()]),
             theme: Theme::default(),
+            ui_palette: markdown::UiPalette::dark_deck(),
             notice: String::new(),
             theme_stamp: None,
             crew_area: Rect::default(),
@@ -641,17 +627,19 @@ impl Default for App {
             new_area: Rect::default(),
             pause_area: Rect::default(),
             send_area: Rect::default(),
-            crew_row_height: 1,
-            crew_offset: 0,
             show_settled: false,
             touch_clock: 0,
             deck_palette: token_burn::TokenBurnPalette::default(),
             update_receiver: None,
             update_available: None,
+            update_state: update::UpdateState::Idle,
             update_area: Rect::default(),
             exit_message: None,
-            deck_hits: Vec::new(),
+            relaunch_executable: None,
             settings_area: Rect::default(),
+            palette_area: Rect::default(),
+            profile_area: Rect::default(),
+            transcript_area: Rect::default(),
             full_redraw: false,
             panel: None,
             panel_hits: Vec::new(),
@@ -660,19 +648,77 @@ impl Default for App {
             launch: settings::LaunchConfig::default(),
             goal: None,
             side_chats: Vec::new(),
-            side_answers: Vec::new(),
             snoozes: Vec::new(),
+            composer: editor::Composer::new(),
+            autocomplete: editor::AutocompletePopup::new(),
+            palette: palette::CommandPalette::default(),
+            diff_modal: tui::diff_modal::DiffModal::new(),
+            transcript,
+            scroll: markdown::ScrollState::new(),
+            specialist_transcripts: HashMap::new(),
+            specialist_scrolls: HashMap::new(),
+            rail_open: true,
+            rail_focused: false,
+            show_welcome: false,
+            github_status: github::GitHubAuthStatus::default(),
+            auth_detections: Vec::new(),
+            git_snapshot: tui::events::GitSnapshot::default(),
+            turn_changes: Vec::new(),
+            rail_hits: Vec::new(),
+            focus_banner_hits: Vec::new(),
+            welcome_hits: Vec::new(),
+            bg_tx: None,
+            bg_rx: None,
+            esc_armed_at: None,
+            ctrl_c_armed_at: None,
+            leader_armed_at: None,
+            external_editor_request: None,
         }
     }
 }
+
 impl App {
-    fn live(workspace: PathBuf) -> Self {
+    pub fn live_fast(workspace: PathBuf) -> Self {
+        let root = auth::root().ok();
+        let mut live = Live::new(workspace, Vec::new(), root);
+        let _ = live.load_pins();
+        let _ = live.load_override();
+        Self::from_live(live)
+    }
+
+    pub(crate) fn attach_fast(
+        &mut self,
+        host: Box<dyn panel::Host>,
+        launch: settings::LaunchConfig,
+    ) {
+        if let Some(path) = &launch.settings_path {
+            match settings::Settings::load(path) {
+                Ok(loaded) => self.settings = loaded,
+                Err(error) => {
+                    self.notice = format!("Settings unreadable: {error}. Using defaults.")
+                }
+            }
+        }
+        self.crew[0].permission = self.settings.commander_permission;
+        if let Some(live) = &mut self.live {
+            live.soul_store = self
+                .settings
+                .effective_soul_path()
+                .map(soul::SoulStore::new)
+                .or_else(soul::SoulStore::from_env);
+        }
+        self.launch = launch;
+        self.host = Some(host);
+        self.editing = true;
+    }
+
+    pub fn live(workspace: PathBuf) -> Self {
         let mut notice = String::new();
         let root = auth::root();
         let profiles = root
             .as_ref()
             .map_err(|error| io::Error::new(error.kind(), error.to_string()))
-            .and_then(|root| auth::profiles(root))
+            .and_then(|root| auth::all_profiles(root))
             .unwrap_or_else(|error| {
                 notice = format!("Cannot load profiles: {error}");
                 Vec::new()
@@ -696,6 +742,7 @@ impl App {
         app
     }
 
+    #[cfg(test)]
     fn attach(&mut self, host: Box<dyn panel::Host>, launch: settings::LaunchConfig) {
         if let Some(path) = &launch.settings_path {
             match settings::Settings::load(path) {
@@ -706,10 +753,18 @@ impl App {
             }
         }
         self.crew[0].permission = self.settings.commander_permission;
+        if let Some(live) = &mut self.live {
+            live.soul_store = self
+                .settings
+                .effective_soul_path()
+                .map(soul::SoulStore::new)
+                .or_else(soul::SoulStore::from_env);
+        }
         self.launch = launch;
         self.host = Some(host);
         self.refresh_sign_in();
         if self.no_provider_connected() {
+            self.show_welcome = true;
             self.open_connect(panel::Origin::Onboarding);
         }
     }
@@ -726,10 +781,16 @@ impl App {
         let mut app = Self::default();
         app.log.clear();
         app.log_times.clear();
+        app.transcript.clear();
         if let Some(store) = &live.store {
-            match store.load_commander() {
+            match store.load_commander_for_workspace(&live.workspace) {
                 Ok(entries) => {
                     for entry in entries {
+                        app.push_transcript_log_entry(
+                            COMMANDER,
+                            &entry.text,
+                            Some(entry.at.clone()),
+                        );
                         app.log.push_back(entry.text);
                         app.log_times.push_back(entry.at);
                     }
@@ -737,7 +798,19 @@ impl App {
                 Err(error) => app.notice = format!("Cannot read Commander transcript: {error}"),
             }
             match store.load_roster() {
-                Ok(members) => app.crew.extend(members),
+                Ok(members) => {
+                    for member in members {
+                        let name = member.name.clone();
+                        for entry in &member.history {
+                            app.push_transcript_log_entry(
+                                &name,
+                                &entry.text,
+                                Some(entry.at.clone()),
+                            );
+                        }
+                        app.crew.push(member);
+                    }
+                }
                 Err(error) => app.notice = format!("Cannot read specialist roster: {error}"),
             }
         }
@@ -747,7 +820,7 @@ impl App {
         app
     }
 
-    fn select_profile(&mut self) {
+    pub(crate) fn select_profile(&mut self) {
         let Some(live) = &mut self.live else { return };
         if live.busy() || live.profiles.is_empty() {
             return;
@@ -769,15 +842,33 @@ impl App {
         };
     }
 
-    fn status(&self, index: usize) -> &'static str {
+    pub fn status(&self, index: usize) -> &'static str {
         self.crew[index].status.label()
     }
 
-    fn poll_mission(&mut self) {
-        if let Some(live) = &mut self.live {
-            live.refresh_usage();
-        }
+    pub fn poll_mission(&mut self) {
+        self.refresh_usage_and_sync();
         self.poll_side();
+
+        let normalized_batch: Vec<(String, mission::NormalizedEvent)> = self
+            .live
+            .as_ref()
+            .map(|live| {
+                live.runs
+                    .iter()
+                    .flat_map(|run| {
+                        let name = run.name.clone();
+                        run.drain_normalized()
+                            .into_iter()
+                            .map(move |ev| (name.clone(), ev))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, ev) in normalized_batch {
+            self.handle_normalized_event(&name, ev);
+        }
+
         for _ in 0..EVENTS_PER_POLL {
             let events = self.next_events();
             if events.is_empty() {
@@ -850,7 +941,7 @@ impl App {
                 );
                 self.crew[index].status = Status::Snoozed;
                 self.snoozes.retain(|snooze| snooze.thread != name);
-                self.snoozes.push(Snooze::new(name, &label));
+                self.snoozes.push(Snooze::new(name));
                 self.notice = label.clone();
                 self.push_log(format!("SYSTEM  {label}"));
             }
@@ -858,13 +949,18 @@ impl App {
                 let run = &mut live.runs[position];
                 run.reply.push_str(&text);
                 run.reply.push('\n');
+                let saw_norm = run.saw_normalized_text;
                 let speaker = if run.reviewing {
                     format!("{name} review")
                 } else {
                     name.to_owned()
                 };
                 for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    self.record(index, format!("{speaker}  {line}"));
+                    if !saw_norm {
+                        self.record(index, format!("{speaker}  {line}"));
+                    } else {
+                        self.record_log_only(index, format!("{speaker}  {line}"));
+                    }
                 }
             }
             mission::Event::Finished(result) => {
@@ -907,20 +1003,49 @@ impl App {
     }
 
     fn finish_commander(&mut self, run: Run, result: io::Result<()>) {
+        self.transcript.finish_assistant_stream();
+        self.composer.set_running(false);
         self.crew[0].status = if result.is_ok() {
             Status::Done
         } else {
             Status::Error
         };
+        if let Some(live) = &mut self.live {
+            let seq = (live.handoff_turns.len() + 1) as u64;
+            if !run.reply.trim().is_empty() {
+                live.handoff_turns.push(soul::HandoffTurn {
+                    seq,
+                    role: soul::TurnRole::Assistant,
+                    content: run.reply.trim().to_owned(),
+                    command_outcome: None,
+                });
+            }
+            live.pending_prod_gates
+                .retain(|_, run_name| run_name != COMMANDER);
+        }
         self.notice = match &result {
             Ok(()) => run.continuation.map_or_else(
                 || format!("{COMMANDER} replied."),
                 |link| format!("Done · {link}"),
             ),
-            Err(error) => format!("{COMMANDER}: {error}"),
+            Err(error) => {
+                let msg = format!("{COMMANDER}: {error}");
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Error,
+                        text: msg.clone(),
+                    });
+                msg
+            }
         };
         if result.is_ok() {
             self.apply_directives(&run.reply);
+        }
+        if let (Some(live), Some(tx)) = (&self.live, &self.bg_tx) {
+            tui::events::spawn_git_refresh(live.workspace.clone(), tx.clone());
+        }
+        if let Some(queued) = self.composer.pop_next_queued() {
+            self.message_commander(queued);
         }
     }
 
@@ -1091,34 +1216,23 @@ impl App {
     }
 
     fn show_side_answer(&mut self, chat: &side::SideChat, result: io::Result<Vec<String>>) {
-        let mut lines = vec![format!("BTW  Q: {}", chat.question)];
+        let mut lines = vec![format!("**Q:** {}", chat.question)];
         match result {
-            Ok(answer) if answer.is_empty() => lines.push("BTW  (no answer)".into()),
-            Ok(answer) => lines.extend(answer.into_iter().map(|line| format!("BTW  {line}"))),
-            Err(error) => lines.push(format!("BTW  Side chat failed: {error}")),
+            Ok(answer) if answer.is_empty() => lines.push("(no answer)".into()),
+            Ok(answer) => lines.extend(answer),
+            Err(error) => lines.push(format!("Side chat failed: {error}")),
         }
-        for text in lines {
-            self.side_answers.push(SideAnswer {
-                thread: chat.thread.clone(),
-                entry: Entry::now(text),
+        self.transcript_for_mut(&chat.thread)
+            .push(markdown::TranscriptEntry::AssistantMarkdown {
+                speaker: "Side Q&A (/btw)".into(),
+                markdown: lines.join("\n\n"),
+                streaming: false,
             });
-        }
-        let overflow = self
-            .side_answers
-            .len()
-            .saturating_sub(specialists::FEED_LIMIT);
-        self.side_answers.drain(..overflow);
         self.notice = format!("Side answer ready in the {} feed.", chat.thread);
     }
 
     fn is_snoozed(&self, thread: &str) -> bool {
         self.snoozes.iter().any(|snooze| snooze.thread == thread)
-    }
-
-    fn snoozed(&self) -> bool {
-        self.live
-            .as_ref()
-            .is_some_and(|live| live.runs.iter().all(|run| self.is_snoozed(&run.name)))
     }
 
     fn apply_directives(&mut self, reply: &str) {
@@ -1149,11 +1263,37 @@ impl App {
         if self.crew[index].is_commander() {
             return self.push_log(text);
         }
+        let name = self.crew[index].name.clone();
         let entry = Entry::now(text);
+        self.push_transcript_log_entry(&name, &entry.text, Some(entry.at.clone()));
         if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
-            if let Err(error) = store.append_history(&self.crew[index].name, &entry) {
+            if let Err(error) = store.append_history(&name, &entry) {
                 self.notice = format!("History not saved: {error}");
             }
+        }
+        self.crew[index].remember(entry);
+        self.touch(index);
+    }
+
+    fn record_log_only(&mut self, index: usize, text: String) {
+        if self.crew[index].is_commander() {
+            let entry = Entry::now(text);
+            if let Some(live) = &self.live {
+                if let Some(store) = &live.store {
+                    let _ = store.append_commander_for_workspace(&live.workspace, &entry);
+                }
+            }
+            self.log.push_back(entry.text);
+            self.log_times.push_back(entry.at);
+            if self.log.len() > specialists::FEED_LIMIT {
+                self.log.pop_front();
+                self.log_times.pop_front();
+            }
+            return;
+        }
+        let entry = Entry::now(text);
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            let _ = store.append_history(&self.crew[index].name, &entry);
         }
         self.crew[index].remember(entry);
         self.touch(index);
@@ -1347,14 +1487,44 @@ impl App {
             });
             (request, member.permission)
         };
-        let mission = mission::Mission::launch(
+        let mut options = mission::LaunchOptions {
+            policy: permissions::PermissionPolicy::for_mode(mode),
+            ..mission::LaunchOptions::default()
+        };
+        let uniform_provider = live.profiles.first().map(|p| p.provider).filter(|first| {
+            live.profiles
+                .iter()
+                .all(|candidate| candidate.provider == *first)
+        });
+        if let Some(provider) = uniform_provider {
+            options.extra_args =
+                bridge::worker_mcp_diet_args(bridge::BridgeProvider::from(provider));
+        }
+        let mission = mission::Mission::launch_with_options(
             live.profiles.clone(),
             live.route(request, delegation.target, mode, limits),
             workspace.path.clone(),
+            options,
         );
+        let worker_name = member.name.clone();
+        let worker_role = member.role.clone();
+        let worker_branch = member.branch().map(|b| b.name.clone()).unwrap_or_default();
+        let worker_provider = uniform_provider
+            .map(tui::provider_short_name)
+            .unwrap_or("auto")
+            .to_owned();
         live.runs
-            .push(Run::new(&member.name, mission, delegation.review));
+            .push(Run::new(&worker_name, mission, delegation.review));
         self.crew[index].status = Status::Running;
+        self.transcript
+            .push(markdown::TranscriptEntry::DelegationCard {
+                worker: worker_name,
+                role: worker_role,
+                provider: worker_provider,
+                branch: worker_branch,
+                status: markdown::DelegationStatus::Running,
+                summary: self.crew[index].mission.clone(),
+            });
         Ok(())
     }
 
@@ -1365,6 +1535,7 @@ impl App {
             self.deck_palette = deck_palette(path);
             match Theme::load(path) {
                 Ok(theme) => {
+                    self.ui_palette = markdown::UiPalette::from_theme(&theme);
                     self.theme = theme;
                     self.notice.clear();
                 }
@@ -1374,6 +1545,9 @@ impl App {
     }
     pub fn watch_updates(&mut self, receiver: Option<Receiver<String>>) {
         self.update_receiver = receiver;
+        if self.update_receiver.is_some() && self.update_state == update::UpdateState::Idle {
+            self.update_state = update::UpdateState::Checking;
+        }
     }
 
     pub fn poll_update(&mut self) {
@@ -1382,19 +1556,25 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(latest) => {
+                self.update_state = update::UpdateState::Available {
+                    tag: format!("v{latest}"),
+                    current: update::CURRENT.to_owned(),
+                };
                 self.update_available = Some(latest);
                 self.update_receiver = None;
             }
-            Err(TryRecvError::Disconnected) => self.update_receiver = None,
+            Err(TryRecvError::Disconnected) => {
+                if self.update_available.is_none()
+                    && self.update_state == update::UpdateState::Checking
+                {
+                    self.update_state = update::UpdateState::UpToDate {
+                        current: update::CURRENT.to_owned(),
+                    };
+                }
+                self.update_receiver = None;
+            }
             Err(TryRecvError::Empty) => {}
         }
-    }
-
-    fn deck_card_at(&self, point: ratatui::layout::Position) -> Option<usize> {
-        self.deck_hits
-            .iter()
-            .find(|(_, area)| area.contains(point))
-            .map(|(index, _)| *index)
     }
 
     pub fn take_exit_message(&mut self) -> Option<String> {
@@ -1403,9 +1583,12 @@ impl App {
 
     fn push_log(&mut self, text: String) {
         let entry = Entry::now(text);
-        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
-            if let Err(error) = store.append_commander(&entry) {
-                self.notice = format!("Transcript not saved: {error}");
+        self.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at.clone()));
+        if let Some(live) = &self.live {
+            if let Some(store) = &live.store {
+                if let Err(error) = store.append_commander_for_workspace(&live.workspace, &entry) {
+                    self.notice = format!("Transcript not saved: {error}");
+                }
             }
         }
         self.log.push_back(entry.text);
@@ -1436,12 +1619,45 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        let command = self.input.trim().to_owned();
-        if command.is_empty() {
+        let from_composer = self.composer.take_submission();
+        let command = match from_composer {
+            Some(text) => {
+                self.input.clear();
+                text
+            }
+            None => {
+                let raw = self.input.trim().to_owned();
+                if !raw.is_empty() {
+                    self.composer.clear();
+                }
+                raw
+            }
+        };
+        if command.trim().is_empty() {
             return;
         }
-        match specialists::parse_command(&command) {
-            Err(usage) => self.notice = usage,
+        self.submit_text(command);
+    }
+
+    pub(crate) fn submit_text(&mut self, command: String) {
+        let trimmed = command.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(shell_cmd) = trimmed.strip_prefix('!') {
+            self.input.clear();
+            self.run_shell_command(shell_cmd.to_owned());
+            return;
+        }
+        match specialists::parse_command(&trimmed) {
+            Err(usage) => {
+                self.notice = usage.clone();
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Warning,
+                        text: usage,
+                    });
+            }
             Ok(specialists::Command::Message(text)) if self.selected > 0 => {
                 self.input.clear();
                 self.delegate(self.selected, text);
@@ -1485,7 +1701,10 @@ impl App {
             }
             specialists::Command::Remove { name } => self.remove(&name),
             specialists::Command::Entry { profile } => self.set_entry(&profile),
-            specialists::Command::Diff { name } => self.show_diff(name.as_deref()),
+            specialists::Command::Diff { name } => {
+                self.show_diff(name.as_deref());
+                self.open_diff_viewer(name.as_deref());
+            }
             specialists::Command::Pr { name, commit } => self.open_pr(name.as_deref(), commit),
             specialists::Command::Settle { name, settled } => self.settle(&name, settled),
             specialists::Command::SettledDrawer => self.toggle_settled_drawer(),
@@ -1499,14 +1718,20 @@ impl App {
             specialists::Command::GoalCancel => self.cancel_goal(),
             specialists::Command::Mode { mode } => self.set_commander_mode(mode),
             specialists::Command::Help => {
-                self.push_log(format!("SYSTEM  {}", specialists::format_help()));
-                self.notice = "Slash commands listed in the feed.".into();
+                self.show_help_in_transcript();
+                self.record_log_only(0, format!("SYSTEM  {}", specialists::format_help()));
             }
             specialists::Command::Unknown {
                 command,
                 suggestion,
             } => {
-                self.notice = specialists::unknown_command_message(&command, suggestion.as_deref());
+                let msg = specialists::unknown_command_message(&command, suggestion.as_deref());
+                self.notice = msg.clone();
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: markdown::NoticeLevel::Warning,
+                        text: msg,
+                    });
             }
             specialists::Command::Message(text) => self.message_commander(text),
         }
@@ -1710,18 +1935,19 @@ impl App {
     fn message_commander_with_display(&mut self, command: String, display: String) {
         let limits = self.limit_policy();
         let commander_mode = self.settings.commander_permission;
-        let Some(live) = &mut self.live else {
+        let prod_gate_enabled = self.settings.prod_gate;
+        if self.live.is_none() {
             self.crew[0].mission = display.clone();
             self.push_log(format!("YOU  {display}"));
             self.input.clear();
             self.notice = PREVIEW_NOTICE.into();
             return;
-        };
-        if live.running(COMMANDER) {
+        }
+        if self.is_running(COMMANDER) {
             self.notice = if self.is_snoozed(COMMANDER) {
                 "A mission is snoozed until its limit resets; /btw still works.".into()
             } else {
-                "Commander is still working; wait for its reply.".into()
+                "Commander is still working; follow-up queued.".into()
             };
             return;
         }
@@ -1729,7 +1955,8 @@ impl App {
             self.notice = "Resume Commander before sending a message.".into();
             return;
         }
-        if let Some((index, claim)) = live.pending.clone() {
+        if let Some((index, claim)) = self.live.as_ref().and_then(|live| live.pending.clone()) {
+            let live = self.live.as_mut().expect("checked live");
             let mission = mission::Mission::resume(
                 live.profiles.clone(),
                 index,
@@ -1739,10 +1966,15 @@ impl App {
             );
             live.runs.push(Run::new(COMMANDER, mission, false));
             self.crew[0].mission = display;
+            self.composer.set_running(true);
             self.input.clear();
             return;
         }
-        if live.profiles.is_empty() {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.profiles.is_empty())
+        {
             self.notice = format!("{}.", panel::NO_PROVIDER_HINT);
             return;
         }
@@ -1757,28 +1989,64 @@ impl App {
             self.notice = format!("{refusal} {}", permissions::COMMANDER_MODE_USAGE);
             return;
         }
-        let request = match routing::parse(&targeted.text) {
-            Ok(request) => framed(request, |unit| {
-                specialists::commander_prompt(self.log.iter().map(String::as_str), &self.crew, unit)
-            }),
+        let parsed = match routing::parse(&targeted.text) {
+            Ok(request) => request,
             Err(error) => {
                 self.notice = error;
                 return;
             }
         };
+        let request = framed(parsed, |unit| self.build_commander_prompt_text(unit));
+        let mcp_config = self.ensure_loopback_bridge();
+        let active_provider = self.live.as_ref().and_then(|live| {
+            live.profiles
+                .get(live.displayed_profile())
+                .map(|p| p.provider)
+        });
+        let resume_session = if let Some(live) = &mut self.live {
+            if live.commander_provider != active_provider {
+                live.commander_session_id = None;
+                live.commander_provider = active_provider;
+            }
+            live.commander_session_id.clone()
+        } else {
+            None
+        };
+        let mut policy = permissions::PermissionPolicy::for_mode(commander_mode);
+        if !prod_gate_enabled {
+            policy.restrictions.clear();
+        }
+        let options = mission::LaunchOptions {
+            resume_session,
+            mcp_config,
+            extra_args: Vec::new(),
+            policy,
+            persistent_stdio: true,
+        };
+        self.turn_changes.clear();
+        let live = self.live.as_mut().expect("checked live");
+        let seq = (live.handoff_turns.len() + 1) as u64;
+        live.handoff_turns.push(soul::HandoffTurn {
+            seq,
+            role: soul::TurnRole::User,
+            content: display.clone(),
+            command_outcome: None,
+        });
         self.notice = format!("Routing in {}", live.workspace.display());
-        let mission = mission::Mission::launch(
+        let mission = mission::Mission::launch_with_options(
             live.profiles.clone(),
             live.route(request, targeted.target, commander_mode, limits),
             live.workspace.clone(),
+            options,
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
         self.crew[0].mission = display.clone();
+        self.composer.set_running(true);
         self.input.clear();
         self.push_log(format!("YOU  {display}"));
     }
 
-    fn abandon_continuation(&mut self) {
+    pub(crate) fn abandon_continuation(&mut self) {
         let Some(live) = &mut self.live else { return };
         if live.running(COMMANDER) {
             return;
@@ -1790,6 +2058,7 @@ impl App {
             Ok(()) => {
                 live.pending = None;
                 self.input.clear();
+                self.composer.clear();
                 "Interrupted continuation abandoned.".into()
             }
             Err(error) => error.to_string(),
@@ -1797,863 +2066,35 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.panel.is_some() && !(control && matches!(key.code, KeyCode::Char('q' | 'c'))) {
-            return self.panel_key(key);
-        }
-        if control {
-            match key.code {
-                KeyCode::Char('q' | 'c') if self.mission_running() && !self.snoozed() => {
-                    self.notice = "Wait for the running mission before quitting.".into();
-                }
-                KeyCode::Char('q' | 'c') => self.quit = true,
-                KeyCode::Char('n') => self.editing = true,
-                KeyCode::Char('p') => self.toggle_pause(),
-                KeyCode::Char('l') => {
-                    self.log.clear();
-                    self.log_times.clear();
-                }
-                _ => {}
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::F(2) => self.select_profile(),
-            KeyCode::F(3) => self.open_settings(),
-            KeyCode::F(4) => self.abandon_continuation(),
-            KeyCode::F(6) => self.request_update(),
-            KeyCode::F(7) => self.toggle_settled_drawer(),
-            KeyCode::Tab => self.editing = !self.editing,
-            KeyCode::Esc => self.editing = false,
-            KeyCode::Enter if self.editing => self.submit(),
-            KeyCode::Enter => self.editing = true,
-            KeyCode::Backspace if self.editing => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if self.editing => self.input.push(c),
-            KeyCode::Up => self.step_selection(false),
-            KeyCode::Down => self.step_selection(true),
-            KeyCode::Home => self.selected = 0,
-            _ => {}
-        }
+        self.handle_key_single_canvas(key);
     }
+
     pub fn click(&mut self, x: u16, y: u16) {
-        let point = ratatui::layout::Position::new(x, y);
-        if self.panel.is_some() {
-            self.panel_click(x, y);
-        } else if self.settings_area.contains(point) {
-            self.open_settings();
-        } else if self.update_area.contains(point) {
-            self.request_update();
-        } else if let Some(index) = self.deck_card_at(point) {
-            self.open_subscription(index, false);
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.abandon_area.contains(point))
-        {
-            self.abandon_continuation();
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.profile_area.contains(point))
-        {
-            self.select_profile();
-        } else if self.new_area.contains(point) || self.input_area.contains(point) {
-            self.editing = true;
-        } else if self.pause_area.contains(point) {
-            self.toggle_pause();
-        } else if self.send_area.contains(point) {
-            self.submit();
-        } else if self.crew_area.contains(point) {
-            let row = usize::from((y - self.crew_area.y) / self.crew_row_height.max(1));
-            match self.roster_rows().get(self.crew_offset + row) {
-                Some(specialists::RosterRow::Member(index)) => self.selected = *index,
-                Some(specialists::RosterRow::Settled { .. }) => self.toggle_settled_drawer(),
-                None => {}
-            }
-            self.editing = false;
-        }
-    }
-    fn crew_counts(&self) -> [String; 4] {
-        let count = |wanted: fn(Status) -> bool| {
-            self.crew
-                .iter()
-                .filter(|member| !member.settled && wanted(member.status))
-                .count()
-        };
-        [
-            format!("{:02}  CREW", self.crew.len()),
-            format!("{:02}  RUNNING", count(|status| status == Status::Running)),
-            format!("{:02}  NEED ATTENTION", count(Status::needs_attention)),
-            if self.live.is_some() {
-                "LIVE  /  COMMANDER".into()
-            } else {
-                "PREVIEW  /  NO DISPATCH".into()
-            },
-        ]
-    }
-
-    fn selected_details(&self) -> Vec<Line<'static>> {
-        let member = &self.crew[self.selected];
-        let mut lines = if member.is_commander() {
-            let entry = self
-                .live
-                .as_ref()
-                .map_or_else(|| "preview".into(), Live::entry_label);
-            vec![
-                Line::raw("ENTRY MODEL"),
-                Line::raw(entry),
-                Line::raw(""),
-                Line::raw("PERMISSIONS"),
-                Line::raw(self.settings.commander_permission.flag()),
-                Line::raw(""),
-                Line::raw("SPECIALISTS"),
-                Line::raw(format!("{} on roster", self.crew.len() - 1)),
-            ]
-        } else {
-            let mut details = Vec::new();
-            if let Some(branch) = member.branch() {
-                let changes = member
-                    .changes
-                    .as_ref()
-                    .map_or_else(|| "diff unavailable".into(), branches::DiffStat::label);
-                details.extend([
-                    Line::raw("BRANCH"),
-                    Line::raw(format!("{} → {}", branch.name, branch.base)),
-                    Line::raw(changes),
-                    Line::raw(""),
-                ]);
-            }
-            details.extend([
-                Line::raw("ROLE"),
-                Line::raw(member.role.clone()),
-                Line::raw(""),
-                Line::raw("WORKSPACE"),
-                Line::raw(specialists::workspace_label(member)),
-            ]);
-            details
-        };
-        lines.extend(self.goal_lines(&member.name));
-        lines
-    }
-
-    fn member_lines(&self, index: usize, t: &Theme) -> Vec<Line<'static>> {
-        let member = &self.crew[index];
-        let chosen = index == self.selected;
-        let style = match (chosen, member.settled) {
-            (true, _) => Style::default().fg(color("d1dce4")).bold(),
-            (false, true) => Style::default().fg(color(&t.muted)),
-            (false, false) => Style::default(),
-        };
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    " ●",
-                    Style::default().fg(color(status_color(member.status, t))),
-                ),
-                Span::styled(format!(" {}  ", member.name), style),
-                Span::styled(
-                    format!("/{:02}", index + 1),
-                    Style::default().fg(color(if chosen { "97a3ad" } else { "5f646b" })),
-                ),
-            ]),
-            Line::styled(
-                format!("   {} · {}", member.status.caption(), member.role),
-                style,
-            ),
-        ]
-    }
-
-    fn change_badge(member: &Member) -> String {
-        member
-            .changes
-            .as_ref()
-            .filter(|changes| !changes.files.is_empty())
-            .map_or_else(String::new, |changes| format!("  ·  {}", changes.totals()))
-    }
-
-    fn feed_entries(&self) -> Vec<(&str, &str)> {
-        let thread = self.crew[self.selected].name.as_str();
-        let mut entries: Vec<(&str, &str)> = match self.collapsed_snooze(thread) {
-            Some(banner) => vec![(banner.at.as_str(), banner.text.as_str())],
-            None if self.selected == 0 => self
-                .log_times
-                .iter()
-                .zip(&self.log)
-                .map(|(at, text)| (at.as_str(), text.as_str()))
-                .collect(),
-            None => self.crew[self.selected]
-                .history
-                .iter()
-                .map(|entry| (entry.at.as_str(), entry.text.as_str()))
-                .collect(),
-        };
-        entries.extend(
-            self.side_answers
-                .iter()
-                .filter(|answer| answer.thread == thread)
-                .map(|answer| (answer.entry.at.as_str(), answer.entry.text.as_str())),
-        );
-        entries
-    }
-
-    fn collapsed_snooze(&self, thread: &str) -> Option<&Entry> {
-        self.snoozes
-            .iter()
-            .find(|snooze| self.settings.snooze_limited_missions && snooze.thread == thread)
-            .map(|snooze| &snooze.banner)
-    }
-
-    fn goal_lines(&self, member: &str) -> Vec<Line<'static>> {
-        self.goal
-            .as_ref()
-            .filter(|goal| goal.member == member)
-            .map_or_else(Vec::new, |goal| {
-                vec![Line::raw(""), Line::raw("GOAL"), Line::raw(goal.status())]
-            })
+        self.handle_click_single_canvas(x, y);
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        self.selected = self.selected.min(self.crew.len() - 1);
-        let t = self.theme.clone();
-        let a = f.area();
-        let base = Style::default()
-            .fg(color(&t.foreground))
-            .bg(color(&t.background));
-        f.render_widget(Block::default().style(base), a);
-        let r = |x: u16, y: u16, w: u16, h: u16| {
-            Rect::new(
-                x.min(a.width),
-                y.min(a.height),
-                w.min(a.width.saturating_sub(x)),
-                h.min(a.height.saturating_sub(y)),
-            )
-        };
-        self.draw_menu_bar(f, a);
-        let compact = a.height < 36 || a.width < 105;
-        self.deck_hits.clear();
-        let cards = self.live.as_ref().map(Live::deck_cards).unwrap_or_default();
-        let mode = deck_mode(a, compact);
-        let deck_rows = match mode {
-            token_burn::DeckMode::Full if !cards.is_empty() => {
-                self.draw_deck(
-                    f,
-                    &cards,
-                    mode,
-                    r(
-                        3,
-                        2,
-                        a.width.saturating_sub(6),
-                        token_burn::FULL_CARD_HEIGHT,
-                    ),
-                );
-                0
-            }
-            token_burn::DeckMode::Full => 0,
-            token_burn::DeckMode::Compact => {
-                let rows = cards.len().min(COMPACT_DECK_MAX_ROWS) as u16;
-                self.draw_deck(f, &cards, mode, r(1, 1, a.width.saturating_sub(2), rows));
-                rows
-            }
-        };
-        let top_shift = deck_rows.saturating_sub(1);
-        if !compact && cards.is_empty() {
-            let banner = if a.width >= 105 {
-                banner()
-            } else {
-                "AGENT COMMAND".into()
-            };
-            f.render_widget(
-                Paragraph::new(banner).style(Style::default().fg(color("dad8ca")).bold()),
-                r(3, 2, a.width.saturating_sub(41), 3),
-            );
-            f.render_widget(
-                Paragraph::new(if self.live.is_some() {
-                    "PRIVATEER RADIO  /  LOCAL"
-                } else {
-                    "PRIVATEER RADIO  /  LOCAL\n───┤ ◆ ├───  SIGNAL CLEAR\n1200 BAUD  ·  UI PREVIEW"
-                })
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::default().fg(color(&t.muted))),
-                r(a.width.saturating_sub(38), 2, 35, 3),
-            );
-            let mut stripe = ["89a76f", "dbc77b", "cc955d", "b86d67", "9c829f", "7d9fb6"]
-                .map(|c| Span::styled("━━", Style::default().fg(color(c))))
-                .to_vec();
-            stripe.push(Span::raw("  INDEPENDENT OPERATORS. UNCHARTED WATERS."));
-            f.render_widget(
-                Paragraph::new(Line::from(stripe)).style(Style::default().fg(color("818d99"))),
-                r(3, 6, a.width.saturating_sub(6), 1),
-            );
-        }
-        if !compact {
-            let ma = r(3, 8, a.width.saturating_sub(6), 3);
-            f.render_widget(
-                Block::default().style(Style::default().bg(color("191e25"))),
-                ma,
-            );
-            let metrics = Layout::horizontal([Constraint::Fill(1); 4]).split(ma);
-            let labels = self.crew_counts();
-            for (i, label) in labels.iter().enumerate() {
-                f.render_widget(
-                    Paragraph::new(label.as_str())
-                        .alignment(ratatui::layout::Alignment::Center)
-                        .style(Style::default().fg(color(if i == 3 {
-                            &t.amber
-                        } else {
-                            &t.foreground
-                        }))),
-                    Rect::new(metrics[i].x, metrics[i].y + 1, metrics[i].width, 1),
-                );
-            }
-        }
-        let usage_rows = if self.live.is_some() { 3 } else { 0 };
-        let main = if compact {
-            r(
-                1,
-                2 + top_shift,
-                a.width.saturating_sub(2),
-                a.height.saturating_sub(8 + usage_rows + top_shift),
-            )
-        } else {
-            r(
-                3,
-                12,
-                a.width.saturating_sub(6),
-                a.height.saturating_sub(18 + usage_rows),
-            )
-        };
-        let cols = Layout::horizontal([
-            Constraint::Length(if compact { 18 } else { 25 }),
-            Constraint::Min(32),
-            Constraint::Fill(1),
-        ])
-        .spacing(1)
-        .split(main);
-        for (i, title) in ["01 / CREW", "02 / CHART ROOM", "03 / SHIP'S LOG"]
-            .iter()
-            .enumerate()
-        {
-            f.render_widget(
-                Block::bordered()
-                    .style(Style::default().bg(color(&t.panel)))
-                    .border_style(Style::default().fg(color(&t.border))),
-                cols[i],
-            );
-            f.render_widget(
-                Paragraph::new(*title).style(Style::default().fg(color("cbc9bc")).bold()),
-                r(
-                    cols[i].x + 2,
-                    cols[i].y + 1,
-                    cols[i].width.saturating_sub(4),
-                    1,
-                ),
-            );
-        }
-        self.crew_area = r(
-            cols[0].x + 2,
-            cols[0].y + if compact && self.live.is_some() { 2 } else { 3 },
-            cols[0].width.saturating_sub(4),
-            if compact {
-                8.min(cols[0].height.saturating_sub(4))
-            } else {
-                16.min(cols[0].height.saturating_sub(7))
-            },
-        );
-        let stride = (if compact { 2 } else { 4 })
-            .min(self.crew_area.height)
-            .max(1);
-        let visible = usize::from((self.crew_area.height / stride).max(1));
-        self.crew_row_height = stride;
-        let rows = self.roster_rows();
-        let selected_row = rows
-            .iter()
-            .position(|row| *row == specialists::RosterRow::Member(self.selected))
-            .unwrap_or(0);
-        self.crew_offset = (selected_row + 1).saturating_sub(visible);
-        for (row_index, roster_row) in rows.iter().skip(self.crew_offset).take(visible).enumerate()
-        {
-            let y = self.crew_area.y + row_index as u16 * stride;
-            let row = r(self.crew_area.x, y, self.crew_area.width, stride);
-            let lines = match *roster_row {
-                specialists::RosterRow::Member(i) => {
-                    if i == self.selected {
-                        f.render_widget(
-                            Block::default().style(Style::default().bg(color(&t.selection))),
-                            row,
-                        );
-                    }
-                    self.member_lines(i, &t)
-                }
-                specialists::RosterRow::Settled { count, open } => settled_lines(count, open, &t),
-            };
-            f.render_widget(
-                Paragraph::new(lines),
-                r(row.x, row.y + u16::from(!compact), row.width, 2),
-            );
-        }
-        f.render_widget(
-            Paragraph::new(if compact {
-                "↑ ↓ select\nEnter: edit"
-            } else {
-                "↑ ↓ select an agent\nEnter to inspect"
-            })
-            .style(Style::default().fg(color("666f78"))),
-            r(
-                cols[0].x + 3,
-                cols[0]
-                    .bottom()
-                    .saturating_sub(4)
-                    .max(self.crew_area.bottom()),
-                cols[0].width.saturating_sub(5),
-                2,
-            ),
-        );
-        let x = cols[1].x + 2;
-        let y = cols[1].y + 3;
-        let w = cols[1].width.saturating_sub(4);
-        let selected = &self.crew[self.selected];
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}  ", selected.name), Style::default().bold()),
-                Span::styled(
-                    format!(
-                        "● {}",
-                        if selected.paused {
-                            "PAUSED"
-                        } else {
-                            self.status(self.selected)
-                        }
-                    ),
-                    Style::default()
-                        .fg(color(status_color(selected.status, &t)))
-                        .bold(),
-                ),
-            ])),
-            r(x, y, w, 1),
-        );
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    selected.mission.clone(),
-                    Style::default().fg(color("d4d9df")),
-                ),
-                Line::styled(
-                    format!(
-                        "{}  /  {:02}{}",
-                        selected.role.to_uppercase(),
-                        self.selected + 1,
-                        Self::change_badge(selected)
-                    ),
-                    Style::default().fg(color(&t.muted)),
-                ),
-            ])
-            .wrap(Wrap { trim: false }),
-            r(x, y + 2, w, 4),
-        );
-        let by = cols[1].bottom().saturating_sub(5);
-        if by > y + 7 {
-            f.render_widget(
-                Paragraph::new(self.selected_details())
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(color(&t.muted))),
-                r(x, y + 6, w, by - y - 7),
-            );
-        }
-        self.new_area = r(x, by, 15.min(w), 3);
-        self.pause_area = r(x + 16, by, 12.min(w.saturating_sub(16)), 3);
-        fn button(text: &str, primary: bool, t: &Theme) -> Paragraph<'static> {
-            Paragraph::new(format!(" {text}"))
-                .block(Block::default().padding(ratatui::widgets::Padding::new(0, 0, 1, 0)))
-                .style(if primary {
-                    Style::default()
-                        .fg(color("242b32"))
-                        .bg(color(&t.ivory))
-                        .bold()
-                } else {
-                    Style::default()
-                        .fg(color(&t.foreground))
-                        .bg(color("28323d"))
-                        .bold()
-                })
-        }
-        f.render_widget(button("+ New mission", true, &t), self.new_area);
-        f.render_widget(
-            button(
-                if self.crew[self.selected].paused {
-                    "▶ Resume"
-                } else {
-                    "Ⅱ Pause"
-                },
-                false,
-                &t,
-            ),
-            self.pause_area,
-        );
-        let feed = r(
-            cols[2].x + 2,
-            cols[2].y + 3,
-            cols[2].width.saturating_sub(5),
-            cols[2].height.saturating_sub(6),
-        );
-        let keep = (usize::from(feed.height) + 1).div_ceil(3);
-        let entries = self.feed_entries();
-        let mut lines: Vec<_> = entries
-            .iter()
-            .skip(entries.len().saturating_sub(keep))
-            .flat_map(|(stamp, entry)| {
-                let (source, message) = entry.split_once("  ").unwrap_or(("SYSTEM", entry));
-                [
-                    Line::from(vec![
-                        Span::styled(format!("{stamp}  "), Style::default().fg(color("666f78"))),
-                        Span::styled(source.to_owned(), Style::default().fg(color(&t.accent))),
-                    ]),
-                    Line::raw(message.trim().to_owned()),
-                    Line::raw(""),
-                ]
-            })
-            .collect();
-        lines.pop();
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let hidden_rows = paragraph
-            .line_count(feed.width)
-            .saturating_sub(usize::from(feed.height));
-        let scroll = u16::try_from(hidden_rows).unwrap_or(u16::MAX);
-        f.render_widget(paragraph.scroll((scroll, 0)), feed);
-        let iy = a.height.saturating_sub(5);
-        if let Some(live) = &mut self.live {
-            live.profile_area = r(2, iy.saturating_sub(4), a.width.saturating_sub(4), 2);
-            let now = usage::now();
-            let label = if live.profiles.is_empty() {
-                vec![Line::raw(panel::NO_PROVIDER_HINT)]
-            } else {
-                {
-                    let latch = live.usage.map_or_else(
-                        || "State unavailable".into(),
-                        |usage| usage.latch_label(now),
-                    );
-                    let control = if live.running_profile.is_some() {
-                        "Running"
-                    } else {
-                        "F2 / click"
-                    };
-                    vec![
-                        Line::raw(format!("{control} · {latch} · {}", live.route_mode())),
-                        Line::raw(format!(
-                            "{} · {}",
-                            live.profiles[live.displayed_profile()],
-                            live.pin_label(live.displayed_profile())
-                        )),
-                    ]
-                }
-            };
-            let [five, week] = live.usage.unwrap_or_default().rows(now);
-            f.render_widget(
-                Paragraph::new(label).style(Style::default().fg(color(&t.accent))),
-                live.profile_area,
-            );
-            f.render_widget(
-                Paragraph::new(vec![Line::raw(five), Line::raw(week)])
-                    .style(Style::default().fg(color(&t.muted))),
-                r(7, iy.saturating_sub(2), a.width.saturating_sub(14), 2),
-            );
-        }
-        f.render_widget(
-            Paragraph::new("❯").style(Style::default().fg(color("b8ccd9"))),
-            r(4, iy + 1, 1, 1),
-        );
-        self.input_area = r(7, iy, a.width.saturating_sub(23), 3);
-        self.send_area = r(a.width.saturating_sub(15), iy, 12, 3);
-        f.render_widget(
-            Paragraph::new(format!(
-                " {}",
-                if self.input.is_empty() {
-                    if self
-                        .live
-                        .as_ref()
-                        .is_some_and(|live| live.pending.is_some())
-                    {
-                        "Re-enter the original task to resume…".into()
-                    } else if self.selected == 0 {
-                        "Message Commander or /spawn NAME ROLE [TASK]…".into()
-                    } else {
-                        format!("Give {} a task…", self.crew[self.selected].name)
-                    }
-                } else {
-                    self.input.clone()
-                }
-            ))
-            .block(
-                Block::bordered().border_style(Style::default().fg(color(if self.editing {
-                    "b8ccd9"
-                } else {
-                    "455566"
-                }))),
-            )
-            .style(
-                Style::default()
-                    .fg(color(if self.input.is_empty() {
-                        "666f78"
-                    } else {
-                        "c0c6cd"
-                    }))
-                    .bg(color("191f27")),
-            ),
-            self.input_area,
-        );
-        f.render_widget(button("Send ↗", true, &t), self.send_area);
-        let pending = self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.pending.is_some() && !live.running(COMMANDER));
-        f.render_widget(
-            Paragraph::new(if pending && self.notice.is_empty() {
-                "Interrupted continuation pending · re-enter task, then Send"
-            } else if self.notice.is_empty() && self.no_provider_connected() {
-                panel::NO_PROVIDER_HINT
-            } else if self.notice.is_empty() {
-                if self.live.is_some() {
-                    "   Ready"
-                } else {
-                    "   ● SIGNAL CLEAR    Local demo · commands stay in this preview"
-                }
-            } else {
-                &self.notice
-            })
-            .style(Style::default().fg(color("a1adb8"))),
-            r(0, a.height.saturating_sub(2), a.width, 1),
-        );
-        self.draw_shortcut_bar(f, r(0, a.height.saturating_sub(1), a.width, 1), pending);
-        self.draw_panel(f, a);
+        self.selected = self.selected.min(self.crew.len().saturating_sub(1));
+        tui::render::draw_single_canvas(self, f);
     }
-}
-
-fn status_color(status: Status, t: &Theme) -> &str {
-    match status {
-        Status::Running => &t.amber,
-        Status::Error => "b86d67",
-        Status::NeedsApproval => "cc955d",
-        Status::Snoozed => &t.muted,
-        Status::Idle | Status::Done => &t.accent,
-    }
-}
-
-fn settled_lines(count: usize, open: bool, t: &Theme) -> Vec<Line<'static>> {
-    let marker = if open { "▾" } else { "▸" };
-    let action = if open { "F7 hide" } else { "F7 show" };
-    vec![
-        Line::styled(
-            format!(" {marker} SETTLED ({count})"),
-            Style::default().fg(color(&t.muted)).bold(),
-        ),
-        Line::styled(format!("   {action}"), Style::default().fg(color("666f78"))),
-    ]
-}
-
-const MENU_BRAND: &str = "  ▣  AGENT COMMAND";
-const MENU_ITEMS: &str = "File   Crew   Missions   Radio    |    PRIVATEER";
-const MENU_SHIP_NUMBER: &str = " / 01";
-const MENU_SETTINGS: &str = " Settings ";
-
-impl App {
-    fn draw_menu_bar(&mut self, f: &mut Frame, area: Rect) {
-        let bar = Rect::new(area.x, area.y, area.width, 1).intersection(area);
-        let settings_width = MENU_SETTINGS.chars().count() as u16;
-        let wide = format!("{MENU_BRAND}     {MENU_ITEMS}{MENU_SHIP_NUMBER}");
-        let labels = if wide.chars().count() + usize::from(settings_width) < usize::from(bar.width)
-        {
-            wide
-        } else {
-            format!("{MENU_BRAND}   {MENU_ITEMS}")
-        };
-        f.render_widget(
-            Paragraph::new(labels).style(
-                Style::default()
-                    .fg(color("272c32"))
-                    .bg(color(&self.theme.ivory))
-                    .bold(),
-            ),
-            bar,
-        );
-        self.settings_area = Rect::new(
-            bar.right().saturating_sub(settings_width),
-            bar.y,
-            settings_width,
-            1,
-        )
-        .intersection(bar);
-        f.render_widget(
-            Paragraph::new(MENU_SETTINGS).style(
-                Style::default()
-                    .fg(color(&self.theme.ivory))
-                    .bg(color("272c32"))
-                    .bold(),
-            ),
-            self.settings_area,
-        );
-    }
-
-    fn draw_shortcut_bar(&mut self, f: &mut Frame, bar: Rect, pending: bool) {
-        let style = Style::default().bg(color("1b2027")).fg(color("a5b1bd"));
-        f.render_widget(Block::default().style(style), bar);
-        let abandon_width = if pending && self.live.is_some() {
-            text_width(ABANDON_LABEL)
-        } else {
-            0
-        };
-        let abandon_area = right_of(bar, bar.right(), abandon_width);
-        let update_label = self
-            .update_available
-            .as_deref()
-            .map(|latest| update_label(latest, bar.width));
-        let update_width = update_label.as_deref().map_or(0, text_width);
-        self.update_area = right_of(bar, abandon_area.x, update_width);
-        let shortcuts_width = self.update_area.x.saturating_sub(bar.x);
-        f.render_widget(
-            Paragraph::new(clipped(SHORTCUTS, usize::from(shortcuts_width))).style(style),
-            Rect::new(bar.x, bar.y, shortcuts_width, bar.height),
-        );
-        if let Some(label) = update_label {
-            f.render_widget(
-                Paragraph::new(label).style(
-                    Style::default()
-                        .fg(color("1b2027"))
-                        .bg(color(&self.theme.amber))
-                        .bold(),
-                ),
-                self.update_area,
-            );
-        }
-        if let Some(live) = &mut self.live {
-            live.abandon_area = abandon_area;
-            if abandon_width > 0 {
-                f.render_widget(Paragraph::new(ABANDON_LABEL).style(style), abandon_area);
-            }
-        }
-    }
-
-    fn draw_deck(
-        &mut self,
-        f: &mut Frame,
-        cards: &[token_burn::AccountCard],
-        mode: token_burn::DeckMode,
-        area: Rect,
-    ) {
-        if mode == token_burn::DeckMode::Compact {
-            token_burn::render_deck_as(mode, cards, area, f.buffer_mut(), &self.deck_palette);
-            self.deck_hits = (0..cards.len().min(usize::from(area.height)))
-                .map(|index| {
-                    let row = Rect::new(area.x, area.y + index as u16, area.width, 1);
-                    (index, row)
-                })
-                .collect();
-            return;
-        }
-        let shown = &cards[..cards.len().min(FULL_DECK_MAX_CARDS)];
-        let columns = Layout::horizontal(vec![Constraint::Fill(1); shown.len()])
-            .spacing(1)
-            .split(area);
-        self.deck_hits = columns.iter().copied().enumerate().collect();
-        for (card, column) in shown.iter().zip(columns.iter()) {
-            token_burn::render_deck_as(
-                mode,
-                std::slice::from_ref(card),
-                *column,
-                f.buffer_mut(),
-                &self.deck_palette,
-            );
-        }
-    }
-}
-
-fn text_width(text: &str) -> u16 {
-    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
-}
-
-fn right_of(bar: Rect, right: u16, width: u16) -> Rect {
-    let width = width.min(right.saturating_sub(bar.x));
-    Rect::new(right - width, bar.y, width, bar.height)
-}
-
-fn clipped(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.into();
-    }
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
-
-fn update_label(latest: &str, bar_width: u16) -> String {
-    if bar_width >= UPDATE_WIDE_MIN_WIDTH {
-        format!(" Update v{latest} ")
-    } else {
-        " Update ".into()
-    }
-}
-
-pub fn banner() -> String {
-    let glyph = |c| match c {
-        'A' => [" ▄▄ ", "█▄▄█", "█  █"],
-        'G' => [" ▄▄▄", "█ ▄▄", "█▄▄█"],
-        'E' => ["▄▄▄▄", "█▄▄ ", "█▄▄▄"],
-        'N' => ["▄  ▄", "██ █", "█ ██"],
-        'T' => ["▄▄▄▄", " ▐▌ ", " ▐▌ "],
-        'C' => [" ▄▄▄", "█   ", "█▄▄▄"],
-        'O' => [" ▄▄ ", "█  █", "▀▄▄▀"],
-        'M' => ["▄   ▄", "█▀▄▀█", "█   █"],
-        'D' => ["▄▄▄ ", "█  █", "█▄▄▀"],
-        _ => ["  ", "  ", "  "],
-    };
-    (0..3)
-        .map(|row| {
-            "AGENT COMMAND"
-                .chars()
-                .map(|c| glyph(c)[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 pub fn snapshot(path: &Path) -> io::Result<()> {
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 46)).unwrap();
-    terminal.draw(|f| App::default().draw(f)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let mut svg=String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1500 920\"><rect width=\"100%\" height=\"100%\" fill=\"#111419\"/>");
-    let css_color = |c: Color| match c {
-        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-        _ => "#c0c6cd".into(),
-    };
-    for y in 0..46 {
-        for x in 0..150 {
-            let cell = &buffer[(x, y)];
-            svg.push_str(&format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"10.1\" height=\"20.1\" fill=\"{}\"/>",
-                x * 10,
-                y * 20,
-                css_color(cell.bg)
-            ));
-        }
-    }
-    for y in 0..46 {
-        for x in 0..150 {
-            let cell = &buffer[(x, y)];
-            let symbol = cell
-                .symbol()
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            let weight = if cell.modifier.contains(ratatui::style::Modifier::BOLD) {
-                "bold"
-            } else {
-                "normal"
-            };
-            svg.push_str(&format!("<text x=\"{}\" y=\"{}\" font-family=\"monospace\" font-weight=\"{weight}\" font-size=\"16\" textLength=\"10\" lengthAdjust=\"spacingAndGlyphs\" fill=\"{}\">{symbol}</text>",x*10,y*20+16,css_color(cell.fg)));
-        }
-    }
-    svg.push_str("</svg>");
+    let cols = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&n| n >= 40)
+        .unwrap_or(120);
+    let rows = env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&n| n >= 16)
+        .unwrap_or(40);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows)).unwrap();
+    let mut app = App::default();
+    terminal.draw(|f| app.draw(f)).unwrap();
+    let svg = tui::render_compact_svg(terminal.backend().buffer(), "#101011");
     fs::write(path, svg)
 }
 
@@ -2687,6 +2128,7 @@ pub fn source_stamp(root: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[cfg(unix)]
     fn test_live(
@@ -3724,12 +3166,11 @@ esac
             ..App::default()
         };
         a.submit();
-        a.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(a.selected, 1);
+        a.toggle_pause();
         assert!(a.crew[1].paused);
-        a.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        a.editing = true;
+        a.toggle_pause();
+        assert!(!a.crew[1].paused);
         for c in "Build λ".chars() {
             a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -3741,7 +3182,7 @@ esac
     }
     #[test]
     fn layouts() {
-        for (w, h) in [(80, 24), (120, 40), (150, 46), (210, 54)] {
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (150, 46), (210, 54)] {
             let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             let mut a = App::default();
             t.draw(|f| a.draw(f)).unwrap();
@@ -3753,7 +3194,8 @@ esac
                 .iter()
                 .map(|c| c.symbol())
                 .collect::<String>();
-            assert!(text.contains("AGENT COMMAND"));
+            assert!(text.contains("agent-command"));
+            assert!(!text.contains("PRIVATEER"));
         }
     }
     #[test]
@@ -3789,7 +3231,7 @@ esac
         assert_eq!(app.theme.accent, "123456");
         for (width, height) in SIZES {
             let buffer = screen(&mut app, width, height);
-            assert!(region(&buffer, app.input_area).contains("Message Commander"));
+            assert!(region(&buffer, app.input_area).contains("Ask Commander"));
         }
         fs::remove_file(path).unwrap();
     }
@@ -3821,17 +3263,15 @@ esac
             app.poll_update();
             assert!(app.update_available.is_none());
             let buffer = screen(&mut app, width, height);
-            assert!(!row(&buffer, height - 1).contains("Update"));
-            assert_eq!(app.update_area.width, 0);
-            let crew_before = app.crew_area;
+            assert!(app.update_area.width > 0);
+            assert_eq!(app.update_area.right(), width);
+            assert!(row(&buffer, height - 1).contains(update::CURRENT));
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
             assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
             let buffer = screen(&mut app, width, height);
             let bar = row(&buffer, height - 1);
-            assert!(bar.ends_with(&update_label("9.9.9", width)), "{bar}");
-            assert!(!row(&buffer, 1).contains("9.9.9"));
-            assert_eq!(app.crew_area, crew_before);
+            assert!(bar.contains("Update v9.9.9"), "{bar}");
             assert_eq!(app.update_area.right(), width);
             assert!(region(&buffer, app.update_area).contains("Update"));
             app.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
@@ -3855,15 +3295,64 @@ esac
     }
 
     #[test]
-    fn shortcut_text_is_clipped_before_the_right_side_buttons() {
-        assert_eq!(clipped("abcdef", 6), "abcdef");
-        assert_eq!(clipped("abcdef", 4), "abc…");
-        assert_eq!(clipped("abcdef", 0), "…");
-        assert_eq!(update_label("1.2.3", 80), " Update ");
-        assert_eq!(update_label("1.2.3", 120), " Update v1.2.3 ");
-        let bar = Rect::new(0, 23, 10, 1);
-        assert_eq!(right_of(bar, 10, 4), Rect::new(6, 23, 4, 1));
-        assert_eq!(right_of(bar, 3, 8), Rect::new(0, 23, 3, 1));
+    fn update_pill_adapts_across_states_and_widths() {
+        let mut app = App::default();
+        assert!(app.update_pill_text(80).contains(update::CURRENT));
+        app.update_state = update::UpdateState::Checking;
+        assert!(app.update_pill_text(120).contains("checking"));
+        app.update_state = update::UpdateState::UpToDate {
+            current: update::CURRENT.to_owned(),
+        };
+        assert!(app.update_pill_text(120).contains("✓"));
+        app.update_available = Some("1.2.3".into());
+        assert_eq!(app.update_pill_text(80), "⬆ Update v1.2.3");
+        assert_eq!(app.update_pill_text(120), "⬆ Update v1.2.3 (F6)");
+    }
+
+    #[test]
+    fn workspace_scoped_commander_history_isolates_directories() {
+        let base =
+            std::env::temp_dir().join(format!("agent-command-ws-history-{}", uuid::Uuid::new_v4()));
+        let root = base.join("profiles");
+        let dir_a = base.join("repo-a");
+        let dir_b = base.join("repo-b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let store = specialists::Store::new(root);
+        store
+            .append_commander_for_workspace(&dir_a, &Entry::now("YOU  secret-a".into()))
+            .unwrap();
+        store
+            .append_commander_for_workspace(&dir_b, &Entry::now("YOU  secret-b".into()))
+            .unwrap();
+        let a_entries = store.load_commander_for_workspace(&dir_a).unwrap();
+        let b_entries = store.load_commander_for_workspace(&dir_b).unwrap();
+        assert_eq!(a_entries.len(), 1);
+        assert_eq!(b_entries.len(), 1);
+        assert_eq!(a_entries[0].text, "YOU  secret-a");
+        assert_eq!(b_entries[0].text, "YOU  secret-b");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn double_esc_arms_and_cancels_active_mission() {
+        let (mission, _sender) = mission::Mission::held();
+        let mut live = Live::new(std::env::temp_dir(), Vec::new(), None);
+        live.runs.push(Run::new(COMMANDER, mission, false));
+        let mut app = App::from_live(live);
+        assert!(app.mission_running());
+
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.esc_armed_active());
+        assert!(app.notice.contains("Esc again to cancel"), "{}", app.notice);
+
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.esc_armed_active());
+        assert!(
+            app.notice.contains("Cancelled active mission"),
+            "{}",
+            app.notice
+        );
     }
 
     #[cfg(unix)]

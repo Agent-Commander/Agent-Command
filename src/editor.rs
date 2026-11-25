@@ -1265,7 +1265,7 @@ impl AutocompletePopup {
 
         frame.render_widget(Clear, popup_rect);
         let block = Block::default()
-            .title(" Suggestions (Tab/Enter) ")
+            .title(" Suggestions (Tab) ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.surface_alt).fg(theme.fg))

@@ -15,11 +15,16 @@ fn command_routes_to_ui_outside_checkout() {
     let status = Command::new(binary)
         .args(["--snapshot"])
         .arg(&path)
+        .env("COLUMNS", "120")
+        .env("LINES", "40")
         .current_dir(std::env::temp_dir())
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(std::fs::read_to_string(&path).unwrap().contains("#111419"));
+    let svg = std::fs::read_to_string(&path).unwrap();
+    assert!(svg.contains("#101011"));
+    assert!(svg.contains("agent-command"));
+    assert!(!svg.contains("PRIVATEER"));
     std::fs::remove_file(path).unwrap();
 }
 
