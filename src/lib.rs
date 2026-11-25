@@ -13,6 +13,7 @@ pub mod github;
 mod goal;
 mod http;
 mod install;
+pub mod ledger;
 pub mod markdown;
 mod mcp;
 pub mod mission;
@@ -217,6 +218,7 @@ pub(crate) struct Live {
     pub(crate) handoff_turns: Vec<soul::HandoffTurn>,
     pub(crate) live_quota: Option<(Option<f32>, Option<f32>)>,
     pub(crate) pending_prod_gates: HashMap<String, String>,
+    pub(crate) ask_user: Option<bridge::AskUserBroker>,
 }
 
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
@@ -318,6 +320,7 @@ impl Live {
             handoff_turns: Vec::new(),
             live_quota: None,
             pending_prod_gates: HashMap::new(),
+            ask_user: None,
         }
     }
 
@@ -614,6 +617,18 @@ pub struct App {
     pub(crate) ctrl_c_armed_at: Option<Instant>,
     pub(crate) leader_armed_at: Option<Instant>,
     pub(crate) external_editor_request: Option<String>,
+    pub view_tab: tui::tabs::ViewTab,
+    pub left_panel: tui::tabs::LeftPanelMode,
+    pub left_focused: bool,
+    pub(crate) left_hits: Vec<(Rect, tui::tabs::TabHit)>,
+    pub(crate) last_frame_width: u16,
+    pub(crate) ledger: ledger::Ledger,
+    pub(crate) ledger_path: Option<PathBuf>,
+    pub ledger_filter: ledger::LedgerFilter,
+    pub ledger_selected: usize,
+    pub inbox_selected: usize,
+    pub(crate) inbox_dismissed: std::collections::HashSet<String>,
+    pub(crate) inbox_wakes: Vec<tui::tabs::WakeNote>,
 }
 
 impl Default for App {
@@ -691,6 +706,18 @@ impl Default for App {
             ctrl_c_armed_at: None,
             leader_armed_at: None,
             external_editor_request: None,
+            view_tab: tui::tabs::ViewTab::Chat,
+            left_panel: tui::tabs::LeftPanelMode::Auto,
+            left_focused: false,
+            left_hits: Vec::new(),
+            last_frame_width: 0,
+            ledger: ledger::Ledger::default(),
+            ledger_path: None,
+            ledger_filter: ledger::LedgerFilter::All,
+            ledger_selected: 0,
+            inbox_selected: 0,
+            inbox_dismissed: std::collections::HashSet::new(),
+            inbox_wakes: Vec::new(),
         }
     }
 }
@@ -845,6 +872,10 @@ impl App {
                     }
                 }
                 Err(error) => app.notice = format!("Cannot read specialist roster: {error}"),
+            }
+            app.ledger_path = store.ledger_path_for_workspace(&live.workspace).ok();
+            if let Some(path) = &app.ledger_path {
+                app.ledger = ledger::Ledger::load(path);
             }
         }
         live.refresh_routes();
@@ -1139,6 +1170,7 @@ impl App {
             "SYSTEM  Goal pinned on {member}: {}",
             goal.status()
         ));
+        self.ledger_record(ledger::TaskKind::Goal, &member, &goal.criteria);
         self.goal = Some(goal);
         self.send_goal_turn(&member, turn);
     }
@@ -1146,6 +1178,7 @@ impl App {
     fn cancel_goal(&mut self) {
         self.notice = match self.goal.take() {
             Some(goal) => {
+                self.ledger_finish_goal(&goal.member, ledger::TaskStatus::Cancelled);
                 let message = format!(
                     "Goal cancelled on {} after {} of {} turns.",
                     goal.member, goal.turns, goal.cap
@@ -1179,8 +1212,16 @@ impl App {
                 "Goal stopped at the {}-turn safety cap on {member}: {}",
                 goal.cap, goal.criteria
             ),
-            goal::Step::Failed(error) => format!("Goal stopped on {member}: {error}"),
+            goal::Step::Failed(error) => {
+                let message = format!("Goal stopped on {member}: {error}");
+                self.goal = None;
+                self.ledger_finish_goal(member, ledger::TaskStatus::Error);
+                self.notice = message.clone();
+                self.push_log(format!("SYSTEM  {message}"));
+                return;
+            }
         };
+        self.ledger_finish_goal(member, ledger::TaskStatus::Done);
         self.goal = None;
         self.notice = message.clone();
         self.push_log(format!("SYSTEM  {message}"));
@@ -1202,6 +1243,7 @@ impl App {
         if !self.turn_scheduled(member) {
             let reason = std::mem::take(&mut self.notice);
             self.goal = None;
+            self.ledger_finish_goal(member, ledger::TaskStatus::Error);
             self.notice = format!("Goal stopped on {member}: {reason}");
         }
     }
@@ -1421,12 +1463,21 @@ impl App {
             return;
         };
         let busy = live.running(&name);
+        let title = targeted.text.clone();
         live.queue.push_back(Delegation {
             name: name.clone(),
             task: targeted.text,
             target: targeted.target,
             review: false,
         });
+        if !self.goal_pinned_on(&name) {
+            let status = if busy {
+                ledger::TaskStatus::Queued
+            } else {
+                ledger::TaskStatus::Running
+            };
+            self.ledger_record_with(ledger::TaskKind::Spawn, &name, &title, status);
+        }
         self.push_log(format!("SYSTEM  Delegated to {name}: {task}"));
         if busy {
             self.notice = format!("{name} is busy; the task is queued for its workspace.");
@@ -1480,6 +1531,13 @@ impl App {
             review::MAX_REVIEW_ROUNDS,
             plan.note
         ));
+        let title = format!(
+            "Review round {}/{} · {}",
+            plan.round,
+            review::MAX_REVIEW_ROUNDS,
+            plan.note
+        );
+        self.ledger_record(ledger::TaskKind::Review, &name, &title);
         self.save_roster();
         self.start_next();
     }
@@ -2016,6 +2074,7 @@ impl App {
                 claim,
             );
             live.runs.push(Run::new(COMMANDER, mission, false));
+            self.record_commander_mission(&display);
             self.crew[0].mission = display;
             self.composer.set_running(true);
             self.input.clear();
@@ -2092,6 +2151,7 @@ impl App {
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
         self.crew[0].status = Status::Running;
+        self.record_commander_mission(&display);
         self.crew[0].mission = display.clone();
         self.composer.set_running(true);
         self.input.clear();
@@ -2127,6 +2187,7 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         self.selected = self.selected.min(self.crew.len().saturating_sub(1));
+        self.sync_ledger();
         tui::render::draw_single_canvas(self, f);
     }
 }
@@ -3315,9 +3376,8 @@ esac
             app.poll_update();
             assert!(app.update_available.is_none());
             let buffer = screen(&mut app, width, height);
-            assert!(app.update_area.width > 0);
-            assert_eq!(app.update_area.right(), width);
-            assert!(row(&buffer, height - 1).contains("Checking…"));
+            assert_eq!(app.update_area, Rect::default());
+            assert!(!row(&buffer, height - 1).contains("Update"));
             sender.send("9.9.9".to_owned()).unwrap();
             app.poll_update();
             assert_eq!(app.update_available.as_deref(), Some("9.9.9"));
@@ -3347,31 +3407,47 @@ esac
     }
 
     #[test]
-    fn update_pill_adapts_across_states_and_widths() {
+    fn update_button_label_exists_only_for_detected_releases() {
         let mut app = App::default();
-        assert_eq!(app.update_pill_text(60), "↻ Update");
+        for state in [
+            update::UpdateState::Idle,
+            update::UpdateState::Checking,
+            update::UpdateState::UpToDate {
+                current: update::CURRENT.to_owned(),
+            },
+            update::UpdateState::Failed("offline".into()),
+        ] {
+            app.update_state = state.clone();
+            assert!(!app.update_button_visible(), "{state:?}");
+            for width in [60, 80, 120] {
+                assert_eq!(app.update_button_label(width), None, "{state:?}");
+            }
+        }
+        app.update_available = Some("1.2.3".into());
+        assert!(app.update_button_visible());
         assert_eq!(
-            app.update_pill_text(80),
-            format!("↻ Update · v{}", update::CURRENT)
+            app.update_button_label(80).as_deref(),
+            Some("⬆ Update v1.2.3")
         );
-        app.update_state = update::UpdateState::Checking;
-        assert_eq!(app.update_pill_text(120), "↻ Checking…");
-        app.update_state = update::UpdateState::UpToDate {
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v1.2.3 (F6)")
+        );
+        app.update_available = None;
+        app.update_state = update::UpdateState::Available {
+            tag: "v2.0.0".into(),
             current: update::CURRENT.to_owned(),
         };
-        assert_eq!(app.update_pill_text(74), "↻ Update");
         assert_eq!(
-            app.update_pill_text(120),
-            format!("↻ Update · v{}", update::CURRENT)
+            app.update_button_label(80).as_deref(),
+            Some("⬆ Update v2.0.0")
         );
-        app.update_state = update::UpdateState::Failed("offline".into());
-        assert_eq!(app.update_pill_text(60), "↻ Update (retry)");
-        assert_eq!(app.update_pill_text(120), "↻ Update (retry)");
-        app.update_available = Some("1.2.3".into());
-        assert_eq!(app.update_pill_text(80), "⬆ Update v1.2.3");
-        assert_eq!(app.update_pill_text(120), "⬆ Update v1.2.3 (F6)");
         app.update_state = update::UpdateState::Downloading { pct: 42 };
-        assert_eq!(app.update_pill_text(120), "⬇ Updating 42%");
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬇ Updating 42%")
+        );
     }
 
     #[test]

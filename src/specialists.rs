@@ -359,6 +359,12 @@ impl Store {
         )
     }
 
+    pub(crate) fn ledger_path_for_workspace(&self, workspace: &Path) -> io::Result<PathBuf> {
+        Ok(self
+            .directory()?
+            .join(format!("ledger-{}.json", workspace_hash(workspace))))
+    }
+
     pub(crate) fn load_transcript_for_workspace(
         &self,
         workspace: &Path,

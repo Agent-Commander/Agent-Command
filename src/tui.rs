@@ -1,7 +1,9 @@
 pub mod app_ops;
 pub mod diff_modal;
 pub mod events;
+pub mod left_panel;
 pub mod render;
+pub mod tabs;
 
 use std::{fs, path::Path};
 
@@ -30,12 +32,58 @@ pub fn map_tool_kind(kind: mission::ToolKind) -> markdown::ToolKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaletteState<'a> {
+    pub rail_open: bool,
+    pub left_panel_open: bool,
+    pub update_available: Option<&'a str>,
+}
+
+fn view_palette_items(left_panel_open: bool) -> Vec<PaletteItem> {
+    let mut items = vec![PaletteItem {
+        id: "view.left".into(),
+        category: "View".into(),
+        label: if left_panel_open {
+            "Hide Left Panel".into()
+        } else {
+            "Show Left Panel".into()
+        },
+        detail: "Toggle tabs, usage rings, and workspace panel".into(),
+        shortcut: "F8".into(),
+        suggested: true,
+    }];
+    for (tab, shortcut) in [
+        (tabs::ViewTab::Chat, "Alt+1"),
+        (tabs::ViewTab::Inbox, "Alt+2"),
+        (tabs::ViewTab::Ledger, "Alt+3"),
+    ] {
+        items.push(PaletteItem {
+            id: format!("view.tab.{}", tab.label().to_ascii_lowercase()),
+            category: "View".into(),
+            label: format!("Switch to {}", tab.label()),
+            detail: match tab {
+                tabs::ViewTab::Chat => "Conversation with Commander and specialists",
+                tabs::ViewTab::Inbox => "Approvals, failures, and finished work needing you",
+                tabs::ViewTab::Ledger => "Tracked missions, spawns, goals, and reviews",
+            }
+            .into(),
+            shortcut: shortcut.into(),
+            suggested: false,
+        });
+    }
+    items
+}
+
 pub fn build_palette_items(
     crew: &[Member],
     profiles: &[auth::Profile],
-    rail_open: bool,
-    update_available: Option<&str>,
+    state: PaletteState<'_>,
 ) -> Vec<PaletteItem> {
+    let PaletteState {
+        rail_open,
+        left_panel_open,
+        update_available,
+    } = state;
     let mut items = vec![
         PaletteItem {
             id: "view.diff".into(),
@@ -165,6 +213,8 @@ pub fn build_palette_items(
             suggested: false,
         },
     ];
+
+    items.splice(2..2, view_palette_items(left_panel_open));
 
     for profile in profiles {
         items.push(PaletteItem {

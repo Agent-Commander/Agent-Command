@@ -11,13 +11,16 @@ use crate::{
     auth::Provider,
     markdown::{self, UiPalette},
     specialists::{self, RosterRow, Status},
-    tui::{events::ChangedFile, provider_short_name},
+    token_burn,
+    tui::{
+        events::ChangedFile,
+        left_panel, provider_short_name,
+        tabs::{self, ViewTab},
+    },
     update::UpdateState,
     App,
 };
 
-const RAIL_MIN_WIDTH: u16 = 100;
-const RAIL_WIDTH: u16 = 34;
 const ABANDON_LABEL: &str = " F4 Abandon ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,11 +48,11 @@ pub enum WelcomeHit {
     DismissWelcome,
 }
 
-fn display_width(text: &str) -> usize {
+pub(crate) fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }
 
-fn truncate_width(text: &str, max_width: usize) -> String {
+pub(crate) fn truncate_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
@@ -72,7 +75,7 @@ fn truncate_width(text: &str, max_width: usize) -> String {
     out
 }
 
-fn text_u16(text: &str) -> u16 {
+pub(crate) fn text_u16(text: &str) -> u16 {
     u16::try_from(display_width(text)).unwrap_or(u16::MAX)
 }
 
@@ -97,17 +100,18 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
     app.rail_hits.clear();
     app.focus_banner_hits.clear();
     app.welcome_hits.clear();
+    app.left_hits.clear();
+    app.last_frame_width = area.width;
 
     if area.width < 12 || area.height < 6 {
         return;
     }
 
-    let show_rail = app.rail_open && area.width >= RAIL_MIN_WIDTH;
-    let main_w = if show_rail {
-        area.width.saturating_sub(RAIL_WIDTH)
-    } else {
-        area.width
-    };
+    let widths = tabs::panel_widths(area.width, app.left_panel, app.rail_open);
+    if widths.left == 0 {
+        app.left_focused = false;
+    }
+    let main_w = area.width.saturating_sub(widths.left + widths.rail);
     let max_composer_h = area.height.saturating_sub(6).clamp(3, 9);
     let composer_h = app
         .composer
@@ -129,19 +133,34 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
 
     draw_top_bar(app, frame, top_bar_area, &palette);
 
-    let (canvas_area, rail_area) = if show_rail {
-        let cols = Layout::horizontal([Constraint::Min(24), Constraint::Length(RAIL_WIDTH)])
-            .split(body_area);
-        (cols[0], Some(cols[1]))
+    let cols = Layout::horizontal([
+        Constraint::Length(widths.left),
+        Constraint::Min(24),
+        Constraint::Length(widths.rail),
+    ])
+    .split(body_area);
+    let (left_area, canvas_area, rail_area) = (cols[0], cols[1], cols[2]);
+
+    if widths.left > 0 {
+        left_panel::draw_left_panel(app, frame, left_area, &palette);
+    }
+
+    match app.view_tab {
+        ViewTab::Chat => draw_canvas(app, frame, canvas_area, &palette),
+        ViewTab::Inbox => {
+            app.transcript_area = Rect::default();
+            left_panel::draw_inbox_view(app, frame, canvas_area, &palette);
+        }
+        ViewTab::Ledger => {
+            app.transcript_area = Rect::default();
+            left_panel::draw_ledger_view(app, frame, canvas_area, &palette);
+        }
+    }
+
+    if widths.rail > 0 {
+        draw_right_rail(app, frame, rail_area, &palette);
     } else {
         app.crew_area = Rect::default();
-        (body_area, None)
-    };
-
-    draw_canvas(app, frame, canvas_area, &palette);
-
-    if let Some(rail) = rail_area {
-        draw_right_rail(app, frame, rail, &palette);
     }
 
     let composer_area = Rect::new(
@@ -157,6 +176,7 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
 
     let composer_focused = app.editing
         && !app.rail_focused
+        && !app.left_focused
         && !app.palette.is_open()
         && !app.diff_modal.is_open()
         && app.panel.is_none();
@@ -228,20 +248,6 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
         return;
     }
 
-    let workspace_name = app.workspace_display_name();
-    let branch_part = app
-        .git_snapshot
-        .branch
-        .as_deref()
-        .map(|branch| {
-            let dirty = if app.git_snapshot.dirty { "*" } else { "" };
-            format!(" ({branch}{dirty})")
-        })
-        .unwrap_or_default();
-    let commander_badge = app.top_bar_commander_badge();
-    let gh_badge = app.top_bar_github_badge();
-    let quota_badge = app.top_bar_quota_badge();
-
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
 
@@ -257,6 +263,48 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
         ));
         used += brand_w;
     }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
+        Rect::new(bar.x, bar.y, used as u16, 1),
+    );
+    if !app.left_panel_visible() && left_budget > used + 12 {
+        let pills_area = Rect::new(
+            bar.x + used as u16 + 1,
+            bar.y,
+            (left_budget - used - 1) as u16,
+            1,
+        );
+        used += 1 + usize::from(left_panel::draw_tab_pills(app, frame, pills_area, palette));
+    }
+    draw_top_bar_details(app, frame, bar, used.min(left_budget), left_budget, palette);
+}
+
+fn draw_top_bar_details(
+    app: &mut App,
+    frame: &mut Frame,
+    bar: Rect,
+    start: usize,
+    left_budget: usize,
+    palette: &UiPalette,
+) {
+    let bg = palette.surface;
+    let workspace_name = app.workspace_display_name();
+    let branch_part = app
+        .git_snapshot
+        .branch
+        .as_deref()
+        .map(|branch| {
+            let dirty = if app.git_snapshot.dirty { "*" } else { "" };
+            format!(" ({branch}{dirty})")
+        })
+        .unwrap_or_default();
+    let commander_badge = app.top_bar_commander_badge();
+    let gh_badge = app.top_bar_github_badge();
+    let quota_badge = app.top_bar_quota_badge();
+    let headline = app.headline_usage();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = start;
 
     let repo_seg = format!(" · {workspace_name}{branch_part}");
     let repo_w = display_width(&repo_seg);
@@ -314,14 +362,24 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
     }
 
     if let Some(quota) = quota_badge {
-        let seg = format!(" · {quota}");
-        let w = display_width(&seg);
+        let seg = format!(" {quota}");
+        let w = display_width(&seg) + 4;
         if used + w <= left_budget {
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(palette.muted).bg(bg),
+            ));
+            spans.push(token_burn::compact_ring(headline, &app.deck_palette));
             spans.push(Span::styled(seg, Style::default().fg(palette.muted).bg(bg)));
         }
     }
 
-    let left_area = Rect::new(bar.x, bar.y, left_budget as u16, 1);
+    let left_area = Rect::new(
+        bar.x + start as u16,
+        bar.y,
+        left_budget.saturating_sub(start) as u16,
+        1,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
         left_area,
@@ -910,17 +968,30 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
         .as_ref()
         .is_some_and(|live| live.pending.is_some() && !live.running(specialists::COMMANDER));
 
-    let raw_pill = app.update_pill_text(bar.width);
-    let pill_label = format!(" {raw_pill} ");
-    let pill_w = text_u16(&pill_label);
-    app.update_area = right_slice(bar, bar.right(), pill_w);
+    app.update_area = match app.update_button_label(bar.width) {
+        Some(label) => {
+            let label = format!(" {label} ");
+            let rect = right_slice(bar, bar.right(), text_u16(&label));
+            frame.render_widget(
+                Paragraph::new(label).style(update_button_style(app, palette)),
+                rect,
+            );
+            rect
+        }
+        None => Rect::default(),
+    };
+    let right_edge = if app.update_area.width > 0 {
+        app.update_area.x
+    } else {
+        bar.right()
+    };
 
     let abandon_w = if pending_continuation {
         text_u16(ABANDON_LABEL)
     } else {
         0
     };
-    let abandon_rect = right_slice(bar, app.update_area.x, abandon_w);
+    let abandon_rect = right_slice(bar, right_edge, abandon_w);
     if let Some(live) = &mut app.live {
         live.abandon_area = abandon_rect;
     }
@@ -960,35 +1031,15 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
             abandon_rect,
         );
     }
+}
 
-    let pill_style = match &app.update_state {
-        UpdateState::Downloading { .. } => Style::default()
-            .fg(palette.bg)
-            .bg(palette.accent)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Available { .. } => Style::default()
-            .fg(palette.bg)
-            .bg(palette.warning)
-            .add_modifier(Modifier::BOLD),
-        _ if app.update_available.is_some() => Style::default()
-            .fg(palette.bg)
-            .bg(palette.warning)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Failed(_) => Style::default()
-            .fg(palette.warning)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Checking => Style::default()
-            .fg(palette.accent_soft)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
-        UpdateState::Idle | UpdateState::UpToDate { .. } => Style::default()
-            .fg(palette.selection_fg)
-            .bg(palette.selection_bg)
-            .add_modifier(Modifier::BOLD),
+fn update_button_style(app: &App, palette: &UiPalette) -> Style {
+    let bg = match app.update_state {
+        UpdateState::Downloading { .. } => palette.accent,
+        _ => palette.warning,
     };
-    frame.render_widget(
-        Paragraph::new(pill_label).style(pill_style),
-        app.update_area,
-    );
+    Style::default()
+        .fg(palette.bg)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD)
 }

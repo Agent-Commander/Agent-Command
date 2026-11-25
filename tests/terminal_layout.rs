@@ -51,8 +51,8 @@ fn single_canvas_renders_cleanly_at_supported_and_narrow_sizes() {
         assert!(app.settings_area.width > 0 && app.settings_area.right() <= w);
         assert!(app.palette_area.width > 0 && app.palette_area.right() <= w);
         assert!(app.input_area.width > 0 && app.input_area.bottom() < h);
-        assert!(app.update_area.width > 0 && app.update_area.right() == w);
-        assert_eq!(app.update_area.y, h - 1);
+        assert_eq!(app.update_area, Rect::default(), "{w}x{h}");
+        assert!(!text(&buffer, Rect::new(0, h - 1, w, 1)).contains("Update"));
         assert!(app.editing);
         if w >= 100 {
             assert!(app.crew_area.width > 0);
@@ -224,36 +224,41 @@ fn command_palette_and_diff_viewer_work_via_keyboard_and_mouse() {
 }
 
 #[test]
-fn bottom_right_update_pill_is_always_visible_across_states() {
+fn update_button_is_hidden_unless_a_newer_release_is_detected() {
+    let mut app = App::default();
+    for state in [
+        UpdateState::Idle,
+        UpdateState::Checking,
+        UpdateState::UpToDate {
+            current: update::CURRENT.to_owned(),
+        },
+        UpdateState::Failed("offline".into()),
+    ] {
+        app.update_state = state.clone();
+        app.update_available = None;
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (140, 40)] {
+            let buf = render(&mut app, w, h);
+            assert_eq!(app.update_area, Rect::default(), "{state:?} {w}x{h}");
+            let footer = text(&buf, Rect::new(0, h - 1, w, 1));
+            assert!(!footer.contains("Update"), "{state:?} {w}x{h}: {footer}");
+            assert!(!footer.contains('↻'), "{state:?} {w}x{h}: {footer}");
+            app.notice.clear();
+            app.click(w - 2, h - 1);
+            assert!(app.notice.is_empty(), "{state:?} {w}x{h}: {}", app.notice);
+            assert!(!app.quit);
+        }
+    }
+}
+
+#[test]
+fn update_button_is_visible_and_clickable_once_a_newer_release_is_detected() {
     let mut app = App::default();
     let footer_bg = app.ui_palette.surface;
     for (state, expected_narrow, expected_wide) in [
         (
-            UpdateState::Idle,
-            "↻ Update",
-            format!("↻ Update · v{}", update::CURRENT),
-        ),
-        (
-            UpdateState::Checking,
-            "↻ Checking…",
-            "↻ Checking…".to_owned(),
-        ),
-        (
-            UpdateState::UpToDate {
-                current: update::CURRENT.to_owned(),
-            },
-            "↻ Update",
-            format!("↻ Update · v{}", update::CURRENT),
-        ),
-        (
-            UpdateState::Failed("offline".into()),
-            "↻ Update (retry)",
-            "↻ Update (retry)".to_owned(),
-        ),
-        (
             UpdateState::Downloading { pct: 50 },
             "⬇ Updating 50%",
-            "⬇ Updating 50%".to_owned(),
+            "⬇ Updating 50%",
         ),
         (
             UpdateState::Available {
@@ -261,28 +266,37 @@ fn bottom_right_update_pill_is_always_visible_across_states() {
                 current: update::CURRENT.to_owned(),
             },
             "⬆ Update v0.9.0",
-            "⬆ Update v0.9.0 (F6)".to_owned(),
+            "⬆ Update v0.9.0 (F6)",
         ),
     ] {
         app.update_state = state;
-        for (w, h) in [(60, 20), (80, 24), (120, 40)] {
+        for (w, h) in [(60, 20), (80, 24), (120, 40), (140, 40)] {
             let buf = render(&mut app, w, h);
             assert!(app.update_area.width > 0);
             assert_eq!(app.update_area.right(), w);
             assert_eq!(app.update_area.y, h - 1);
             let pill = text(&buf, app.update_area);
-            let expected = if w < 75 {
-                expected_narrow
-            } else if w >= 100 {
-                expected_wide.as_str()
+            let expected = if w >= 100 {
+                expected_wide
             } else {
-                expected_wide.trim_end_matches(" (F6)")
+                expected_narrow
             };
             assert_eq!(pill.trim(), expected, "{w}x{h}: {pill}");
             let cell = &buf[(app.update_area.x, app.update_area.y)];
             assert_ne!(cell.bg, footer_bg, "{w}x{h} button must contrast footer bg");
+            app.notice.clear();
+            let button = app.update_area;
+            click_center(&mut app, button, w, h);
+            assert!(
+                !app.notice.is_empty(),
+                "{w}x{h} click must reach the updater"
+            );
         }
     }
+    app.update_state = UpdateState::Idle;
+    app.update_available = Some("9.9.9".into());
+    let buf = render(&mut app, 140, 40);
+    assert_eq!(text(&buf, app.update_area).trim(), "⬆ Update v9.9.9 (F6)");
 }
 
 #[test]
