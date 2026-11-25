@@ -18,7 +18,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -35,6 +35,7 @@ const SNOOZE_POLL: Duration = Duration::from_millis(200);
 const CANCEL_POLL: Duration = Duration::from_millis(15);
 const STDERR_TAIL_LIMIT: usize = 20;
 const OUTPUT_PREVIEW_CHARS: usize = 400;
+const MAX_PARTIAL_TOOL_JSON_BYTES: usize = 256 * 1024;
 const NO_ALTERNATE: &str =
     "Usage limit reached; mission stopped without replay. No eligible signed-in alternate.";
 
@@ -773,8 +774,10 @@ fn tool_resource(tool_name: &str, input: &Value) -> String {
 fn summarize_tool(name: &str, input: &Value) -> String {
     for key in [
         "command",
+        "cmd",
         "file_path",
         "path",
+        "notebook_path",
         "pattern",
         "query",
         "url",
@@ -782,11 +785,86 @@ fn summarize_tool(name: &str, input: &Value) -> String {
     ] {
         if let Some(val) = input.get(key).and_then(Value::as_str) {
             let single_line = val.lines().next().unwrap_or(val).trim();
-            let clipped: String = single_line.chars().take(120).collect();
-            return format!("{name}: {clipped}");
+            if !single_line.is_empty() {
+                let clipped: String = single_line.chars().take(120).collect();
+                return format!("{name}: {clipped}");
+            }
         }
     }
     name.to_owned()
+}
+
+fn summarize_partial_tool_json(name: &str, partial_json: &str) -> Option<String> {
+    for key in [
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "notebook_path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ] {
+        if let Some(val) = extract_partial_json_string_field(partial_json, key) {
+            let single_line = val.lines().next().unwrap_or(&val).trim();
+            if !single_line.is_empty() {
+                let clipped: String = single_line.chars().take(120).collect();
+                return Some(format!("{name}: {clipped}"));
+            }
+        }
+    }
+    None
+}
+
+fn extract_partial_json_string_field(partial: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut offset = 0usize;
+    while let Some(found) = partial[offset..].find(&needle) {
+        let after_key = offset + found + needle.len();
+        let rest = partial[after_key..].trim_start();
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            let value_start = after_colon.trim_start();
+            if let Some(quoted) = value_start.strip_prefix('"') {
+                return parse_complete_json_string_literal(quoted);
+            }
+        }
+        offset = after_key;
+    }
+    None
+}
+
+fn parse_complete_json_string_literal(input: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'u' => {
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        hex.push(chars.next()?);
+                    }
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    if let Some(decoded) = char::from_u32(code) {
+                        out.push(decoded);
+                    }
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
 }
 
 fn preview_text(text: &str) -> String {
@@ -800,12 +878,30 @@ fn preview_text(text: &str) -> String {
     }
 }
 
+enum ActiveStreamBlock {
+    Thinking,
+    Text,
+    ToolUse {
+        call_id: String,
+        name: String,
+        partial_json: String,
+        emitted_summary: String,
+    },
+}
+
 pub struct EventParser {
     provider: Provider,
     last_cumulative_cost_usd: f64,
-    streamed_text_this_turn: bool,
+    active_stream_message_id: Option<String>,
+    streamed_text_in_message: bool,
+    streamed_thinking_in_message: bool,
+    gemini_streamed_delta: bool,
     final_text: String,
     tool_names_by_id: HashMap<String, (String, Value)>,
+    emitted_tool_summaries: HashMap<String, String>,
+    active_blocks: HashMap<usize, ActiveStreamBlock>,
+    codex_item_text: HashMap<String, String>,
+    codex_started_tools: HashSet<String>,
 }
 
 impl EventParser {
@@ -813,9 +909,16 @@ impl EventParser {
         Self {
             provider,
             last_cumulative_cost_usd: 0.0,
-            streamed_text_this_turn: false,
+            active_stream_message_id: None,
+            streamed_text_in_message: false,
+            streamed_thinking_in_message: false,
+            gemini_streamed_delta: false,
             final_text: String::new(),
             tool_names_by_id: HashMap::new(),
+            emitted_tool_summaries: HashMap::new(),
+            active_blocks: HashMap::new(),
+            codex_item_text: HashMap::new(),
+            codex_started_tools: HashSet::new(),
         }
     }
 
@@ -829,6 +932,37 @@ impl EventParser {
             Provider::Claude => self.parse_claude(event, interrupted, policy),
             Provider::Codex => self.parse_codex(event, interrupted),
             Provider::Gemini => self.parse_gemini(event, interrupted),
+        }
+    }
+
+    fn emit_claude_tool_start(
+        &mut self,
+        call_id: String,
+        name: String,
+        summary: String,
+        raw_input: Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) {
+        if raw_input.is_object() && !raw_input.as_object().is_some_and(serde_json::Map::is_empty)
+            || !self.tool_names_by_id.contains_key(&call_id)
+        {
+            self.tool_names_by_id
+                .insert(call_id.clone(), (name.clone(), raw_input.clone()));
+        }
+        let should_emit = match self.emitted_tool_summaries.get(&call_id) {
+            None => true,
+            Some(prev) => prev != &summary && summary.len() > prev.len(),
+        };
+        if should_emit {
+            self.emitted_tool_summaries
+                .insert(call_id.clone(), summary.clone());
+            out.push(NormalizedEvent::ToolStart {
+                call_id,
+                kind: classify_tool_kind(&name),
+                name,
+                summary,
+                raw_input,
+            });
         }
     }
 
@@ -850,59 +984,181 @@ impl EventParser {
             }
             Some("stream_event") => {
                 let inner = &event["event"];
-                if inner["type"] == "content_block_delta" {
-                    let delta = &inner["delta"];
-                    match delta["type"].as_str() {
-                        Some("text_delta") => {
-                            if let Some(text) = delta["text"].as_str() {
-                                self.streamed_text_this_turn = true;
-                                self.final_text.push_str(text);
-                                out.push(NormalizedEvent::TextDelta(text.to_owned()));
-                            }
-                        }
-                        Some("thinking_delta") => {
-                            if let Some(thinking) = delta["thinking"].as_str() {
-                                out.push(NormalizedEvent::ThinkingDelta(thinking.to_owned()));
-                            }
-                        }
-                        _ => {}
+                match inner["type"].as_str() {
+                    Some("message_start") => {
+                        self.active_stream_message_id =
+                            inner["message"]["id"].as_str().map(str::to_owned);
+                        self.streamed_text_in_message = false;
+                        self.streamed_thinking_in_message = false;
+                        self.active_blocks.clear();
                     }
+                    Some("content_block_start") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        let block = &inner["content_block"];
+                        match block["type"].as_str() {
+                            Some("thinking" | "redacted_thinking") => {
+                                self.active_blocks
+                                    .insert(index, ActiveStreamBlock::Thinking);
+                                let initial = block["thinking"].as_str().unwrap_or_default();
+                                if !initial.is_empty() {
+                                    self.streamed_thinking_in_message = true;
+                                }
+                                out.push(NormalizedEvent::ThinkingDelta(initial.to_owned()));
+                            }
+                            Some("text") => {
+                                self.active_blocks.insert(index, ActiveStreamBlock::Text);
+                                if let Some(initial) =
+                                    block["text"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_text_in_message = true;
+                                    self.final_text.push_str(initial);
+                                    out.push(NormalizedEvent::TextDelta(initial.to_owned()));
+                                }
+                            }
+                            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                                let call_id = block["id"].as_str().unwrap_or_default().to_owned();
+                                let name = block["name"].as_str().unwrap_or("tool").to_owned();
+                                let initial_input = block["input"].clone();
+                                let summary = summarize_tool(&name, &initial_input);
+                                self.active_blocks.insert(
+                                    index,
+                                    ActiveStreamBlock::ToolUse {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        partial_json: String::new(),
+                                        emitted_summary: summary.clone(),
+                                    },
+                                );
+                                self.emit_claude_tool_start(
+                                    call_id,
+                                    name,
+                                    summary,
+                                    initial_input,
+                                    &mut out,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        let delta = &inner["delta"];
+                        match delta["type"].as_str() {
+                            Some("text_delta") => {
+                                if let Some(text) = delta["text"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_text_in_message = true;
+                                    self.final_text.push_str(text);
+                                    out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if let Some(thinking) =
+                                    delta["thinking"].as_str().filter(|t| !t.is_empty())
+                                {
+                                    self.streamed_thinking_in_message = true;
+                                    out.push(NormalizedEvent::ThinkingDelta(thinking.to_owned()));
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(chunk) = delta["partial_json"].as_str() {
+                                    let enriched = if let Some(ActiveStreamBlock::ToolUse {
+                                        call_id,
+                                        name,
+                                        partial_json,
+                                        emitted_summary,
+                                    }) = self.active_blocks.get_mut(&index)
+                                    {
+                                        if partial_json.len() < MAX_PARTIAL_TOOL_JSON_BYTES {
+                                            partial_json.push_str(chunk);
+                                        }
+                                        if *emitted_summary == *name {
+                                            if let Some(rich) =
+                                                summarize_partial_tool_json(name, partial_json)
+                                            {
+                                                *emitted_summary = rich.clone();
+                                                Some((call_id.clone(), name.clone(), rich))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((call_id, name, summary)) = enriched {
+                                        self.emit_claude_tool_start(
+                                            call_id,
+                                            name,
+                                            summary,
+                                            Value::Object(serde_json::Map::new()),
+                                            &mut out,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let index = inner["index"].as_u64().unwrap_or(0) as usize;
+                        if let Some(ActiveStreamBlock::ToolUse {
+                            call_id,
+                            name,
+                            partial_json,
+                            ..
+                        }) = self.active_blocks.remove(&index)
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&partial_json) {
+                                let summary = summarize_tool(&name, &parsed);
+                                self.emit_claude_tool_start(
+                                    call_id, name, summary, parsed, &mut out,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some("assistant") => {
+                let msg_id = event["message"]["id"].as_str();
+                let matches_streamed = match (msg_id, self.active_stream_message_id.as_deref()) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, _) | (_, None) => true,
+                };
                 if let Some(items) = event["message"]["content"].as_array() {
                     for item in items {
                         match item["type"].as_str() {
                             Some("text") => {
-                                if !self.streamed_text_this_turn {
-                                    if let Some(text) = item["text"].as_str() {
+                                if !(matches_streamed && self.streamed_text_in_message) {
+                                    if let Some(text) =
+                                        item["text"].as_str().filter(|t| !t.is_empty())
+                                    {
                                         self.final_text.push_str(text);
                                         out.push(NormalizedEvent::TextDelta(text.to_owned()));
                                     }
                                 }
                             }
                             Some("thinking") => {
-                                if !self.streamed_text_this_turn {
-                                    if let Some(thinking) = item["thinking"].as_str() {
+                                if !(matches_streamed && self.streamed_thinking_in_message) {
+                                    if let Some(thinking) =
+                                        item["thinking"].as_str().filter(|t| !t.is_empty())
+                                    {
                                         out.push(NormalizedEvent::ThinkingDelta(
                                             thinking.to_owned(),
                                         ));
                                     }
                                 }
                             }
-                            Some("tool_use") => {
+                            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
                                 let call_id = item["id"].as_str().unwrap_or_default().to_owned();
                                 let name = item["name"].as_str().unwrap_or("tool").to_owned();
                                 let input = item["input"].clone();
-                                self.tool_names_by_id
-                                    .insert(call_id.clone(), (name.clone(), input.clone()));
-                                out.push(NormalizedEvent::ToolStart {
-                                    call_id,
-                                    kind: classify_tool_kind(&name),
-                                    summary: summarize_tool(&name, &input),
-                                    name,
-                                    raw_input: input,
-                                });
+                                let summary = summarize_tool(&name, &input);
+                                self.emit_claude_tool_start(
+                                    call_id, name, summary, input, &mut out,
+                                );
                             }
                             _ => {}
                         }
@@ -931,13 +1187,18 @@ impl EventParser {
                 }
             }
             Some("user") => {
+                self.active_stream_message_id = None;
+                self.streamed_text_in_message = false;
+                self.streamed_thinking_in_message = false;
+                self.active_blocks.clear();
                 if let Some(items) = event["message"]["content"].as_array() {
                     for item in items {
                         if item["type"] == "tool_result" {
                             let call_id =
                                 item["tool_use_id"].as_str().unwrap_or_default().to_owned();
                             let ok = item["is_error"] != true;
-                            let content_str = match &item["content"] {
+                            let mut content_str = match &item["content"] {
+                                Value::Null => String::new(),
                                 Value::String(text) => text.clone(),
                                 Value::Array(parts) => parts
                                     .iter()
@@ -946,6 +1207,26 @@ impl EventParser {
                                     .join("\n"),
                                 other => other.to_string(),
                             };
+                            if content_str.trim().is_empty() {
+                                let result_meta = event
+                                    .get("tool_use_result")
+                                    .or_else(|| event["message"].get("tool_use_result"));
+                                if let Some(meta) = result_meta {
+                                    if let Some(text) =
+                                        meta.as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = text.to_owned();
+                                    } else if let Some(stdout) =
+                                        meta["stdout"].as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = stdout.to_owned();
+                                    } else if let Some(stderr) =
+                                        meta["stderr"].as_str().filter(|s| !s.trim().is_empty())
+                                    {
+                                        content_str = stderr.to_owned();
+                                    }
+                                }
+                            }
                             out.push(NormalizedEvent::ToolEnd {
                                 call_id: call_id.clone(),
                                 ok,
@@ -957,6 +1238,7 @@ impl EventParser {
                                     if let Some(path) = input
                                         .get("file_path")
                                         .or_else(|| input.get("path"))
+                                        .or_else(|| input.get("notebook_path"))
                                         .and_then(Value::as_str)
                                     {
                                         let kind = match classify_tool_kind(name) {
@@ -1037,7 +1319,11 @@ impl EventParser {
                 } else {
                     event["result"].as_str().unwrap_or_default().to_owned()
                 };
-                self.streamed_text_this_turn = false;
+                self.active_stream_message_id = None;
+                self.streamed_text_in_message = false;
+                self.streamed_thinking_in_message = false;
+                self.active_blocks.clear();
+                self.emitted_tool_summaries.clear();
                 out.push(NormalizedEvent::TurnFinished {
                     interrupted: was_interrupted,
                     is_error: raw_is_error && !was_interrupted,
@@ -1049,6 +1335,97 @@ impl EventParser {
             _ => {}
         }
         out
+    }
+
+    fn codex_incremental_delta(&mut self, item_id: &str, full_text: &str, remove: bool) -> String {
+        let previous = if remove {
+            self.codex_item_text.remove(item_id).unwrap_or_default()
+        } else {
+            self.codex_item_text
+                .get(item_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let delta = if let Some(suffix) = full_text.strip_prefix(&previous) {
+            suffix.to_owned()
+        } else if full_text == previous {
+            String::new()
+        } else {
+            full_text.to_owned()
+        };
+        if !remove {
+            self.codex_item_text
+                .insert(item_id.to_owned(), full_text.to_owned());
+        }
+        delta
+    }
+
+    fn emit_codex_tool_start(
+        &mut self,
+        call_id: &str,
+        item: &Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) {
+        if !self.codex_started_tools.insert(call_id.to_owned()) {
+            return;
+        }
+        match item["type"].as_str() {
+            Some("command_execution") => {
+                let cmd = item["command"].as_str().unwrap_or_default();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Shell,
+                    name: "command_execution".into(),
+                    summary: format!("shell: {}", preview_text(cmd)),
+                    raw_input: json!({ "command": cmd }),
+                });
+            }
+            Some("file_change") => {
+                let first_path = item["changes"]
+                    .as_array()
+                    .and_then(|c| c.first())
+                    .and_then(|c| c["path"].as_str())
+                    .unwrap_or("files");
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Edit,
+                    name: "file_change".into(),
+                    summary: format!("Edit: {first_path}"),
+                    raw_input: item.clone(),
+                });
+            }
+            Some("mcp_tool_call") => {
+                let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_owned();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Mcp,
+                    summary: summarize_tool(&tool, &item["arguments"]),
+                    name: tool,
+                    raw_input: item["arguments"].clone(),
+                });
+            }
+            Some("collab_tool_call") => {
+                let tool = item["tool"].as_str().unwrap_or("collab").to_owned();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Subagent,
+                    summary: format!("subagent: {tool}"),
+                    name: tool,
+                    raw_input: item.clone(),
+                });
+            }
+            Some("web_search") => {
+                let query = item["query"].as_str().unwrap_or_default();
+                out.push(NormalizedEvent::ToolStart {
+                    call_id: call_id.to_owned(),
+                    kind: ToolKind::Web,
+                    name: "web_search".into(),
+                    summary: format!("web_search: {}", preview_text(query)),
+                    raw_input: json!({ "query": query }),
+                });
+            }
+            _ => {}
+        }
     }
 
     fn parse_codex(&mut self, event: &Value, interrupted: bool) -> Vec<NormalizedEvent> {
@@ -1064,47 +1441,57 @@ impl EventParser {
             }
             Some("item.started") => {
                 let item = &event["item"];
-                let call_id = item["id"].as_str().unwrap_or_default().to_owned();
+                let call_id = item["id"].as_str().unwrap_or_default();
                 match item["type"].as_str() {
-                    Some("command_execution") => {
-                        let cmd = item["command"].as_str().unwrap_or_default();
-                        out.push(NormalizedEvent::ToolStart {
-                            call_id,
-                            kind: ToolKind::Shell,
-                            name: "command_execution".into(),
-                            summary: format!("shell: {}", preview_text(cmd)),
-                            raw_input: json!({ "command": cmd }),
-                        });
+                    Some("reasoning") => {
+                        let initial = item["text"].as_str().unwrap_or_default();
+                        let delta = self.codex_incremental_delta(call_id, initial, false);
+                        out.push(NormalizedEvent::ThinkingDelta(delta));
                     }
-                    Some("mcp_tool_call") => {
-                        let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_owned();
-                        out.push(NormalizedEvent::ToolStart {
-                            call_id,
-                            kind: ToolKind::Mcp,
-                            summary: summarize_tool(&tool, &item["arguments"]),
-                            name: tool,
-                            raw_input: item["arguments"].clone(),
-                        });
+                    Some("agent_message") => {
+                        if let Some(text) = item["text"].as_str().filter(|t| !t.is_empty()) {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
+                        }
                     }
-                    Some("collab_tool_call") => {
-                        let tool = item["tool"].as_str().unwrap_or("collab").to_owned();
-                        out.push(NormalizedEvent::ToolStart {
-                            call_id,
-                            kind: ToolKind::Subagent,
-                            summary: format!("subagent: {tool}"),
-                            name: tool,
-                            raw_input: item.clone(),
-                        });
+                    Some(
+                        "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                        | "web_search",
+                    ) => {
+                        self.emit_codex_tool_start(call_id, item, &mut out);
                     }
-                    Some("web_search") => {
-                        let query = item["query"].as_str().unwrap_or_default();
-                        out.push(NormalizedEvent::ToolStart {
-                            call_id,
-                            kind: ToolKind::Web,
-                            name: "web_search".into(),
-                            summary: format!("web_search: {}", preview_text(query)),
-                            raw_input: json!({ "query": query }),
-                        });
+                    _ => {}
+                }
+            }
+            Some("item.updated") => {
+                let item = &event["item"];
+                let call_id = item["id"].as_str().unwrap_or_default();
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = item["text"].as_str() {
+                            let delta = self.codex_incremental_delta(call_id, text, false);
+                            if !delta.is_empty() {
+                                out.push(NormalizedEvent::ThinkingDelta(delta));
+                            }
+                        }
+                    }
+                    Some(
+                        "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                        | "web_search",
+                    ) => {
+                        self.emit_codex_tool_start(call_id, item, &mut out);
                     }
                     _ => {}
                 }
@@ -1115,16 +1502,24 @@ impl EventParser {
                 match item["type"].as_str() {
                     Some("agent_message") => {
                         if let Some(text) = item["text"].as_str() {
-                            self.final_text.push_str(text);
-                            out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                            let delta = self.codex_incremental_delta(&call_id, text, true);
+                            if !delta.is_empty() {
+                                self.final_text.push_str(&delta);
+                                out.push(NormalizedEvent::TextDelta(delta));
+                            }
                         }
                     }
                     Some("reasoning") => {
                         if let Some(text) = item["text"].as_str() {
-                            out.push(NormalizedEvent::ThinkingDelta(text.to_owned()));
+                            let delta = self.codex_incremental_delta(&call_id, text, true);
+                            if !delta.is_empty() {
+                                out.push(NormalizedEvent::ThinkingDelta(delta));
+                            }
                         }
                     }
                     Some("command_execution") => {
+                        self.emit_codex_tool_start(&call_id, item, &mut out);
+                        self.codex_started_tools.remove(&call_id);
                         let status = item["status"].as_str().unwrap_or("completed");
                         let exit_code = item["exit_code"].as_i64().map(|c| c as i32);
                         let output = item["aggregated_output"].as_str().unwrap_or_default();
@@ -1136,9 +1531,12 @@ impl EventParser {
                         });
                     }
                     Some("file_change") => {
+                        let had_tool_card = self.codex_started_tools.remove(&call_id);
+                        let mut changed_paths = Vec::new();
                         if let Some(changes) = item["changes"].as_array() {
                             for change in changes {
                                 if let Some(path) = change["path"].as_str() {
+                                    changed_paths.push(path.to_owned());
                                     let kind = match change["kind"].as_str() {
                                         Some("add") => PatchKind::Add,
                                         Some("delete") => PatchKind::Delete,
@@ -1151,14 +1549,31 @@ impl EventParser {
                                 }
                             }
                         }
+                        if had_tool_card {
+                            let ok = item["status"].as_str().unwrap_or("completed") != "failed";
+                            out.push(NormalizedEvent::ToolEnd {
+                                call_id,
+                                ok,
+                                output_preview: changed_paths.join(", "),
+                                exit_code: None,
+                            });
+                        }
                     }
                     Some("mcp_tool_call" | "collab_tool_call" | "web_search") => {
+                        self.emit_codex_tool_start(&call_id, item, &mut out);
+                        self.codex_started_tools.remove(&call_id);
                         let ok = item["error"].is_null() && item["status"] != "failed";
                         let preview = item["error"]
                             .as_str()
                             .or_else(|| item["result"].as_str())
                             .map(preview_text)
-                            .unwrap_or_else(|| preview_text(&item["result"].to_string()));
+                            .unwrap_or_else(|| {
+                                if item["result"].is_null() {
+                                    String::new()
+                                } else {
+                                    preview_text(&item["result"].to_string())
+                                }
+                            });
                         out.push(NormalizedEvent::ToolEnd {
                             call_id,
                             ok,
@@ -1175,6 +1590,8 @@ impl EventParser {
                 }
             }
             Some("turn.completed") => {
+                self.codex_item_text.clear();
+                self.codex_started_tools.clear();
                 let usage_val = &event["usage"];
                 if usage_val.is_object() {
                     out.push(NormalizedEvent::UsageDelta {
@@ -1199,6 +1616,8 @@ impl EventParser {
                     .unwrap_or("Codex turn failed");
                 out.push(NormalizedEvent::StderrLine(msg.to_owned()));
                 if event["type"] == "turn.failed" {
+                    self.codex_item_text.clear();
+                    self.codex_started_tools.clear();
                     out.push(NormalizedEvent::TurnFinished {
                         interrupted,
                         is_error: !interrupted,
@@ -1216,6 +1635,7 @@ impl EventParser {
         let mut out = Vec::new();
         match event["type"].as_str() {
             Some("init") => {
+                self.gemini_streamed_delta = false;
                 if let Some(session_id) = event["session_id"].as_str() {
                     out.push(NormalizedEvent::SessionStarted {
                         session_id: session_id.to_owned(),
@@ -1223,10 +1643,29 @@ impl EventParser {
                     });
                 }
             }
+            Some("thought" | "thinking") => {
+                if let Some(thought) = event["content"]
+                    .as_str()
+                    .or_else(|| event["text"].as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                }
+            }
             Some("message") if event["role"] == "assistant" => {
-                if let Some(text) = event["content"].as_str() {
-                    self.final_text.push_str(text);
-                    out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                if let Some(thought) = event["thought"].as_str().filter(|t| !t.is_empty()) {
+                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                }
+                if let Some(text) = event["content"].as_str().filter(|t| !t.is_empty()) {
+                    let is_delta = event["delta"] == true;
+                    if is_delta {
+                        self.gemini_streamed_delta = true;
+                        self.final_text.push_str(text);
+                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                    } else if !self.gemini_streamed_delta || !self.final_text.ends_with(text) {
+                        self.final_text.push_str(text);
+                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
+                    }
                 }
             }
             Some("tool_use") => {
@@ -1284,6 +1723,7 @@ impl EventParser {
                 }
             }
             Some("result") => {
+                self.gemini_streamed_delta = false;
                 let stats = &event["stats"];
                 if stats.is_object() {
                     out.push(NormalizedEvent::UsageDelta {
@@ -2072,6 +2512,11 @@ fn read_output(
             }
             let _ = norm_sender.send(normalized);
         }
+        if profile.provider == Provider::Claude && event["type"] == "result" {
+            if let Some(ctrl) = &control {
+                ctrl.lock().unwrap_or_else(PoisonError::into_inner).take();
+            }
+        }
         for text in output_text(profile.provider, &event) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
                 let safe = line
@@ -2361,6 +2806,209 @@ mod engine_tests {
             .collect();
         let _ = remaining;
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parses_realistic_claude_partial_stream_with_thinking_write_bash_and_text_without_duplicates()
+    {
+        let stream = [
+            json!({"type":"system","subtype":"init","session_id":"sess-gridfall","model":"claude-opus-4-6"}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan the HTML5 canvas game."}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_1","content":[
+                {"type":"thinking","thinking":"Plan the HTML5 canvas game."}
+            ]}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_write","name":"Write","input":{}}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"C:\\\\Users\\\\j\\\\gridfall.html\","}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"content\":\"<!doctype html>\"}"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":1}}),
+            json!({"type":"assistant","message":{"id":"msg_1","content":[
+                {"type":"thinking","thinking":"Plan the HTML5 canvas game."},
+                {"type":"tool_use","id":"toolu_write","name":"Write","input":{"file_path":"C:\\Users\\j\\gridfall.html","content":"<!doctype html>"}}
+            ]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_write","content":"File created successfully","is_error":false}]}}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{}}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"start C:\\\\Users\\\\j\\\\gridfall.html\"}"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_2","content":[
+                {"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"start C:\\Users\\j\\gridfall.html"}}
+            ]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":null,"is_error":false}]},"tool_use_result":{"stdout":"","stderr":"Launched browser"}}),
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_3"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Built "}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Gridfall!"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+            json!({"type":"assistant","message":{"id":"msg_3","content":[{"type":"text","text":"Built Gridfall!"}]}}),
+            json!({"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.04,"result":"Built Gridfall!"}),
+        ];
+
+        let mut parser = EventParser::new(Provider::Claude);
+        let mut events = Vec::new();
+        for item in &stream {
+            events.extend(parser.parse_value(item, false, None));
+        }
+
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_text, "Plan the HTML5 canvas game.");
+
+        let write_starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ToolStart {
+                    call_id, summary, ..
+                } if call_id == "toolu_write" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            write_starts,
+            ["Write", "Write: C:\\Users\\j\\gridfall.html"]
+        );
+
+        let bash_starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ToolStart {
+                    call_id, summary, ..
+                } if call_id == "toolu_bash" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bash_starts,
+            ["Bash", "Bash: start C:\\Users\\j\\gridfall.html"]
+        );
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd {
+                call_id,
+                ok: true,
+                output_preview,
+                ..
+            } if call_id == "toolu_write" && output_preview == "File created successfully"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd {
+                call_id,
+                ok: true,
+                output_preview,
+                ..
+            } if call_id == "toolu_bash" && output_preview == "Launched browser"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::FileChanged { path, kind: PatchKind::Add }
+            if path == "C:\\Users\\j\\gridfall.html"
+        )));
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, "Built Gridfall!");
+    }
+
+    #[test]
+    fn parses_codex_incremental_updates_and_gemini_deltas_without_duplication() {
+        let mut codex = EventParser::new(Provider::Codex);
+        let codex_stream = [
+            json!({"type":"thread.started","thread_id":"th-9"}),
+            json!({"type":"item.started","item":{"id":"r1","type":"reasoning","text":"Check"}}),
+            json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"Check files"}}),
+            json!({"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"Check files."}}),
+            json!({"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test"}}),
+            json!({"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test","aggregated_output":"ok","exit_code":0,"status":"completed"}}),
+            json!({"type":"item.started","item":{"id":"f1","type":"file_change","changes":[{"path":"src/app.rs","kind":"update"}]}}),
+            json!({"type":"item.completed","item":{"id":"f1","type":"file_change","changes":[{"path":"src/app.rs","kind":"update"}],"status":"completed"}}),
+            json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"All "}}),
+            json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"All green!"}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}),
+        ];
+        let mut codex_events = Vec::new();
+        for item in &codex_stream {
+            codex_events.extend(codex.parse_value(item, false, None));
+        }
+        let reasoning: String = codex_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "Check files.");
+        let msg: String = codex_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msg, "All green!");
+        assert!(codex_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, .. } if call_id == "c1")));
+        assert!(codex_events.iter().any(
+            |e| matches!(e, NormalizedEvent::ToolEnd { call_id, ok: true, .. } if call_id == "c1")
+        ));
+        assert!(codex_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, .. } if call_id == "f1")));
+        assert!(codex_events.iter().any(
+            |e| matches!(e, NormalizedEvent::ToolEnd { call_id, ok: true, .. } if call_id == "f1")
+        ));
+
+        let mut gemini = EventParser::new(Provider::Gemini);
+        let gemini_stream = [
+            json!({"type":"init","session_id":"gem-1","model":"gemini-2.5-pro"}),
+            json!({"type":"thought","content":"Inspect workspace"}),
+            json!({"type":"tool_use","tool_id":"gt1","tool_name":"write_file","parameters":{"file_path":"game.html"}}),
+            json!({"type":"tool_result","tool_id":"gt1","status":"success","output":"Wrote game.html"}),
+            json!({"type":"message","role":"assistant","content":"Done ","delta":true}),
+            json!({"type":"message","role":"assistant","content":"now.","delta":true}),
+            json!({"type":"message","role":"assistant","content":"Done now.","delta":false}),
+            json!({"type":"result","status":"success","stats":{"input_tokens":20,"cached":0,"output_tokens":8}}),
+        ];
+        let mut gem_events = Vec::new();
+        for item in &gemini_stream {
+            gem_events.extend(gemini.parse_value(item, false, None));
+        }
+        let gem_text: String = gem_events
+            .iter()
+            .filter_map(|e| match e {
+                NormalizedEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gem_text, "Done now.");
+        assert!(gem_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ThinkingDelta(t) if t == "Inspect workspace")));
+        assert!(gem_events
+            .iter()
+            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, summary, .. } if call_id == "gt1" && summary == "write_file: game.html")));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::FileChanged {
+                path,
+                kind: PatchKind::Add
+            } if path == "game.html"
+        )));
     }
 }
 
