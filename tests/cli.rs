@@ -174,7 +174,9 @@ fn specialist_subcommands_spawn_list_status_and_remove() {
     assert!(!root
         .join("state/agent-command-orchestrator-v1/workspaces/echo")
         .exists());
-    assert!(status.contains(&base.canonicalize().unwrap().display().to_string()));
+    let canonical = base.canonicalize().unwrap().display().to_string();
+    let expected_dir = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    assert!(status.contains(expected_dir), "{status}");
     let diff = run(&["diff", "echo"]);
     assert!(!diff.status.success());
     assert!(String::from_utf8_lossy(&diff.stderr).contains("plain directory"));

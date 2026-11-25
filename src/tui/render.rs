@@ -17,7 +17,7 @@ use crate::{
 };
 
 const RAIL_MIN_WIDTH: u16 = 100;
-const RAIL_WIDTH: u16 = 31;
+const RAIL_WIDTH: u16 = 34;
 const ABANDON_LABEL: &str = " F4 Abandon ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

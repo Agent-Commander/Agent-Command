@@ -140,17 +140,19 @@ impl DiffModal {
             self.modal_area = Rect::default();
             return;
         }
-        let modal_w = area.width.saturating_sub(4).max(16);
-        let modal_h = area.height.saturating_sub(2).max(8);
-        let modal = Rect::new(
-            area.x + (area.width.saturating_sub(modal_w)) / 2,
-            area.y + (area.height.saturating_sub(modal_h)) / 2,
-            modal_w,
-            modal_h,
+        let body_band = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
         );
+        frame.render_widget(Clear, body_band);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme.bg)),
+            body_band,
+        );
+        let modal = body_band;
         self.modal_area = modal;
-
-        frame.render_widget(Clear, modal);
         let title = if self.title.is_empty() {
             " Unified Diff ".to_owned()
         } else {

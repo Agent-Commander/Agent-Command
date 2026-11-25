@@ -1792,18 +1792,29 @@ fn unknown(name: &str) -> io::Error {
     invalid(format!("No specialist named {name}"))
 }
 
+pub(crate) fn display_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        raw
+    }
+}
+
 pub(crate) fn workspace_label(member: &Member) -> String {
     match &member.workspace {
         Some(Workspace {
             path,
             isolation: Isolation::Worktree { .. },
             ..
-        }) => format!("git worktree {}", path.display()),
+        }) => format!("git worktree {}", display_path(path)),
         Some(Workspace {
             path,
             isolation: Isolation::Directory,
             ..
-        }) => format!("directory {}", path.display()),
+        }) => format!("directory {}", display_path(path)),
         None => "preview only".into(),
     }
 }

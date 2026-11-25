@@ -390,7 +390,7 @@ impl ConnectForm {
     fn rows(&self, editing_name: bool, width: usize) -> Vec<Row> {
         let mut rows: Vec<Row> = vec![
             vec![text(
-                "Pick Claude, Codex or both. One provider is enough to continue.",
+                "Pick Claude, Codex, or Gemini. One provider is enough to continue.",
                 Tone::Muted,
             )],
             vec![],
@@ -943,7 +943,7 @@ impl App {
             form.status = if form.missing() {
                 "Rechecked PATH.".into()
             } else {
-                "Rechecked PATH: Claude and Codex found.".into()
+                "Rechecked PATH: Claude, Codex, and Gemini found.".into()
             };
         }
     }
@@ -1596,14 +1596,26 @@ impl App {
         };
         let status_rows = wrapped(&status, inner_width, STATUS_MAX_ROWS);
         let content_rows = rows.len() + status_rows.len() + 2;
-        let height = (content_rows as u16 + 2).min(area.height.saturating_sub(1));
+        let max_modal_h = area.height.saturating_sub(2).max(4);
+        let height = (content_rows as u16 + 2).min(max_modal_h);
         let modal = Rect::new(
             area.x + (area.width - width) / 2,
-            area.y + 1 + (area.height.saturating_sub(1) - height) / 2,
+            area.y + 1 + (max_modal_h.saturating_sub(height)) / 2,
             width,
             height,
         );
         let theme = self.theme.clone();
+        let backdrop = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        );
+        f.render_widget(Clear, backdrop);
+        f.render_widget(
+            Block::default().style(Style::default().bg(color(&theme.background))),
+            backdrop,
+        );
         f.render_widget(Clear, modal);
         f.render_widget(
             Block::bordered()

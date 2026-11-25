@@ -344,6 +344,10 @@ impl Composer {
         self.queued_messages.pop_front()
     }
 
+    pub fn clear_queued(&mut self) {
+        self.queued_messages.clear();
+    }
+
     pub fn recall_last_queued(&mut self) -> Option<String> {
         let recalled = self.queued_messages.pop_back()?;
         self.set_text(recalled.clone());
@@ -768,10 +772,15 @@ impl Composer {
                 EditorAction::Changed
             }
             (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-                if let Some(text) = self.take_submission() {
-                    EditorAction::Submit { text, steer: true }
+                if self.running {
+                    if let Some(text) = self.take_submission() {
+                        EditorAction::Submit { text, steer: true }
+                    } else {
+                        EditorAction::None
+                    }
                 } else {
-                    EditorAction::None
+                    self.insert_newline();
+                    EditorAction::Changed
                 }
             }
             (KeyCode::Enter, _) => {
@@ -1506,6 +1515,7 @@ mod tests {
                 steer: false
             }
         );
+        composer.set_running(true);
         composer.insert_str("second prompt");
         assert_eq!(
             press(&mut composer, KeyCode::Enter, KeyModifiers::CONTROL),
@@ -1514,6 +1524,12 @@ mod tests {
                 steer: true
             }
         );
+        composer.set_running(false);
+        composer.insert_str("a");
+        press(&mut composer, KeyCode::Enter, KeyModifiers::CONTROL);
+        composer.insert_str("b");
+        assert_eq!(composer.text(), "a\nb");
+        composer.clear();
 
         composer.insert_str("unsent draft");
         composer.move_home();

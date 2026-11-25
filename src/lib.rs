@@ -1029,6 +1029,7 @@ impl App {
                 |link| format!("Done · {link}"),
             ),
             Err(error) => {
+                self.mark_provider_stderr_failed(COMMANDER);
                 let msg = format!("{COMMANDER}: {error}");
                 self.transcript
                     .push(markdown::TranscriptEntry::SystemNotice {
@@ -1702,8 +1703,20 @@ impl App {
             specialists::Command::Remove { name } => self.remove(&name),
             specialists::Command::Entry { profile } => self.set_entry(&profile),
             specialists::Command::Diff { name } => {
-                self.show_diff(name.as_deref());
-                self.open_diff_viewer(name.as_deref());
+                if name.is_none() && self.selected == 0 {
+                    self.open_diff_viewer(None);
+                    self.notice = "Opened workspace unified diff.".into();
+                } else {
+                    self.show_diff(name.as_deref());
+                    if self.crew[self.selected].workspace.is_some()
+                        || name
+                            .as_deref()
+                            .and_then(|n| specialists::find(&self.crew, n))
+                            .is_some()
+                    {
+                        self.open_diff_viewer(name.as_deref());
+                    }
+                }
             }
             specialists::Command::Pr { name, commit } => self.open_pr(name.as_deref(), commit),
             specialists::Command::Settle { name, settled } => self.settle(&name, settled),
@@ -2040,6 +2053,7 @@ impl App {
             options,
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
+        self.crew[0].status = Status::Running;
         self.crew[0].mission = display.clone();
         self.composer.set_running(true);
         self.input.clear();
@@ -3340,6 +3354,8 @@ esac
         let mut live = Live::new(std::env::temp_dir(), Vec::new(), None);
         live.runs.push(Run::new(COMMANDER, mission, false));
         let mut app = App::from_live(live);
+        app.crew[0].status = Status::Running;
+        app.composer.set_running(true);
         assert!(app.mission_running());
 
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -3348,8 +3364,88 @@ esac
 
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.esc_armed_active());
+        assert!(!app.mission_running());
+        assert_eq!(app.crew[0].status, Status::Idle);
+        assert!(!app.composer.is_running());
         assert!(
             app.notice.contains("Cancelled active mission"),
+            "{}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn provider_stderr_collapses_when_nonfatal_and_expands_on_error() {
+        let mut app = App::default();
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::StderrLine("WARN config line 1".into()),
+        );
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::StderrLine("WARN config line 2".into()),
+        );
+        let stderr_cards: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    markdown::TranscriptEntry::ToolCallCard { name, .. } if name == "Provider stderr"
+                )
+            })
+            .collect();
+        assert_eq!(stderr_cards.len(), 1);
+        match stderr_cards[0] {
+            markdown::TranscriptEntry::ToolCallCard {
+                collapsed,
+                ok,
+                summary,
+                output,
+                ..
+            } => {
+                assert!(*collapsed);
+                assert_eq!(*ok, Some(true));
+                assert!(summary.contains("2 lines"), "{summary}");
+                assert!(output.contains("WARN config line 2"));
+            }
+            _ => panic!("expected stderr tool card"),
+        }
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: None,
+                final_text: "fatal failure".into(),
+            },
+        );
+        let expanded = app.transcript.entries.iter().find(|e| {
+            matches!(
+                e,
+                markdown::TranscriptEntry::ToolCallCard {
+                    name,
+                    collapsed: false,
+                    ok: Some(false),
+                    ..
+                } if name == "Provider stderr"
+            )
+        });
+        assert!(expanded.is_some());
+    }
+
+    #[test]
+    fn slash_diff_on_commander_opens_modal_without_specialist_error() {
+        let mut app = App {
+            input: "/diff".into(),
+            ..App::default()
+        };
+        app.submit();
+        assert!(app.diff_modal.is_open());
+        assert!(
+            !app.notice.contains("Select a specialist"),
             "{}",
             app.notice
         );

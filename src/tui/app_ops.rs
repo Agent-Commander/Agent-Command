@@ -203,6 +203,18 @@ impl App {
     }
 
     pub fn connection_summary(&self, provider: Provider) -> (bool, String) {
+        let short_method = |raw: &str| -> &'static str {
+            match raw.to_ascii_lowercase().as_str() {
+                "oauth_token" | "claude.ai" => "oauth",
+                "oauth-personal" => "google",
+                "chatgpt" => "chatgpt",
+                "api_key" | "gemini-api-key" => "api",
+                "bedrock" => "bedrock",
+                "vertex" | "vertex-ai" => "vertex",
+                "foundry" => "foundry",
+                _ => "ok",
+            }
+        };
         if let Some(live) = &self.live {
             if let Some((profile, _)) = live
                 .profiles
@@ -216,7 +228,7 @@ impl App {
                     .find(|d| d.provider == provider && d.logged_in);
                 let suffix = det
                     .and_then(|d| d.auth_method.as_deref().or(d.tier.as_deref()))
-                    .map(|m| format!(" ({m})"))
+                    .map(|m| format!(" · {}", short_method(m)))
                     .unwrap_or_default();
                 return (true, format!("{}{suffix}", profile.name()));
             }
@@ -230,8 +242,9 @@ impl App {
                 .auth_method
                 .as_deref()
                 .or(det.tier.as_deref())
-                .unwrap_or("default");
-            return (true, format!("default ({detail})"));
+                .map(short_method)
+                .unwrap_or("ok");
+            return (true, format!("default · {detail}"));
         }
         (false, "not signed in".into())
     }
@@ -618,11 +631,7 @@ impl App {
             }
             NormalizedEvent::UsageDelta { .. } => {}
             NormalizedEvent::StderrLine(line) => {
-                self.transcript_for_mut(name)
-                    .push(TranscriptEntry::SystemNotice {
-                        level: NoticeLevel::Error,
-                        text: format!("stderr: {line}"),
-                    });
+                self.append_provider_stderr(name, &line);
             }
             NormalizedEvent::TurnFinished {
                 interrupted,
@@ -638,6 +647,7 @@ impl App {
                             text: "Turn interrupted.".into(),
                         });
                 } else if is_error {
+                    self.mark_provider_stderr_failed(name);
                     if error_code == Some(HealthCode::AgentAuth) {
                         self.transcript_for_mut(name)
                             .push(TranscriptEntry::InlineConnectCard {
@@ -822,8 +832,11 @@ impl App {
             return;
         };
         match clipboard::copy_text(&text) {
-            Ok(backend) => {
-                self.notice = format!("Copied reply ({backend:?}).");
+            Ok(clipboard::CopyBackend::Osc52Only) => {
+                self.notice = "Copied reply to terminal clipboard (OSC 52).".into();
+            }
+            Ok(_) => {
+                self.notice = "Copied reply to clipboard.".into();
             }
             Err(error) => {
                 self.notice = format!("Clipboard unavailable: {error}");
@@ -904,14 +917,85 @@ impl App {
     }
 
     pub fn interrupt_all_runs(&mut self) {
+        let mut had_runs = false;
         if let Some(live) = &mut self.live {
-            for run in &live.runs {
+            let cancelled = std::mem::take(&mut live.runs);
+            had_runs = !cancelled.is_empty();
+            for run in cancelled {
                 run.mission.interrupt();
+                drop(run);
             }
+            live.running_profile = None;
             live.pending_prod_gates.clear();
             live.queue.clear();
         }
+        self.composer.clear_queued();
         self.composer.set_running(false);
+        for member in &mut self.crew {
+            if member.status == specialists::Status::Running {
+                member.status = specialists::Status::Idle;
+            }
+        }
+        if had_runs {
+            self.transcript.finish_assistant_stream();
+            self.transcript.push(TranscriptEntry::SystemNotice {
+                level: NoticeLevel::Warning,
+                text: "Turn cancelled.".into(),
+            });
+        }
+    }
+
+    pub(crate) fn append_provider_stderr(&mut self, name: &str, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let call_id = format!("stderr-{name}");
+        let transcript = self.transcript_for_mut(name);
+        if let Some(TranscriptEntry::ToolCallCard {
+            summary, output, ..
+        }) = transcript.entries.iter_mut().rev().find(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::ToolCallCard { call_id: id, .. } if id == &call_id
+            )
+        }) {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(trimmed);
+            let count = output.lines().count();
+            let noun = if count == 1 { "line" } else { "lines" };
+            *summary = format!("{count} {noun} · Ctrl+E to expand");
+            return;
+        }
+        transcript.push(TranscriptEntry::ToolCallCard {
+            call_id,
+            kind: ToolKind::Other,
+            name: "Provider stderr".into(),
+            summary: "1 line · Ctrl+E to expand".into(),
+            output: trimmed.to_owned(),
+            ok: Some(true),
+            exit_code: None,
+            duration_ms: None,
+            collapsed: true,
+        });
+    }
+
+    pub(crate) fn mark_provider_stderr_failed(&mut self, name: &str) {
+        let call_id = format!("stderr-{name}");
+        let transcript = self.transcript_for_mut(name);
+        if let Some(TranscriptEntry::ToolCallCard { ok, collapsed, .. }) =
+            transcript.entries.iter_mut().rev().find(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::ToolCallCard { call_id: id, .. } if id == &call_id
+                )
+            })
+        {
+            *ok = Some(false);
+            *collapsed = false;
+        }
     }
 
     pub fn run_shell_command(&mut self, command: String) {
@@ -1047,7 +1131,10 @@ impl App {
                 DiffModalAction::CopyDiff => {
                     let text = self.diff_modal.diff_text().to_owned();
                     match clipboard::copy_text(&text) {
-                        Ok(backend) => self.notice = format!("Copied diff ({backend:?})."),
+                        Ok(clipboard::CopyBackend::Osc52Only) => {
+                            self.notice = "Copied diff to terminal clipboard (OSC 52).".into();
+                        }
+                        Ok(_) => self.notice = "Copied diff to clipboard.".into(),
                         Err(err) => self.notice = format!("Clipboard unavailable: {err}"),
                     }
                 }

@@ -2,7 +2,7 @@ use crate::{editor, App};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -13,6 +13,9 @@ use std::{
     process::Command,
     time::Duration,
 };
+
+const PASTE_COALESCE_POLL: Duration = Duration::from_millis(8);
+const MAX_EVENTS_PER_FRAME: usize = 4096;
 
 fn restore_terminal() {
     let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
@@ -44,6 +47,127 @@ fn run_external_editor(initial: &str) -> io::Result<Option<String>> {
         EnableBracketedPaste
     );
     edited
+}
+
+fn key_as_paste_piece(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(c)
+        }
+        KeyCode::Enter if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            Some('\n')
+        }
+        KeyCode::Tab if key.modifiers.is_empty() => Some('\t'),
+        _ => None,
+    }
+}
+
+fn strip_bracketed_paste_markers(text: &str) -> String {
+    let mut out = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+    if out.starts_with("[200~") && out.ends_with("[201~") {
+        out = out
+            .strip_prefix("[200~")
+            .and_then(|s| s.strip_suffix("[201~"))
+            .unwrap_or(&out)
+            .to_owned();
+    }
+    out
+}
+
+fn is_multiline_paste_burst(events: &[Event]) -> bool {
+    let mut active_keys = Vec::new();
+    for ev in events {
+        if let Event::Key(k) = ev {
+            if k.kind != KeyEventKind::Release {
+                active_keys.push(*k);
+            }
+        } else {
+            return false;
+        }
+    }
+    if active_keys.len() < 2 {
+        return false;
+    }
+    if !active_keys.iter().all(|k| key_as_paste_piece(*k).is_some()) {
+        return false;
+    }
+    let enter_positions: Vec<usize> = active_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, k)| (k.code == KeyCode::Enter).then_some(idx))
+        .collect();
+    if enter_positions.len() >= 2 {
+        return true;
+    }
+    if let Some(&first_enter) = enter_positions.first() {
+        return first_enter + 1 < active_keys.len();
+    }
+    false
+}
+
+fn drain_input_batch() -> io::Result<Vec<Event>> {
+    let mut batch = vec![event::read()?];
+    while batch.len() < MAX_EVENTS_PER_FRAME && event::poll(Duration::ZERO)? {
+        batch.push(event::read()?);
+    }
+    let ends_with_text_or_enter = batch.last().is_some_and(|ev| {
+        matches!(
+            ev,
+            Event::Key(k) if k.kind != KeyEventKind::Release && key_as_paste_piece(*k).is_some()
+        )
+    });
+    if ends_with_text_or_enter && batch.len() >= 2 {
+        while batch.len() < MAX_EVENTS_PER_FRAME && event::poll(PASTE_COALESCE_POLL)? {
+            batch.push(event::read()?);
+            while batch.len() < MAX_EVENTS_PER_FRAME && event::poll(Duration::ZERO)? {
+                batch.push(event::read()?);
+            }
+        }
+    }
+    Ok(batch)
+}
+
+pub(crate) fn dispatch_input_batch(app: &mut App, events: Vec<Event>) {
+    if is_multiline_paste_burst(&events) {
+        let mut combined = String::with_capacity(events.len());
+        for ev in events {
+            if let Event::Key(k) = ev {
+                if k.kind != KeyEventKind::Release {
+                    if let Some(ch) = key_as_paste_piece(k) {
+                        combined.push(ch);
+                    }
+                }
+            }
+        }
+        let cleaned = strip_bracketed_paste_markers(&combined);
+        if !cleaned.is_empty() {
+            app.paste(&cleaned);
+        }
+        return;
+    }
+
+    for ev in events {
+        match ev {
+            Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
+            Event::Paste(text) => app.paste(&strip_bracketed_paste_markers(&text)),
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => app.click(m.column, m.row),
+                MouseEventKind::ScrollUp => app.scroll_mouse(m.column, m.row, -3),
+                MouseEventKind::ScrollDown => app.scroll_mouse(m.column, m.row, 3),
+                _ => {}
+            },
+            Event::Resize(_, _) => {
+                app.full_redraw = false;
+            }
+            _ => {}
+        }
+        if app.quit {
+            break;
+        }
+    }
 }
 
 pub fn run_cli(args: &[String]) -> io::Result<()> {
@@ -153,20 +277,8 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             terminal.draw(|f| app.draw(f))?;
 
             if event::poll(Duration::from_millis(33))? {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
-                    Event::Paste(text) => app.paste(&text),
-                    Event::Mouse(m) => match m.kind {
-                        MouseEventKind::Down(MouseButton::Left) => app.click(m.column, m.row),
-                        MouseEventKind::ScrollUp => app.scroll_mouse(m.column, m.row, -3),
-                        MouseEventKind::ScrollDown => app.scroll_mouse(m.column, m.row, 3),
-                        _ => {}
-                    },
-                    Event::Resize(_, _) => {
-                        app.full_redraw = false;
-                    }
-                    _ => {}
-                }
+                let batch = drain_input_batch()?;
+                dispatch_input_batch(&mut app, batch);
             }
         }
         app.interrupt_all_runs();
@@ -191,4 +303,47 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         std::process::exit(75);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_events_from_str(text: &str) -> Vec<Event> {
+        text.chars()
+            .map(|c| {
+                if c == '\n' {
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multiline_paste_burst_coalesces_without_submitting_and_collapses_large_pastes() {
+        let mut app = App::default();
+        dispatch_input_batch(&mut app, key_events_from_str("line1\nline2"));
+        assert_eq!(app.composer.text(), "line1\nline2");
+        assert_eq!(app.log.len(), 1);
+
+        app.composer.clear();
+        let fifteen = (1..=15)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        dispatch_input_batch(&mut app, key_events_from_str(&format!("{fifteen}\n")));
+        assert!(app.composer.text().contains("[Pasted text #1"));
+        assert_eq!(app.composer.pasted_chunks().len(), 1);
+        assert!(app.composer.queued_messages().is_empty());
+    }
+
+    #[test]
+    fn single_line_command_with_trailing_enter_drains_and_submits_immediately() {
+        let mut app = App::default();
+        dispatch_input_batch(&mut app, key_events_from_str("/help\n"));
+        assert!(app.composer.is_empty());
+        assert!(app.notice.contains("Command reference"));
+    }
 }
