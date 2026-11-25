@@ -323,3 +323,48 @@ fn ctrl_c_and_ctrl_q_never_trap_and_thinking_tool_cards_expand() {
     key(&mut app2, KeyCode::Char('q'), KeyModifiers::CONTROL);
     assert!(app2.quit);
 }
+
+#[test]
+fn top_bar_settings_has_clean_spacing_bottom_padding_and_empty_thinking_expands() {
+    let mut app = App::default();
+    app.transcript.clear();
+    app.transcript.push(TranscriptEntry::ThinkingBlock {
+        text: String::new(),
+        duration_ms: 12_700,
+        collapsed: true,
+    });
+    let buf = render(&mut app, 120, 30);
+    let top = text(&buf, Rect::new(0, 0, 120, 1));
+    assert!(top.contains("⚙  Settings"), "{top}");
+
+    key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    let expanded_buf = render(&mut app, 120, 30);
+    let body = text(&expanded_buf, app.transcript_area);
+    assert!(body.contains("▾ Thought for 12.7s"), "{body}");
+    assert!(
+        body.contains("(No reasoning text streamed by provider)"),
+        "{body}"
+    );
+
+    let mut tall = App::default();
+    tall.transcript.clear();
+    for idx in 0..30 {
+        tall.transcript
+            .push_user(format!("Prompt line {idx}"), None);
+    }
+    let tall_buf = render(&mut tall, 100, 20);
+    let last_transcript_row = tall.transcript_area.bottom() - 1;
+    let bottom_row_text = text(
+        &tall_buf,
+        Rect::new(
+            tall.transcript_area.x,
+            last_transcript_row,
+            tall.transcript_area.width.saturating_sub(1),
+            1,
+        ),
+    );
+    assert!(
+        bottom_row_text.trim().is_empty(),
+        "expected blank bottom padding row, got: {bottom_row_text:?}"
+    );
+}

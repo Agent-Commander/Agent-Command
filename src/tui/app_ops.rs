@@ -12,8 +12,8 @@ use crate::{
     branches, bridge, clipboard,
     editor::{EditorAction, TriggerKind},
     markdown::{
-        DelegationStatus, NoticeLevel, ScrollState, ToolKind, Transcript, TranscriptEntry,
-        TranscriptHitAction,
+        DelegationStatus, LiveActivity, NoticeLevel, ScrollState, ToolKind, Transcript,
+        TranscriptEntry, TranscriptHitAction,
     },
     mission::{HealthCode, NormalizedEvent, PatchKind},
     palette::PaletteAction,
@@ -24,12 +24,62 @@ use crate::{
         render::{FocusBannerHit, RailHit, WelcomeHit},
     },
     update::UpdateState,
-    usage, App,
+    usage, App, RunPhase,
 };
 
 const ARM_WINDOW: Duration = Duration::from_secs(2);
 const MAX_SHELL_CONTEXT_SNIPPETS: usize = 4;
 const MAX_SHELL_SNIPPET_CHARS: usize = 2000;
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub(crate) fn format_routing_notice(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if !(trimmed.starts_with("Override →")
+        || trimmed.starts_with("Auto →")
+        || trimmed.starts_with("Override "))
+    {
+        return trimmed.to_owned();
+    }
+    let unscored = trimmed.contains(" · unscored");
+    let mut parts: Vec<String> = trimmed
+        .split(" · ")
+        .filter(|seg| !matches!(*seg, "unscored" | "speed n/a" | "headroom unknown"))
+        .map(str::to_owned)
+        .collect();
+    if unscored {
+        if let Some(first) = parts.first_mut() {
+            if let Some(stripped) = first.strip_suffix(" provider default") {
+                *first = stripped.to_owned();
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+fn format_elapsed_tenths(elapsed_ms: u64) -> String {
+    format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+}
+
+fn clean_tool_summary(tool_name: &str, summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(tool_name) {
+        return String::new();
+    }
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        if prefix.trim().eq_ignore_ascii_case(tool_name) {
+            return rest.trim().to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn legacy_line_needs_blank_separator(prev_line: &str, next_line: &str) -> bool {
+    let prev_table = prev_line.starts_with('|');
+    let next_table = next_line.starts_with('|');
+    let next_heading = next_line.starts_with('#');
+    let next_fence = next_line.starts_with("```");
+    (prev_table != next_table) || next_heading || next_fence
+}
 
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
     rect.width > 0
@@ -72,6 +122,65 @@ impl App {
     pub fn leader_armed_active(&self) -> bool {
         self.leader_armed_at
             .is_some_and(|at| at.elapsed() <= ARM_WINDOW)
+    }
+
+    pub(crate) fn persist_commander_transcript(&self) {
+        if let Some(live) = &self.live {
+            if let Some(store) = &live.store {
+                let _ =
+                    store.save_transcript_for_workspace(&live.workspace, &self.transcript.entries);
+            }
+        }
+    }
+
+    pub fn active_live_activity(&self, name: &str) -> Option<LiveActivity> {
+        if let Some(live) = &self.live {
+            if let Some(pos) = live.run_position(name) {
+                let run = &live.runs[pos];
+                let elapsed_ms = run.started_at.elapsed().as_millis() as u64;
+                let spinner = SPINNER_FRAMES[((elapsed_ms / 100) % 10) as usize];
+                let dur = format_elapsed_tenths(elapsed_ms);
+                let label = match &run.phase {
+                    RunPhase::Working => format!("Working… {dur}"),
+                    RunPhase::Thinking => format!("Thinking… {dur}"),
+                    RunPhase::Tool {
+                        name: tool_name,
+                        summary,
+                    } => {
+                        if summary.is_empty() {
+                            format!("Working… {dur} · {tool_name}")
+                        } else {
+                            format!("Working… {dur} · {tool_name} {summary}")
+                        }
+                    }
+                    RunPhase::Streaming => format!("Streaming response… {dur}"),
+                };
+                return Some(LiveActivity {
+                    spinner,
+                    label,
+                    elapsed_ms,
+                });
+            }
+        }
+        let member_running = self
+            .crew
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+            .is_some_and(|m| m.status == specialists::Status::Running);
+        if member_running {
+            return Some(LiveActivity {
+                spinner: SPINNER_FRAMES[0],
+                label: "Working… 0.0s".into(),
+                elapsed_ms: 0,
+            });
+        }
+        None
+    }
+
+    pub fn running_elapsed_secs(&self, name: &str) -> Option<u64> {
+        let live = self.live.as_ref()?;
+        let pos = live.run_position(name)?;
+        Some(live.runs[pos].started_at.elapsed().as_secs())
     }
 
     pub fn active_transcript(&self) -> &Transcript {
@@ -430,6 +539,7 @@ impl App {
                 } else {
                     format!("!{command} exited ({:?})", exit_code)
                 };
+                self.persist_commander_transcript();
             }
             AppEvent::WorkerWake(result) => {
                 let status = if result.is_error {
@@ -445,6 +555,7 @@ impl App {
                     status,
                     summary: result.summary.clone(),
                 });
+                self.persist_commander_transcript();
                 self.notice = format!("Worker {} finished ({})", result.worker_id, result.status);
                 if let Some(live) = &self.live {
                     if let Some(store) = &live.store {
@@ -507,6 +618,7 @@ impl App {
                 if let Some(live) = &mut self.live {
                     if let Some(pos) = live.run_position(name) {
                         live.runs[pos].saw_normalized_text = true;
+                        live.runs[pos].phase = RunPhase::Streaming;
                     }
                 }
                 let speaker = self.speaker_label(name);
@@ -520,6 +632,7 @@ impl App {
                     .and_then(|live| {
                         let pos = live.run_position(name)?;
                         let run = &mut live.runs[pos];
+                        run.phase = RunPhase::Thinking;
                         let started = run.thinking_started_at.get_or_insert_with(Instant::now);
                         Some(started.elapsed().as_millis() as u64)
                     })
@@ -534,25 +647,28 @@ impl App {
                 summary,
                 ..
             } => {
+                let cleaned_summary = clean_tool_summary(&tool_name, &summary);
                 if let Some(live) = &mut self.live {
                     if let Some(pos) = live.run_position(name) {
-                        live.runs[pos]
-                            .tool_started_at
-                            .insert(call_id.clone(), Instant::now());
+                        let run = &mut live.runs[pos];
+                        run.phase = RunPhase::Tool {
+                            name: tool_name.clone(),
+                            summary: cleaned_summary.clone(),
+                        };
+                        run.tool_started_at
+                            .entry(call_id.clone())
+                            .or_insert_with(Instant::now);
                     }
                 }
-                self.transcript_for_mut(name)
-                    .push(TranscriptEntry::ToolCallCard {
-                        call_id,
-                        kind: crate::tui::map_tool_kind(kind),
-                        name: tool_name,
-                        summary,
-                        output: String::new(),
-                        ok: None,
-                        exit_code: None,
-                        duration_ms: None,
-                        collapsed: true,
-                    });
+                self.transcript_for_mut(name).upsert_tool_call(
+                    call_id,
+                    crate::tui::map_tool_kind(kind),
+                    tool_name,
+                    cleaned_summary,
+                );
+                if is_commander {
+                    self.persist_commander_transcript();
+                }
             }
             NormalizedEvent::ToolEnd {
                 call_id,
@@ -562,8 +678,9 @@ impl App {
             } => {
                 let duration = self.live.as_mut().and_then(|live| {
                     let pos = live.run_position(name)?;
-                    live.runs[pos]
-                        .tool_started_at
+                    let run = &mut live.runs[pos];
+                    run.phase = RunPhase::Working;
+                    run.tool_started_at
                         .remove(&call_id)
                         .map(|started| started.elapsed().as_millis() as u64)
                 });
@@ -580,6 +697,9 @@ impl App {
                             level: NoticeLevel::Error,
                             text: output_preview,
                         });
+                }
+                if is_commander {
+                    self.persist_commander_transcript();
                 }
             }
             NormalizedEvent::FileChanged { path, kind } => {
@@ -684,6 +804,9 @@ impl App {
                                 text: final_text,
                             });
                     }
+                }
+                if is_commander {
+                    self.persist_commander_transcript();
                 }
                 if let (Some(live), Some(tx)) = (&self.live, &self.bg_tx) {
                     events::spawn_git_refresh(live.workspace.clone(), tx.clone());
@@ -877,6 +1000,7 @@ impl App {
             self.log_times.clear();
             self.transcript.clear();
             self.scroll.jump_to_top();
+            self.persist_commander_transcript();
         } else {
             self.crew[self.selected].history.clear();
             self.transcript_for_mut(&name).clear();
@@ -958,6 +1082,7 @@ impl App {
                 level: NoticeLevel::Warning,
                 text: "Turn cancelled.".into(),
             });
+            self.persist_commander_transcript();
         }
     }
 
@@ -1619,6 +1744,34 @@ impl App {
         }
     }
 
+    pub(crate) fn append_transcript_assistant_chunk(
+        &mut self,
+        thread_name: &str,
+        speaker: &str,
+        chunk: &str,
+    ) {
+        let transcript = self.transcript_for_mut(thread_name);
+        if let Some(TranscriptEntry::AssistantMarkdown {
+            speaker: current_speaker,
+            markdown,
+            ..
+        }) = transcript.entries.last_mut()
+        {
+            if current_speaker == speaker {
+                if !markdown.is_empty() && !markdown.ends_with('\n') {
+                    markdown.push('\n');
+                }
+                markdown.push_str(chunk);
+                return;
+            }
+        }
+        transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: speaker.to_owned(),
+            markdown: chunk.to_owned(),
+            streaming: false,
+        });
+    }
+
     pub(crate) fn push_transcript_log_entry(
         &mut self,
         thread_name: &str,
@@ -1627,30 +1780,54 @@ impl App {
     ) {
         let (source, body) = text.split_once("  ").unwrap_or(("SYSTEM", text));
         let clean = body.trim();
-        let entry = match source {
-            "YOU" => TranscriptEntry::UserMessage {
-                text: clean.to_owned(),
-                timestamp: at,
-            },
-            "TASK" => TranscriptEntry::UserMessage {
-                text: clean.to_owned(),
-                timestamp: at,
-            },
-            "SYSTEM" | "SNOOZED" => TranscriptEntry::SystemNotice {
-                level: if clean.contains("failed") || clean.contains("ERROR") {
-                    NoticeLevel::Error
-                } else {
-                    NoticeLevel::Info
-                },
-                text: clean.to_owned(),
-            },
-            other => TranscriptEntry::AssistantMarkdown {
-                speaker: other.to_owned(),
-                markdown: clean.to_owned(),
-                streaming: false,
-            },
-        };
-        self.transcript_for_mut(thread_name).push(entry);
+        match source {
+            "YOU" | "TASK" => {
+                self.transcript_for_mut(thread_name)
+                    .push(TranscriptEntry::UserMessage {
+                        text: clean.to_owned(),
+                        timestamp: at,
+                    });
+            }
+            "SYSTEM" | "SNOOZED" => {
+                let notice = format_routing_notice(clean);
+                self.transcript_for_mut(thread_name)
+                    .push(TranscriptEntry::SystemNotice {
+                        level: if notice.contains("failed") || notice.contains("ERROR") {
+                            NoticeLevel::Error
+                        } else {
+                            NoticeLevel::Info
+                        },
+                        text: notice,
+                    });
+            }
+            other => {
+                let transcript = self.transcript_for_mut(thread_name);
+                if let Some(TranscriptEntry::AssistantMarkdown {
+                    speaker,
+                    markdown,
+                    streaming: false,
+                }) = transcript.entries.last_mut()
+                {
+                    if speaker == other {
+                        if !markdown.is_empty() {
+                            let prev_line = markdown.lines().last().unwrap_or("");
+                            if legacy_line_needs_blank_separator(prev_line, clean) {
+                                markdown.push_str("\n\n");
+                            } else {
+                                markdown.push('\n');
+                            }
+                        }
+                        markdown.push_str(clean);
+                        return;
+                    }
+                }
+                transcript.push(TranscriptEntry::AssistantMarkdown {
+                    speaker: other.to_owned(),
+                    markdown: clean.to_owned(),
+                    streaming: false,
+                });
+            }
+        }
     }
 
     pub(crate) fn build_commander_prompt_text(&self, unit: &str) -> String {

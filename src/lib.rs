@@ -222,12 +222,26 @@ pub(crate) struct Live {
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
 const EVENTS_PER_POLL: usize = 64;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RunPhase {
+    #[default]
+    Working,
+    Thinking,
+    Tool {
+        name: String,
+        summary: String,
+    },
+    Streaming,
+}
+
 pub(crate) struct Run {
     pub(crate) name: String,
     pub(crate) mission: mission::Mission,
     reply: String,
     continuation: Option<String>,
     reviewing: bool,
+    pub(crate) started_at: Instant,
+    pub(crate) phase: RunPhase,
     pub(crate) thinking_started_at: Option<Instant>,
     pub(crate) tool_started_at: HashMap<String, Instant>,
     pub(crate) saw_normalized_text: bool,
@@ -241,6 +255,8 @@ impl Run {
             reply: String::new(),
             continuation: None,
             reviewing,
+            started_at: Instant::now(),
+            phase: RunPhase::Working,
             thinking_started_at: None,
             tool_started_at: HashMap::new(),
             saw_normalized_text: false,
@@ -785,19 +801,34 @@ impl App {
         app.log_times.clear();
         app.transcript.clear();
         if let Some(store) = &live.store {
-            match store.load_commander_for_workspace(&live.workspace) {
+            let legacy_entries = match store.load_commander_for_workspace(&live.workspace) {
                 Ok(entries) => {
-                    for entry in entries {
-                        app.push_transcript_log_entry(
-                            COMMANDER,
-                            &entry.text,
-                            Some(entry.at.clone()),
-                        );
-                        app.log.push_back(entry.text);
-                        app.log_times.push_back(entry.at);
+                    for entry in &entries {
+                        app.log.push_back(entry.text.clone());
+                        app.log_times.push_back(entry.at.clone());
+                    }
+                    entries
+                }
+                Err(error) => {
+                    app.notice = format!("Cannot read Commander transcript: {error}");
+                    Vec::new()
+                }
+            };
+            match store.load_transcript_for_workspace(&live.workspace) {
+                Ok(Some(structured)) => {
+                    app.transcript.entries = structured;
+                }
+                Ok(None) => {
+                    for entry in legacy_entries {
+                        app.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at));
                     }
                 }
-                Err(error) => app.notice = format!("Cannot read Commander transcript: {error}"),
+                Err(error) => {
+                    app.notice = format!("Cannot read Commander transcript: {error}");
+                    for entry in legacy_entries {
+                        app.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at));
+                    }
+                }
             }
             match store.load_roster() {
                 Ok(members) => {
@@ -920,8 +951,9 @@ impl App {
                 live.refresh_usage();
                 self.touch(index);
                 if let Some(reason) = reason {
-                    self.notice = reason.clone();
-                    self.push_log(format!("SYSTEM  {reason}"));
+                    let concise = tui::app_ops::format_routing_notice(&reason);
+                    self.notice = concise.clone();
+                    self.push_log(format!("SYSTEM  {concise}"));
                 }
             }
             mission::Event::Continuing { from, to } => {
@@ -957,12 +989,14 @@ impl App {
                 } else {
                     name.to_owned()
                 };
-                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    if !saw_norm {
-                        self.record(index, format!("{speaker}  {line}"));
-                    } else {
-                        self.record_log_only(index, format!("{speaker}  {line}"));
+                if !saw_norm {
+                    let clean = text.trim_end_matches('\r');
+                    if !clean.trim().is_empty() {
+                        self.append_transcript_assistant_chunk(name, &speaker, clean);
                     }
+                }
+                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    self.record_log_only(index, format!("{speaker}  {line}"));
                 }
             }
             mission::Event::Finished(result) => {
@@ -1044,6 +1078,7 @@ impl App {
         if result.is_ok() {
             self.apply_directives(&run.reply);
         }
+        self.persist_commander_transcript();
         if let (Some(live), Some(tx)) = (&self.live, &self.bg_tx) {
             tui::events::spawn_git_refresh(live.workspace.clone(), tx.clone());
         }
@@ -1587,6 +1622,7 @@ impl App {
     fn push_log(&mut self, text: String) {
         let entry = Entry::now(text);
         self.push_transcript_log_entry(COMMANDER, &entry.text, Some(entry.at.clone()));
+        self.persist_commander_transcript();
         if let Some(live) = &self.live {
             if let Some(store) = &live.store {
                 if let Err(error) = store.append_commander_for_workspace(&live.workspace, &entry) {
@@ -3394,6 +3430,235 @@ esac
         assert_eq!(a_entries[0].text, "YOU  secret-a");
         assert_eq!(b_entries[0].text, "YOU  secret-b");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn structured_transcript_persists_and_reloads_with_tables_thinking_and_tool_cards() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-structured-tx-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = specialists::Store::new(root.clone());
+        let saved = vec![
+            markdown::TranscriptEntry::UserMessage {
+                text: "Build gridfall.html".into(),
+                timestamp: Some("01:25:00".into()),
+            },
+            markdown::TranscriptEntry::ThinkingBlock {
+                text: "Design canvas loop and controls".into(),
+                duration_ms: 2100,
+                collapsed: true,
+            },
+            markdown::TranscriptEntry::ToolCallCard {
+                call_id: "tool-write-1".into(),
+                kind: markdown::ToolKind::Write,
+                name: "Write".into(),
+                summary: "C:\\Users\\j\\gridfall.html".into(),
+                output: "Wrote 8420 bytes".into(),
+                ok: Some(true),
+                exit_code: Some(0),
+                duration_ms: Some(120),
+                collapsed: true,
+            },
+            markdown::TranscriptEntry::AssistantMarkdown {
+                speaker: COMMANDER.into(),
+                markdown: "I built Gridfall.\n\n| Key | Action |\n| --- | --- |\n| ← → | Move |"
+                    .into(),
+                streaming: true,
+            },
+        ];
+        store
+            .save_transcript_for_workspace(&workspace, &saved)
+            .unwrap();
+
+        let live = Live::new(workspace, Vec::new(), Some(root));
+        let mut app = App::from_live(live);
+        assert_eq!(app.transcript.entries.len(), 4);
+        assert!(matches!(
+            &app.transcript.entries[1],
+            markdown::TranscriptEntry::ThinkingBlock { text, .. } if text.contains("Design canvas")
+        ));
+        assert!(matches!(
+            &app.transcript.entries[2],
+            markdown::TranscriptEntry::ToolCallCard { name, .. } if name == "Write"
+        ));
+        assert!(matches!(
+            &app.transcript.entries[3],
+            markdown::TranscriptEntry::AssistantMarkdown {
+                streaming: false,
+                ..
+            }
+        ));
+
+        let buf = screen(&mut app, 100, 30);
+        let rendered = region(&buf, app.transcript_area);
+        assert!(rendered.contains("Write · C:\\Users\\j\\gridfall.html"));
+        assert!(rendered.contains("─┼─"), "{rendered}");
+        assert!(!rendered.contains("| --- |"), "{rendered}");
+        assert_eq!(rendered.matches("Commander").count(), 1, "{rendered}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_commander_log_coalesces_multiline_reply_and_tables_into_one_block() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-legacy-coalesce-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = specialists::Store::new(root.clone());
+        for line in [
+            "YOU  Build a Tetris clone",
+            "SYSTEM  Override → claude/default provider default · unscored · speed n/a · headroom unknown",
+            "Commander  I built Gridfall.",
+            "Commander  • Pieces: I, O, T, S, Z, J, L",
+            "Commander  | Key | Action |",
+            "Commander  |---|---|",
+            "Commander  | ← → | Move |",
+            "Commander  | Space | Hard drop |",
+        ] {
+            store
+                .append_commander_for_workspace(&workspace, &Entry::now(line.into()))
+                .unwrap();
+        }
+
+        let live = Live::new(workspace, Vec::new(), Some(root));
+        let mut app = App::from_live(live);
+        assert_eq!(app.transcript.entries.len(), 3);
+        assert!(matches!(
+            &app.transcript.entries[1],
+            markdown::TranscriptEntry::SystemNotice { text, .. } if text == "Override → claude/default"
+        ));
+        assert!(matches!(
+            &app.transcript.entries[2],
+            markdown::TranscriptEntry::AssistantMarkdown { speaker, .. } if speaker == COMMANDER
+        ));
+
+        let buf = screen(&mut app, 100, 30);
+        let rendered = region(&buf, app.transcript_area);
+        assert_eq!(rendered.matches("Commander").count(), 1, "{rendered}");
+        assert!(rendered.contains("─┼─"), "{rendered}");
+        assert!(!rendered.contains("|---|"), "{rendered}");
+        assert!(!rendered.contains("unscored"), "{rendered}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn live_normalized_events_update_spinner_phase_upsert_tools_and_expand_thinking() {
+        let (mission, _sender) = mission::Mission::held();
+        let mut live = Live::new(std::env::temp_dir(), Vec::new(), None);
+        live.runs.push(Run::new(COMMANDER, mission, false));
+        let mut app = App::from_live(live);
+        app.crew[0].status = Status::Running;
+
+        let initial = app.active_live_activity(COMMANDER).unwrap();
+        assert!(initial.label.starts_with("Working…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ThinkingDelta("Planning HTML canvas".into()),
+        );
+        let thinking = app.active_live_activity(COMMANDER).unwrap();
+        assert!(thinking.label.starts_with("Thinking…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolStart {
+                call_id: "tool-1".into(),
+                kind: mission::ToolKind::Write,
+                name: "Write".into(),
+                summary: "Write".into(),
+                raw_input: serde_json::json!({}),
+            },
+        );
+        let initial_tool = app.active_live_activity(COMMANDER).unwrap();
+        assert!(initial_tool.label.ends_with(" · Write"));
+        assert!(!initial_tool.label.contains("Write Write"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolStart {
+                call_id: "tool-1".into(),
+                kind: mission::ToolKind::Write,
+                name: "Write".into(),
+                summary: "Write: C:\\Users\\j\\gridfall.html".into(),
+                raw_input: serde_json::json!({"file_path": "C:\\Users\\j\\gridfall.html"}),
+            },
+        );
+        let tool_phase = app.active_live_activity(COMMANDER).unwrap();
+        assert!(tool_phase
+            .label
+            .contains("Write C:\\Users\\j\\gridfall.html"));
+        assert!(!tool_phase.label.contains("Write: "));
+        let tool_cards: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| matches!(e, markdown::TranscriptEntry::ToolCallCard { .. }))
+            .collect();
+        assert_eq!(tool_cards.len(), 1);
+
+        let running_buf = screen(&mut app, 120, 30);
+        let whole_running = region(&running_buf, Rect::new(0, 0, 120, 30));
+        assert!(whole_running.contains("RUNNING 0s") || whole_running.contains("RUNNING "));
+        assert!(whole_running.contains("Write · C:\\Users\\j\\gridfall.html"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::ToolEnd {
+                call_id: "tool-1".into(),
+                ok: true,
+                output_preview: "Wrote gridfall.html".into(),
+                exit_code: Some(0),
+            },
+        );
+        let after_tool = app.active_live_activity(COMMANDER).unwrap();
+        assert!(after_tool.label.starts_with("Working…"));
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TextDelta("Built ".into()),
+        );
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::TextDelta("gridfall.html!".into()),
+        );
+        let streaming = app.active_live_activity(COMMANDER).unwrap();
+        assert!(streaming.label.starts_with("Streaming response…"));
+        let assistant_entries: Vec<_> = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| matches!(e, markdown::TranscriptEntry::AssistantMarkdown { .. }))
+            .collect();
+        assert_eq!(assistant_entries.len(), 1);
+    }
+
+    #[test]
+    fn format_routing_notice_strips_unscored_noise_and_preserves_scored_metrics() {
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Override → claude/work provider default · unscored · speed n/a · headroom unknown"
+            ),
+            "Override → claude/work"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · speed n/a · 100% left"
+            ),
+            "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · 100% left"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
+            ),
+            "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
+        );
     }
 
     #[test]

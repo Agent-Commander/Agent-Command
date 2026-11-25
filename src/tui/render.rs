@@ -191,9 +191,9 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
     frame.render_widget(Block::default().style(Style::default().bg(bg)), bar);
 
     let settings_label = if bar.width >= 96 {
-        " ⚙ Settings "
+        " ⚙  Settings "
     } else {
-        " ⚙ "
+        " ⚙  "
     };
     let palette_label = if bar.width >= 80 { " Ctrl+P " } else { " ^P " };
 
@@ -350,13 +350,15 @@ fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette
     }
 
     let selected_key = app.crew[app.selected].name.clone();
+    let activity = app.active_live_activity(&selected_key);
     if selected_key == specialists::COMMANDER {
-        markdown::render_transcript(
+        markdown::render_transcript_with_activity(
             frame,
             content_area,
             &app.transcript,
             &mut app.scroll,
             palette,
+            activity.as_ref(),
         );
     } else {
         let transcript = app
@@ -364,7 +366,14 @@ fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette
             .entry(selected_key.clone())
             .or_default();
         let scroll = app.specialist_scrolls.entry(selected_key).or_default();
-        markdown::render_transcript(frame, content_area, transcript, scroll, palette);
+        markdown::render_transcript_with_activity(
+            frame,
+            content_area,
+            transcript,
+            scroll,
+            palette,
+            activity.as_ref(),
+        );
     }
 }
 
@@ -646,11 +655,17 @@ fn draw_right_rail(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPal
                     Status::Snoozed => ("◌", palette.muted),
                     Status::Idle => ("○", palette.subtle),
                 };
-                let status_str = if member.paused {
-                    "PAUSED"
+                let status_owned = if member.paused {
+                    "PAUSED".to_owned()
+                } else if member.status == Status::Running {
+                    match app.running_elapsed_secs(&member.name) {
+                        Some(secs) => format!("RUNNING {secs}s"),
+                        None => member.status.label().to_owned(),
+                    }
                 } else {
-                    member.status.label()
+                    member.status.label().to_owned()
                 };
+                let status_str = status_owned.as_str();
                 let status_w = display_width(status_str);
                 let name_budget = w.saturating_sub(status_w + 5).max(4);
                 let name_text = truncate_width(&member.name, name_budget);

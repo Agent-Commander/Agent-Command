@@ -32,6 +32,10 @@ pub(crate) fn workspace_hash(workspace: &Path) -> String {
 fn workspace_commander_file(workspace: &Path) -> String {
     format!("commander-{}.jsonl", workspace_hash(workspace))
 }
+
+fn workspace_transcript_file(workspace: &Path) -> String {
+    format!("transcript-{}.jsonl", workspace_hash(workspace))
+}
 const HISTORY_DIRECTORY: &str = "history";
 const WORKTREE_DIRECTORY: &str = "worktrees";
 const DIRECTORY_FALLBACK: &str = "workspaces";
@@ -353,6 +357,61 @@ impl Store {
             &self.directory()?.join(workspace_commander_file(workspace)),
             entry,
         )
+    }
+
+    pub(crate) fn load_transcript_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> io::Result<Option<Vec<crate::markdown::TranscriptEntry>>> {
+        let Some(directory) = self.existing()? else {
+            return Ok(None);
+        };
+        let path = directory.join(workspace_transcript_file(workspace));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut entries = VecDeque::new();
+        for line in BufReader::new(file).lines() {
+            let text = line?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<crate::markdown::TranscriptEntry>(&text) {
+                entries.push_back(entry);
+                if entries.len() > FEED_LIMIT {
+                    entries.pop_front();
+                }
+            }
+        }
+        Ok(Some(crate::markdown::Transcript::normalize_loaded(
+            entries.into(),
+        )))
+    }
+
+    pub(crate) fn save_transcript_for_workspace(
+        &self,
+        workspace: &Path,
+        entries: &[crate::markdown::TranscriptEntry],
+    ) -> io::Result<()> {
+        let path = self.directory()?.join(workspace_transcript_file(workspace));
+        let start = entries.len().saturating_sub(FEED_LIMIT);
+        let mut buf = Vec::new();
+        for entry in &entries[start..] {
+            serde_json::to_writer(&mut buf, entry)?;
+            buf.push(b'\n');
+        }
+        let temporary = path.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
+        let mut file = fs::File::create_new(&temporary)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        drop(file);
+        if fs::rename(&temporary, &path).is_err() {
+            fs::write(&path, &buf)?;
+            let _ = fs::remove_file(&temporary);
+        }
+        Ok(())
     }
 
     pub(crate) fn append_history(&self, name: &str, entry: &Entry) -> io::Result<()> {

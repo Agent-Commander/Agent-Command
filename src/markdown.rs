@@ -8,6 +8,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{color, Theme};
@@ -89,7 +90,8 @@ impl UiPalette {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     Read,
     Grep,
@@ -124,7 +126,8 @@ impl ToolKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NoticeLevel {
     Info,
     Success,
@@ -132,7 +135,8 @@ pub enum NoticeLevel {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DelegationStatus {
     Queued,
     Running,
@@ -154,6 +158,14 @@ impl DelegationStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveActivity {
+    pub spinner: &'static str,
+    pub label: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranscriptEntry {
     UserMessage {
         text: String,
@@ -318,7 +330,7 @@ impl Transcript {
         }) = self.entries.last_mut()
         {
             text.push_str(delta);
-            *current_ms = duration_ms;
+            *current_ms = (*current_ms).max(duration_ms);
             return;
         }
         self.push(TranscriptEntry::ThinkingBlock {
@@ -326,6 +338,66 @@ impl Transcript {
             duration_ms,
             collapsed: true,
         });
+    }
+
+    pub fn upsert_tool_call(
+        &mut self,
+        call_id: String,
+        kind: ToolKind,
+        name: String,
+        summary: String,
+    ) -> usize {
+        if !call_id.is_empty() {
+            for (idx, entry) in self.entries.iter_mut().enumerate().rev() {
+                if let TranscriptEntry::ToolCallCard {
+                    call_id: existing_id,
+                    kind: existing_kind,
+                    name: existing_name,
+                    summary: existing_summary,
+                    ..
+                } = entry
+                {
+                    if existing_id == &call_id {
+                        if kind != ToolKind::Other {
+                            *existing_kind = kind;
+                        }
+                        if !name.is_empty() {
+                            *existing_name = name;
+                        }
+                        if !summary.is_empty() {
+                            *existing_summary = summary;
+                        }
+                        return idx;
+                    }
+                }
+            }
+        }
+        self.push(TranscriptEntry::ToolCallCard {
+            call_id,
+            kind,
+            name,
+            summary,
+            output: String::new(),
+            ok: None,
+            exit_code: None,
+            duration_ms: None,
+            collapsed: true,
+        })
+    }
+
+    pub fn normalize_loaded(mut entries: Vec<TranscriptEntry>) -> Vec<TranscriptEntry> {
+        for entry in &mut entries {
+            match entry {
+                TranscriptEntry::AssistantMarkdown { streaming, .. } => {
+                    *streaming = false;
+                }
+                TranscriptEntry::ToolCallCard { ok, .. } if ok.is_none() => {
+                    *ok = Some(false);
+                }
+                _ => {}
+            }
+        }
+        entries
     }
 
     pub fn complete_tool_call(
@@ -1516,15 +1588,26 @@ fn looks_like_unified_diff(text: &str) -> bool {
     has_hunk && has_file_hdr
 }
 
+#[cfg(test)]
 fn build_transcript_lines(
     transcript: &Transcript,
     width: usize,
     theme: &UiPalette,
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<LineHitRegion>) {
+    build_transcript_lines_with_activity(transcript, width, theme, None)
+}
+
+fn build_transcript_lines_with_activity(
+    transcript: &Transcript,
+    width: usize,
+    theme: &UiPalette,
+    activity: Option<&LiveActivity>,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<LineHitRegion>) {
     let max_width = width.max(MIN_RENDER_WIDTH);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut message_anchors: Vec<usize> = Vec::new();
     let mut hit_regions: Vec<LineHitRegion> = Vec::new();
+    let active_spinner = activity.map(|act| act.spinner);
 
     let mut idx = 0usize;
     while idx < transcript.entries.len() {
@@ -1568,6 +1651,9 @@ fn build_transcript_lines(
             }
             let count = idx - start;
             let expanded = transcript.expanded_exploration_groups.contains(&start);
+            let any_running = transcript.entries[start..idx]
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::ToolCallCard { ok: None, .. }));
             let targets: Vec<&str> = transcript.entries[start..idx]
                 .iter()
                 .filter_map(|e| match e {
@@ -1579,20 +1665,31 @@ fn build_transcript_lines(
                 .take(4)
                 .collect();
             let noun = if count == 1 { "file" } else { "files" };
-            let glyph = if expanded { "▾" } else { "▸" };
+            let glyph = if any_running {
+                active_spinner.unwrap_or("⠋")
+            } else if expanded {
+                "▾"
+            } else {
+                "▸"
+            };
+            let verb = if any_running { "Exploring" } else { "Explored" };
             let detail = if targets.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", targets.join(", "))
             };
             let header_text = truncate_str(
-                &format!("  {glyph} Explored {count} {noun}{detail}"),
+                &format!("  {glyph} {verb} {count} {noun}{detail}"),
                 max_width,
             );
             let line_index = lines.len();
             lines.push(Line::from(Span::styled(
                 header_text,
-                Style::default().fg(theme.muted),
+                Style::default().fg(if any_running {
+                    theme.warning
+                } else {
+                    theme.muted
+                }),
             )));
             hit_regions.push(LineHitRegion {
                 line_index,
@@ -1607,6 +1704,7 @@ fn build_transcript_lines(
                         &transcript.entries[sub_idx],
                         max_width,
                         theme,
+                        active_spinner,
                         &mut lines,
                         &mut message_anchors,
                         &mut hit_regions,
@@ -1621,6 +1719,7 @@ fn build_transcript_lines(
             &transcript.entries[idx],
             max_width,
             theme,
+            active_spinner,
             &mut lines,
             &mut message_anchors,
             &mut hit_regions,
@@ -1628,14 +1727,32 @@ fn build_transcript_lines(
         idx += 1;
     }
 
+    if let Some(act) = activity {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let label = truncate_str(&act.label, max_width.saturating_sub(4).max(1));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", act.spinner),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label, Style::default().fg(theme.accent_soft)),
+        ]));
+    }
+
     (lines, message_anchors, hit_regions)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_single_entry(
     entry_index: usize,
     entry: &TranscriptEntry,
     max_width: usize,
     theme: &UiPalette,
+    active_spinner: Option<&str>,
     lines: &mut Vec<Line<'static>>,
     message_anchors: &mut Vec<usize>,
     hit_regions: &mut Vec<LineHitRegion>,
@@ -1716,10 +1833,27 @@ fn render_single_entry(
                         .add_modifier(Modifier::ITALIC),
                 )));
                 let body_w = max_width.saturating_sub(4).max(MIN_RENDER_WIDTH);
-                for mut line in render_markdown(text, body_w, theme) {
-                    line.spans
-                        .insert(0, Span::styled("  │ ", Style::default().fg(theme.border)));
-                    lines.push(line);
+                let rendered = if text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    render_markdown(text, body_w, theme)
+                };
+                if rendered.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(theme.border)),
+                        Span::styled(
+                            truncate_str("(No reasoning text streamed by provider)", body_w),
+                            Style::default()
+                                .fg(theme.subtle)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                } else {
+                    for mut line in rendered {
+                        line.spans
+                            .insert(0, Span::styled("  │ ", Style::default().fg(theme.border)));
+                        lines.push(line);
+                    }
                 }
             }
             hit_regions.push(LineHitRegion {
@@ -1752,6 +1886,7 @@ fn render_single_entry(
                 *collapsed,
                 max_width,
                 theme,
+                active_spinner,
                 lines,
                 hit_regions,
             );
@@ -1841,19 +1976,36 @@ fn render_single_entry(
             );
         }
         TranscriptEntry::SystemNotice { level, text } => {
-            let (glyph, color) = match level {
-                NoticeLevel::Info => ("ℹ", theme.info),
-                NoticeLevel::Success => ("✓", theme.success),
-                NoticeLevel::Warning => ("⚠", theme.warning),
-                NoticeLevel::Error => ("✗", theme.danger),
+            let is_routing = *level == NoticeLevel::Info
+                && (text.starts_with("Override →")
+                    || text.starts_with("Auto →")
+                    || text.starts_with("Override "));
+            let (glyph, glyph_color, text_color) = match level {
+                NoticeLevel::Info if is_routing => ("ℹ", theme.subtle, theme.muted),
+                NoticeLevel::Info => ("ℹ", theme.info, theme.info),
+                NoticeLevel::Success => ("✓", theme.success, theme.success),
+                NoticeLevel::Warning => ("⚠", theme.warning, theme.warning),
+                NoticeLevel::Error => ("✗", theme.danger, theme.danger),
+            };
+            let (prefix_str, cont_str) = if glyph == "ℹ" {
+                ("  ℹ  ", "     ")
+            } else {
+                ("", "    ")
+            };
+            let prefix_owned = if prefix_str.is_empty() {
+                format!("  {glyph} ")
+            } else {
+                prefix_str.to_owned()
             };
             let prefix = [Span::styled(
-                format!("  {glyph} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                prefix_owned,
+                Style::default()
+                    .fg(glyph_color)
+                    .add_modifier(Modifier::BOLD),
             )];
-            let cont = [Span::raw("    ")];
+            let cont = [Span::raw(cont_str)];
             lines.extend(wrap_spans_with_prefix(
-                &[Span::styled(text.clone(), Style::default().fg(color))],
+                &[Span::styled(text.clone(), Style::default().fg(text_color))],
                 max_width,
                 &prefix,
                 &cont,
@@ -1875,9 +2027,11 @@ fn render_tool_call_card(
     collapsed: bool,
     max_width: usize,
     theme: &UiPalette,
+    active_spinner: Option<&str>,
     lines: &mut Vec<Line<'static>>,
     hit_regions: &mut Vec<LineHitRegion>,
 ) {
+    let spinner = active_spinner.unwrap_or("⠋");
     let (status_text, status_color) = match ok {
         Some(true) => {
             let code = exit_code.map(|c| format!(" {c}")).unwrap_or_default();
@@ -1893,24 +2047,42 @@ fn render_tool_call_card(
                 .unwrap_or_default();
             (format!("✗{code}{dur}"), theme.danger)
         }
-        None => ("…".to_owned(), theme.warning),
+        None => ("running…".to_owned(), theme.warning),
     };
     let tool_label = if name.is_empty() { kind.label() } else { name };
-    let title = if summary.is_empty() {
+    let clean_summary = summary.trim();
+    let dedup_summary = if clean_summary.eq_ignore_ascii_case(tool_label) {
+        ""
+    } else if let Some((prefix, rest)) = clean_summary.split_once(':') {
+        if prefix.trim().eq_ignore_ascii_case(tool_label) {
+            rest.trim()
+        } else {
+            clean_summary
+        }
+    } else {
+        clean_summary
+    };
+    let title = if dedup_summary.is_empty() {
         tool_label.to_owned()
     } else {
-        format!("{tool_label} · {summary}")
+        format!("{tool_label} · {dedup_summary}")
     };
 
     if collapsed {
         let line_index = lines.len();
+        let lead = if ok.is_none() { spinner } else { "▸" };
+        let left_fg = if ok.is_none() {
+            theme.accent_soft
+        } else {
+            theme.muted
+        };
         let left_budget = max_width.saturating_sub(display_width(&status_text) + 5);
-        let left = truncate_str(&format!("  ▸ {title}"), left_budget.max(4));
+        let left = truncate_str(&format!("  {lead} {title}"), left_budget.max(4));
         let gap = max_width
             .saturating_sub(display_width(&left) + display_width(&status_text) + 1)
             .max(1);
         lines.push(Line::from(vec![
-            Span::styled(left, Style::default().fg(theme.muted)),
+            Span::styled(left, Style::default().fg(left_fg)),
             Span::raw(" ".repeat(gap)),
             Span::styled(status_text, Style::default().fg(status_color)),
         ]));
@@ -2260,6 +2432,17 @@ pub fn render_transcript(
     scroll: &mut ScrollState,
     theme: &UiPalette,
 ) {
+    render_transcript_with_activity(frame, area, transcript, scroll, theme, None);
+}
+
+pub fn render_transcript_with_activity(
+    frame: &mut Frame,
+    area: Rect,
+    transcript: &Transcript,
+    scroll: &mut ScrollState,
+    theme: &UiPalette,
+    activity: Option<&LiveActivity>,
+) {
     scroll.hit_rects.clear();
     if area.width == 0 || area.height == 0 {
         scroll.sync_metrics(0, 0, Vec::new());
@@ -2267,7 +2450,11 @@ pub fn render_transcript(
     }
 
     let content_width = area.width.saturating_sub(1).max(1) as usize;
-    let (all_lines, anchors, regions) = build_transcript_lines(transcript, content_width, theme);
+    let (mut all_lines, anchors, regions) =
+        build_transcript_lines_with_activity(transcript, content_width, theme, activity);
+    if !all_lines.is_empty() {
+        all_lines.push(Line::default());
+    }
     let viewport_h = area.height as usize;
     scroll.sync_metrics(all_lines.len(), viewport_h, anchors);
 
@@ -2633,5 +2820,122 @@ diff --git a/src/lib.rs b/src/lib.rs
                 .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn empty_thinking_block_expands_with_fallback_and_tool_upsert_updates_in_place() {
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.append_thinking_delta("", 4200);
+        assert!(transcript.toggle_expand_at_or_latest(None));
+        let (lines, _, _) = build_transcript_lines(&transcript, 80, &theme);
+        let rendered = lines_to_string(&lines);
+        assert!(rendered.contains("▾ Thought for 4.2s"), "{rendered}");
+        assert!(
+            rendered.contains("(No reasoning text streamed by provider)"),
+            "{rendered}"
+        );
+
+        let idx1 = transcript.upsert_tool_call(
+            "call-1".into(),
+            ToolKind::Write,
+            "Write".into(),
+            String::new(),
+        );
+        let idx2 = transcript.upsert_tool_call(
+            "call-1".into(),
+            ToolKind::Write,
+            "Write".into(),
+            "C:\\Users\\j\\gridfall.html".into(),
+        );
+        assert_eq!(idx1, idx2);
+        assert_eq!(transcript.entries.len(), 2);
+
+        let activity = LiveActivity {
+            spinner: "⠙",
+            label: "Working… 4.2s · Write C:\\Users\\j\\gridfall.html".into(),
+            elapsed_ms: 4200,
+        };
+        let (live_lines, _, _) =
+            build_transcript_lines_with_activity(&transcript, 80, &theme, Some(&activity));
+        let live_text = lines_to_string(&live_lines);
+        assert!(live_text.contains("⠙ Write · C:\\Users\\j\\gridfall.html"));
+        assert!(live_text.contains("running…"));
+        assert!(live_text.contains("⠙ Working… 4.2s · Write C:\\Users\\j\\gridfall.html"));
+
+        assert!(transcript.complete_tool_call("call-1", "Wrote 12 KB", true, Some(0), Some(180)));
+        let (done_lines, _, _) = build_transcript_lines(&transcript, 80, &theme);
+        assert!(lines_to_string(&done_lines).contains("✓ 0 (180ms)"));
+    }
+
+    #[test]
+    fn structured_transcript_entries_serialize_and_normalize_cleanly() {
+        let entries = [
+            TranscriptEntry::UserMessage {
+                text: "Build gridfall".into(),
+                timestamp: Some("01:20:00".into()),
+            },
+            TranscriptEntry::ThinkingBlock {
+                text: "Plan HTML5 canvas layout".into(),
+                duration_ms: 1400,
+                collapsed: true,
+            },
+            TranscriptEntry::ToolCallCard {
+                call_id: "t1".into(),
+                kind: ToolKind::Write,
+                name: "Write".into(),
+                summary: "gridfall.html".into(),
+                output: "ok".into(),
+                ok: None,
+                exit_code: None,
+                duration_ms: None,
+                collapsed: true,
+            },
+            TranscriptEntry::AssistantMarkdown {
+                speaker: "Commander".into(),
+                markdown: "| Key | Action |\n|---|---|\n| ← → | Move |".into(),
+                streaming: true,
+            },
+            TranscriptEntry::SystemNotice {
+                level: NoticeLevel::Info,
+                text: "Override → claude/default".into(),
+            },
+        ];
+        let jsonl: String = entries
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Vec<TranscriptEntry> = jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let normalized = Transcript::normalize_loaded(parsed);
+        assert!(matches!(
+            &normalized[2],
+            TranscriptEntry::ToolCallCard {
+                ok: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &normalized[3],
+            TranscriptEntry::AssistantMarkdown {
+                streaming: false,
+                ..
+            }
+        ));
+
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.entries = normalized;
+        let (lines, _, _) = build_transcript_lines(&transcript, 80, &theme);
+        let rendered = lines_to_string(&lines);
+        assert!(rendered.contains("─┼─"), "{rendered}");
+        assert!(!rendered.contains("|---|"), "{rendered}");
+        assert!(
+            rendered.contains("ℹ  Override → claude/default"),
+            "{rendered}"
+        );
     }
 }
