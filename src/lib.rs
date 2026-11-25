@@ -1,5 +1,6 @@
 pub mod auth;
 mod branches;
+pub mod bridge;
 mod catalog;
 mod checkpoint;
 mod cli;
@@ -25,6 +26,7 @@ mod review;
 pub mod routing;
 pub mod settings;
 mod side;
+pub mod soul;
 mod specialists;
 mod targeting;
 pub mod token_burn;
@@ -32,7 +34,11 @@ mod triage;
 pub mod update;
 pub mod usage;
 pub use cli::run_cli;
-pub use specialists::{Entry, Member, Status, COMMANDER};
+pub use specialists::{
+    format_goal_turn, format_help, help_entries, resolve_member_target, resolve_target,
+    split_goal_prompt, CommandHelp, Entry, GoalTurn, Member, Status, TargetCandidate, TargetMatch,
+    COMMANDER,
+};
 
 use std::{
     collections::VecDeque,
@@ -962,14 +968,16 @@ impl App {
             return;
         }
         let mut goal = goal::Goal::new(&member, criteria, self.settings.goal_cap());
-        let prompt = goal.begin();
+        let _ = goal.begin();
+        let turn =
+            specialists::format_goal_turn(&goal.criteria, goal.turns, goal.cap, goal::GOAL_MET);
         self.notice = format!("Goal pinned on {member}: {}", goal.status());
         self.push_log(format!(
             "SYSTEM  Goal pinned on {member}: {}",
             goal.status()
         ));
         self.goal = Some(goal);
-        self.send_goal_turn(&member, prompt);
+        self.send_goal_turn(&member, turn);
     }
 
     fn cancel_goal(&mut self) {
@@ -991,10 +999,16 @@ impl App {
             return;
         };
         let message = match goal.after_turn(outcome) {
-            goal::Step::Continue(prompt) => {
+            goal::Step::Continue(_) => {
                 let status = goal.status();
+                let turn = specialists::format_goal_turn(
+                    &goal.criteria,
+                    goal.turns,
+                    goal.cap,
+                    goal::GOAL_MET,
+                );
                 self.push_log(format!("SYSTEM  Goal continues: {status}"));
-                self.send_goal_turn(member, prompt);
+                self.send_goal_turn(member, turn);
                 return;
             }
             goal::Step::Met => format!("Goal met on {member}: {}", goal.status()),
@@ -1009,11 +1023,16 @@ impl App {
         self.push_log(format!("SYSTEM  {message}"));
     }
 
-    fn send_goal_turn(&mut self, member: &str, prompt: String) {
+    fn send_goal_turn(&mut self, member: &str, turn: specialists::GoalTurn) {
         let typed = std::mem::take(&mut self.input);
         match specialists::find(&self.crew, member) {
-            Some(0) => self.message_commander(prompt),
-            Some(index) => self.delegate(index, prompt),
+            Some(0) => self.message_commander_with_display(turn.model_prompt, turn.display_label),
+            Some(index) => {
+                self.delegate(index, turn.model_prompt);
+                if let Some(slot) = self.crew.get_mut(index) {
+                    slot.mission = turn.display_label;
+                }
+            }
             None => {}
         }
         self.input = typed;
@@ -1121,7 +1140,7 @@ impl App {
         let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) else {
             return;
         };
-        if let Err(error) = store.save_roster(&self.crew) {
+        if let Err(error) = store.save_roster_merging(&self.crew, &[]) {
             self.notice = format!("Roster not saved: {error}");
         }
     }
@@ -1479,6 +1498,16 @@ impl App {
             specialists::Command::Goal { criteria } => self.start_goal(&criteria),
             specialists::Command::GoalCancel => self.cancel_goal(),
             specialists::Command::Mode { mode } => self.set_commander_mode(mode),
+            specialists::Command::Help => {
+                self.push_log(format!("SYSTEM  {}", specialists::format_help()));
+                self.notice = "Slash commands listed in the feed.".into();
+            }
+            specialists::Command::Unknown {
+                command,
+                suggestion,
+            } => {
+                self.notice = specialists::unknown_command_message(&command, suggestion.as_deref());
+            }
             specialists::Command::Message(text) => self.message_commander(text),
         }
     }
@@ -1517,7 +1546,11 @@ impl App {
         };
         let note = specialists::removal_note(&member.name, retained.as_deref());
         self.push_log(format!("SYSTEM  {note}"));
-        self.save_roster();
+        if let Some(store) = self.live.as_ref().and_then(|live| live.store.as_ref()) {
+            if let Err(error) = store.save_roster_merging(&self.crew, &[&member.name]) {
+                self.notice = format!("Roster not saved: {error}");
+            }
+        }
     }
 
     fn target(&self, name: Option<&str>, usage: &str) -> Result<usize, String> {
@@ -1671,11 +1704,15 @@ impl App {
     }
 
     fn message_commander(&mut self, command: String) {
+        self.message_commander_with_display(command.clone(), command);
+    }
+
+    fn message_commander_with_display(&mut self, command: String, display: String) {
         let limits = self.limit_policy();
         let commander_mode = self.settings.commander_permission;
         let Some(live) = &mut self.live else {
-            self.crew[0].mission = command.clone();
-            self.push_log(format!("YOU  {command}"));
+            self.crew[0].mission = display.clone();
+            self.push_log(format!("YOU  {display}"));
             self.input.clear();
             self.notice = PREVIEW_NOTICE.into();
             return;
@@ -1697,11 +1734,11 @@ impl App {
                 live.profiles.clone(),
                 index,
                 live.workspace.clone(),
-                command.clone(),
+                command,
                 claim,
             );
             live.runs.push(Run::new(COMMANDER, mission, false));
-            self.crew[0].mission = command;
+            self.crew[0].mission = display;
             self.input.clear();
             return;
         }
@@ -1736,9 +1773,9 @@ impl App {
             live.workspace.clone(),
         );
         live.runs.push(Run::new(COMMANDER, mission, false));
-        self.crew[0].mission = command.clone();
+        self.crew[0].mission = display.clone();
         self.input.clear();
-        self.push_log(format!("YOU  {command}"));
+        self.push_log(format!("YOU  {display}"));
     }
 
     fn abandon_continuation(&mut self) {
