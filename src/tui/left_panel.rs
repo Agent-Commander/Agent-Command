@@ -98,6 +98,19 @@ pub fn draw_tab_pills(app: &mut App, frame: &mut Frame, area: Rect, palette: &Ui
     x.saturating_sub(area.x)
 }
 
+pub fn draw_tab_strip(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette) {
+    let bg = palette.surface;
+    frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+    let pills = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1);
+    let used = draw_tab_pills(app, frame, pills, palette);
+    let hint = " Alt+1/2/3 · F8 panel ";
+    let hint_w = text_u16(hint);
+    if used + hint_w + 2 <= area.width {
+        let rect = Rect::new(area.right() - hint_w, area.y, hint_w, 1);
+        put_line(frame, rect, vec![styled(hint, palette.subtle, bg)], bg);
+    }
+}
+
 pub fn draw_left_panel(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette) {
     let border = if app.left_focused {
         palette.accent

@@ -871,6 +871,16 @@ mod tests {
         })
     }
 
+    fn find_left_of(buffer: &Buffer, needle: &str, max_x: u16) -> Option<(u16, u16)> {
+        let width = needle.chars().count() as u16;
+        (0..buffer.area.height).find_map(|y| {
+            (0..max_x.saturating_sub(width)).find_map(|x| {
+                let run: String = (x..x + width).map(|cx| buffer[(cx, y)].symbol()).collect();
+                (run == needle).then_some((x, y))
+            })
+        })
+    }
+
     fn live_app(root: &std::path::Path) -> App {
         let profiles = vec![
             auth::Profile::system_default(root.join("state"), auth::Provider::Claude),
@@ -938,16 +948,14 @@ mod tests {
         let deck = app.deck_palette;
         let (x, y) = find(&buffer, "64% left").unwrap();
         assert_eq!(buffer[(x, y)].fg, deck.healthy);
-        let (x, y) = find(&buffer, "7d 12%").unwrap();
+        let (x, y) = find_left_of(&buffer, "7d 12%", 30).unwrap();
         assert_eq!(buffer[(x, y)].fg, deck.depleted);
         let (x, y) = find(&buffer, "-- left").unwrap();
         assert_eq!(buffer[(x, y)].fg, deck.unknown);
         let (x, y) = find(&buffer, "↻ 2h 26m").unwrap();
         assert_eq!(buffer[(x, y)].fg, deck.reset_six_hours);
         let codex_row = find(&buffer, "Codex · backup").unwrap().1;
-        assert!(text(&buffer, Rect::new(0, codex_row + 1, 10, 1)).contains("--"));
-        let top = text(&buffer, Rect::new(0, 0, 140, 1));
-        assert!(!top.contains("◕"), "{top}");
+        assert!(text(&buffer, Rect::new(0, codex_row + 2, 10, 1)).contains("--"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1100,8 +1108,10 @@ mod tests {
 
     #[test]
     fn goals_are_tracked_and_closed_in_the_ledger() {
-        let mut app = App::default();
-        app.input = "/goal ship the release".into();
+        let mut app = App {
+            input: "/goal ship the release".into(),
+            ..App::default()
+        };
         app.submit();
         let goal = app
             .ledger

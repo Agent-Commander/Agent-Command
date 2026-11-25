@@ -871,8 +871,8 @@ fn update_button_runs_the_host_updater_and_stays_for_a_retry_after_failure() {
             let host = fake([true, true], &["claude/main"]);
             let mut app = launched(&sandbox, &host);
             let text = last_row(&render(&mut app, width, height));
-            assert!(text.contains("Update"), "{text}");
-            assert!(app.update_area.width > 0);
+            assert!(!text.contains("Update"), "{text}");
+            assert_eq!(app.update_area, ratatui::layout::Rect::default());
             send(&mut app, "/update");
             assert_eq!(app.update_state, update::UpdateState::Checking);
             assert!(app.notice.contains("Checking"), "{}", app.notice);
@@ -954,9 +954,8 @@ fn update_button_sits_bottom_right_and_left_of_abandon_at_both_sizes() {
     for (width, height) in SIZES {
         let mut app = App::from_live(crate::Live::new(std::env::temp_dir(), Vec::new(), None));
         let text = last_row(&render(&mut app, width, height));
-        assert!(text.contains(update::CURRENT), "{text}");
-        assert_eq!(app.update_area.y, height - 1);
-        assert_eq!(app.update_area.right(), width);
+        assert!(!text.contains("Update"), "{text}");
+        assert_eq!(app.update_area, ratatui::layout::Rect::default());
 
         let _sender = detected(&mut app, "9.9.9");
         let buffer = render(&mut app, width, height);

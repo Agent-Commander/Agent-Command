@@ -96,7 +96,7 @@ fn wide_layout_shows_left_panel_canvas_and_rail_while_narrow_collapses_to_tab_pi
         assert!(screen.contains(section), "{section} missing:\n{screen}");
     }
     assert!(app.left_panel_visible());
-    let top = text(&wide, Rect::new(0, 0, 140, 1));
+    let top = text(&wide, Rect::new(0, 1, 140, 1));
     assert!(!top.contains(" Inbox "), "{top}");
     assert!(app.transcript_area.x >= 30 && app.transcript_area.right() <= 106);
 
@@ -104,7 +104,7 @@ fn wide_layout_shows_left_panel_canvas_and_rail_while_narrow_collapses_to_tab_pi
     assert!(!app.left_panel_visible());
     let screen = whole(&narrow);
     assert!(!screen.contains("VIEWS"), "{screen}");
-    let top = text(&narrow, Rect::new(0, 0, 80, 1));
+    let top = text(&narrow, Rect::new(0, 1, 80, 1));
     for pill in [" Chat ", " Inbox ", " Ledger "] {
         assert!(top.contains(pill), "{pill} missing: {top}");
     }
@@ -122,7 +122,7 @@ fn left_panel_toggles_by_key_palette_and_button() {
     press(&mut app, KeyCode::F(8), KeyModifiers::NONE);
     let hidden = render(&mut app, 140, 40);
     assert!(!app.left_panel_visible());
-    assert!(text(&hidden, Rect::new(0, 0, 140, 1)).contains(" Inbox "));
+    assert!(text(&hidden, Rect::new(0, 1, 140, 1)).contains(" Inbox "));
     press(&mut app, KeyCode::Char('\\'), KeyModifiers::CONTROL);
     let _ = render(&mut app, 140, 40);
     assert!(app.left_panel_visible());
@@ -175,7 +175,7 @@ fn tabs_switch_by_alt_digits_focus_cycling_and_mouse_at_every_width() {
 
     let narrow = render(&mut app, 80, 24);
     let (x, y) = find(&narrow, " Chat ").expect("chat pill");
-    assert_eq!(y, 0);
+    assert_eq!(y, 1);
     app.click(x + 2, y);
     assert_eq!(app.view_tab, ViewTab::Chat);
     let narrow = render(&mut app, 80, 24);
@@ -211,7 +211,7 @@ fn inbox_orders_action_needed_first_and_supports_open_read_and_badges() {
     assert!(whole(&buffer).contains("Inbox"), "badge row");
     assert!(find(&buffer, " 4 ").is_some(), "{}", whole(&buffer));
     let narrow = render(&mut app, 80, 24);
-    assert!(text(&narrow, Rect::new(0, 0, 80, 1)).contains("Inbox (4)"));
+    assert!(text(&narrow, Rect::new(0, 1, 80, 1)).contains("Inbox (4)"));
 
     app.set_view_tab(ViewTab::Inbox);
     let view = render(&mut app, 140, 40);

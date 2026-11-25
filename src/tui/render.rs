@@ -145,6 +145,19 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
         left_panel::draw_left_panel(app, frame, left_area, &palette);
     }
 
+    let canvas_area = if widths.left == 0 && canvas_area.height > 4 {
+        let strip = Rect::new(canvas_area.x, canvas_area.y, canvas_area.width, 1);
+        left_panel::draw_tab_strip(app, frame, strip, &palette);
+        Rect::new(
+            canvas_area.x,
+            canvas_area.y + 1,
+            canvas_area.width,
+            canvas_area.height - 1,
+        )
+    } else {
+        canvas_area
+    };
+
     match app.view_tab {
         ViewTab::Chat => draw_canvas(app, frame, canvas_area, &palette),
         ViewTab::Inbox => {
@@ -270,15 +283,6 @@ fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette
         Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
         Rect::new(bar.x, bar.y, used as u16, 1),
     );
-    if !app.left_panel_visible() && left_budget > used + 12 {
-        let pills_area = Rect::new(
-            bar.x + used as u16 + 1,
-            bar.y,
-            (left_budget - used - 1) as u16,
-            1,
-        );
-        used += 1 + usize::from(left_panel::draw_tab_pills(app, frame, pills_area, palette));
-    }
     draw_top_bar_details(app, frame, bar, used.min(left_budget), left_budget, palette);
 }
 

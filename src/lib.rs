@@ -3218,7 +3218,7 @@ esac
             assert!(feed.contains("README looks good"), "{feed}");
             let banner = words(&region(&buffer, Rect::new(0, 0, width, height)));
             assert!(
-                banner.contains("Focused: nova (reviewer") && banner.contains("✓ nova DONE"),
+                banner.contains("Focused: nova (review") && banner.contains("✓ nova DONE"),
                 "{banner}"
             );
             if keyboard {
@@ -4029,7 +4029,7 @@ esac
 
         let top = row(&screen(&mut app, 120, 40), 0);
         assert!(
-            top.contains("Commander [Claude · known] · 5h 64% 7d 12%"),
+            top.contains("Commander [Claude · known] · ◕ 5h 64% 7d 12%"),
             "{top}"
         );
     }
@@ -4081,7 +4081,7 @@ esac
         assert_eq!(app.crew.len(), 2, "{}", app.notice);
         send(&mut app, "/roster");
         app.selected = 1;
-        let deck = "Commander [Claude · alpha] · 5h 50% 7d 75%";
+        let deck = "Commander [Claude · alpha] · ◑ 5h 50% 7d 75%";
         let rail = |app: &mut App, code: KeyCode| {
             app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             app.key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -4245,7 +4245,8 @@ esac
         app.selected = specialists::find(&app.crew, "nova").unwrap();
         for (width, height) in RAIL_SIZES {
             let buffer = screen(&mut app, width, height);
-            let banner = row(&buffer, 1);
+            let banner_row = if app.left_panel_visible() { 1 } else { 2 };
+            let banner = row(&buffer, banner_row);
             assert!(
                 banner.contains("Focused: nova (builder") && banner.contains("[d: Diff]"),
                 "{width}x{height}\n{banner}"

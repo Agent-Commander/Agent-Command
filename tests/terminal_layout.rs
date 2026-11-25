@@ -144,13 +144,13 @@ fn slash_help_and_unknown_typo_guard_never_dispatch_to_llm() {
     key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     let buffer = render(&mut app, 120, 40);
     let body = text(&buffer, app.transcript_area);
-    assert!(
-        body.contains("/spawn") && body.contains("Shortcuts"),
-        "{body}"
-    );
+    assert!(body.contains("Shortcuts"), "{body}");
     key(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
     let top_body = text(&render(&mut app, 120, 40), app.transcript_area);
-    assert!(top_body.contains("Slash Commands"), "{top_body}");
+    assert!(
+        top_body.contains("Slash Commands") && top_body.contains("/spawn"),
+        "{top_body}"
+    );
 
     let before_log = app.log.len();
     for ch in "/spwn".chars() {
