@@ -171,7 +171,7 @@ pub(crate) enum Action {
 }
 
 #[derive(Debug, Default)]
-struct Clis([Option<Found>; 2]);
+struct Clis([Option<Found>; 3]);
 
 impl Clis {
     fn located(host: Option<&dyn Host>) -> Self {
@@ -215,8 +215,8 @@ pub(crate) struct ConnectForm {
     pub(crate) origin: Origin,
     clis: Clis,
     installing: Option<Provider>,
-    chosen: [bool; 2],
-    signed_in: [bool; 2],
+    chosen: [bool; 3],
+    signed_in: [bool; 3],
     pub(crate) name: String,
     focus: usize,
     pub(crate) status: String,
@@ -236,17 +236,11 @@ pub(crate) enum Panel {
 }
 
 fn provider_slot(provider: Provider) -> usize {
-    match provider {
-        Provider::Claude => 0,
-        Provider::Codex => 1,
-    }
+    provider.slot()
 }
 
 fn provider_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "Claude Code",
-        Provider::Codex => "Codex CLI",
-    }
+    provider.title()
 }
 
 fn truncated(text: &str, width: usize) -> String {
@@ -314,12 +308,12 @@ fn button(label: impl AsRef<str>, action: Action) -> Segment {
 type Row = Vec<Segment>;
 
 impl ConnectForm {
-    fn new(origin: Origin, host: Option<&dyn Host>, signed_in: [bool; 2]) -> Self {
+    fn new(origin: Origin, host: Option<&dyn Host>, signed_in: [bool; 3]) -> Self {
         let mut form = Self {
             origin,
             clis: Clis::default(),
             installing: None,
-            chosen: [false; 2],
+            chosen: [false; 3],
             signed_in,
             name: String::new(),
             focus: 0,
@@ -511,7 +505,7 @@ impl App {
         self.panel = Some(Panel::Connect(form));
     }
 
-    fn signed_in_providers(&self) -> [bool; 2] {
+    fn signed_in_providers(&self) -> [bool; 3] {
         Provider::ALL.map(|provider| {
             self.live.as_ref().is_some_and(|live| {
                 live.profiles
@@ -1255,7 +1249,7 @@ impl App {
     fn open_connect_for(&mut self, provider: Provider) {
         self.open_connect(Origin::Direct);
         if let Some(Panel::Connect(form)) = &mut self.panel {
-            form.chosen = [false; 2];
+            form.chosen = [false; 3];
         }
         self.toggle_provider(provider);
     }

@@ -570,7 +570,7 @@ struct Harness {
     agent: &'static str,
 }
 
-const HARNESSES: [Harness; 2] = [
+const HARNESSES: [Harness; 3] = [
     Harness {
         provider: Provider::Codex,
         creator: "OpenAI",
@@ -580,6 +580,11 @@ const HARNESSES: [Harness; 2] = [
         provider: Provider::Claude,
         creator: "Anthropic",
         agent: "Claude Code",
+    },
+    Harness {
+        provider: Provider::Gemini,
+        creator: "Google",
+        agent: "Gemini CLI",
     },
 ];
 

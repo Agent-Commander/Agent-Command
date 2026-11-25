@@ -15,15 +15,18 @@ use std::{
 const SECOND: u64 = 1_000_000_000;
 const POLL_SECONDS: u64 = 300;
 const STALE_SECONDS: u64 = 900;
+pub const SHORT_WINDOW_BUFFER_PCT: f64 = 15.0;
+pub const WEEKLY_WINDOW_BUFFER_PCT: f64 = 5.0;
+pub const RESET_TIE_HYSTERESIS_SECS: i64 = 600;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Tick {
+pub struct Tick {
     pub(crate) wall: i64,
     pub(crate) elapsed: u64,
     epoch: uuid::Uuid,
 }
 
-pub(crate) fn now() -> Tick {
+pub fn now() -> Tick {
     static CLOCK: OnceLock<(Instant, uuid::Uuid)> = OnceLock::new();
     let (start, epoch) = CLOCK.get_or_init(|| (Instant::now(), uuid::Uuid::new_v4()));
     Tick {
@@ -80,7 +83,7 @@ pub(crate) struct Allowance {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct Usage {
+pub struct Usage {
     five: Option<Window>,
     week: Option<Window>,
     latch: Option<i64>,
@@ -363,6 +366,135 @@ pub(crate) fn cross_provider_fallback(
         profile.to_string() == configured
             && profile.provider != profiles[interrupted].provider
             && Usage::read(profile).is_ok_and(|usage| usage.eligible_alternate(now))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolSelection {
+    pub index: usize,
+    pub inside_buffer: bool,
+    pub reason: String,
+}
+
+impl Usage {
+    pub(crate) fn within_safety_buffer(self, now: Tick) -> bool {
+        let short_ok = self
+            .five
+            .filter(|w| w.reset > now.wall)
+            .is_none_or(|w| (100.0 - w.used).clamp(0.0, 100.0) >= SHORT_WINDOW_BUFFER_PCT);
+        let week_ok = self
+            .week
+            .filter(|w| w.reset > now.wall)
+            .is_none_or(|w| (100.0 - w.used).clamp(0.0, 100.0) >= WEEKLY_WINDOW_BUFFER_PCT);
+        short_ok && week_ok
+    }
+
+    pub(crate) fn longest_active_reset(self, now: Tick) -> Option<i64> {
+        self.week
+            .filter(|w| w.reset > now.wall)
+            .or_else(|| self.five.filter(|w| w.reset > now.wall))
+            .map(|w| w.reset)
+    }
+}
+
+pub fn select_pool_account(
+    profiles: &[Profile],
+    provider: Provider,
+    sticky_current: Option<usize>,
+    now: Tick,
+) -> Option<PoolSelection> {
+    let entries: Vec<(usize, Usage)> = profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, profile)| profile.provider == provider)
+        .filter_map(|(index, profile)| Usage::read(profile).ok().map(|usage| (index, usage)))
+        .collect();
+    select_pool_account_from_usages(&entries, sticky_current, now)
+}
+
+pub fn select_pool_account_from_usages(
+    candidates: &[(usize, Usage)],
+    sticky_current: Option<usize>,
+    now: Tick,
+) -> Option<PoolSelection> {
+    let eligible: Vec<(usize, Usage)> = candidates
+        .iter()
+        .copied()
+        .filter(|(_, usage)| usage.eligible_alternate(now))
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+
+    let safe: Vec<(usize, Usage)> = eligible
+        .iter()
+        .copied()
+        .filter(|(_, usage)| usage.within_safety_buffer(now))
+        .collect();
+
+    if !safe.is_empty() {
+        let best_reset = safe
+            .iter()
+            .filter_map(|(_, usage)| usage.longest_active_reset(now))
+            .min();
+
+        if let Some(current_idx) = sticky_current {
+            if let Some((_, current_usage)) = safe.iter().find(|(idx, _)| *idx == current_idx) {
+                let keep_sticky = match (current_usage.longest_active_reset(now), best_reset) {
+                    (Some(cur_reset), Some(soonest)) => {
+                        cur_reset <= soonest.saturating_add(RESET_TIE_HYSTERESIS_SECS)
+                    }
+                    (None, None) => true,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                };
+                if keep_sticky {
+                    return Some(PoolSelection {
+                        index: current_idx,
+                        inside_buffer: false,
+                        reason: "sticky account within 15%/5% buffer".into(),
+                    });
+                }
+            }
+        }
+
+        let (chosen, _) = safe.iter().copied().min_by(|(idx_a, a), (idx_b, b)| {
+            let reset_a = a.longest_active_reset(now).unwrap_or(i64::MAX);
+            let reset_b = b.longest_active_reset(now).unwrap_or(i64::MAX);
+            reset_a
+                .cmp(&reset_b)
+                .then_with(|| {
+                    let rem_a = a.remaining(now).unwrap_or(100.0);
+                    let rem_b = b.remaining(now).unwrap_or(100.0);
+                    rem_b.total_cmp(&rem_a)
+                })
+                .then_with(|| idx_a.cmp(idx_b))
+        })?;
+
+        return Some(PoolSelection {
+            index: chosen,
+            inside_buffer: false,
+            reason: "soonest-expiring window within 15%/5% buffer".into(),
+        });
+    }
+
+    let (chosen, _) = eligible.iter().copied().max_by(|(idx_a, a), (idx_b, b)| {
+        let rem_a = a.remaining(now).unwrap_or(0.0);
+        let rem_b = b.remaining(now).unwrap_or(0.0);
+        rem_a
+            .total_cmp(&rem_b)
+            .then_with(|| {
+                let reset_a = a.longest_active_reset(now).unwrap_or(i64::MAX);
+                let reset_b = b.longest_active_reset(now).unwrap_or(i64::MAX);
+                reset_b.cmp(&reset_a)
+            })
+            .then_with(|| idx_b.cmp(idx_a))
+    })?;
+
+    Some(PoolSelection {
+        index: chosen,
+        inside_buffer: true,
+        reason: "all accounts inside safety buffer; using most remaining capacity".into(),
     })
 }
 
@@ -812,5 +944,61 @@ done
             fs::read_to_string(directory.join("calls")).unwrap(),
             "probe\nprobe\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn usage_with(
+        five_used: f64,
+        five_reset: i64,
+        week_used: f64,
+        week_reset: i64,
+        now: Tick,
+    ) -> Usage {
+        Usage {
+            five: window(five_used, five_reset, now),
+            week: window(week_used, week_reset, now),
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn sticky_pool_respects_15_5_buffers_soonest_reset_and_hysteresis() {
+        let now = now();
+        let soon = usage_with(50.0, now.wall + 3600, 40.0, now.wall + 10_000, now);
+        let later = usage_with(10.0, now.wall + 7200, 10.0, now.wall + 20_000, now);
+        let close = usage_with(30.0, now.wall + 3600, 30.0, now.wall + 10_300, now);
+
+        let picked = select_pool_account_from_usages(&[(0, later), (1, soon)], None, now).unwrap();
+        assert_eq!(picked.index, 1);
+        assert!(!picked.inside_buffer);
+
+        let sticky =
+            select_pool_account_from_usages(&[(0, soon), (1, close)], Some(1), now).unwrap();
+        assert_eq!(sticky.index, 1);
+
+        let near_short_cap = usage_with(90.0, now.wall + 3600, 10.0, now.wall + 8_000, now);
+        let healthy = usage_with(20.0, now.wall + 3600, 20.0, now.wall + 50_000, now);
+        let rotated =
+            select_pool_account_from_usages(&[(0, near_short_cap), (1, healthy)], Some(0), now)
+                .unwrap();
+        assert_eq!(rotated.index, 1);
+        assert!(!rotated.inside_buffer);
+
+        let near_week_cap = usage_with(10.0, now.wall + 3600, 96.0, now.wall + 8_000, now);
+        let rotated_week =
+            select_pool_account_from_usages(&[(0, near_week_cap), (1, healthy)], Some(0), now)
+                .unwrap();
+        assert_eq!(rotated_week.index, 1);
+
+        let tighter = usage_with(94.0, now.wall + 3600, 96.0, now.wall + 8_000, now);
+        let looser = usage_with(88.0, now.wall + 3600, 90.0, now.wall + 20_000, now);
+        let fallback =
+            select_pool_account_from_usages(&[(0, tighter), (1, looser)], None, now).unwrap();
+        assert_eq!(fallback.index, 1);
+        assert!(fallback.inside_buffer);
     }
 }

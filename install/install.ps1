@@ -15,11 +15,28 @@ try {
     $bin = if ($env:AGENT_COMMAND_INSTALL_DIR) { $env:AGENT_COMMAND_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'AgentCommand\bin' }
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
     $exe = Join-Path $bin 'agent-command.exe'
+    $old = "$exe.old"
+    if (Test-Path -LiteralPath $old) {
+        try { Remove-Item -LiteralPath $old -Force -ErrorAction Stop } catch {}
+    }
+    $renamed = $false
     if (Test-Path -LiteralPath $exe) {
         $version = & $exe --version 2>$null
         if ($version -notmatch '^agent-command ') { throw "Refusing to replace unrelated file: $exe" }
+        Move-Item -LiteralPath $exe -Destination $old -Force
+        $renamed = $true
     }
-    Copy-Item -LiteralPath (Join-Path $temp 'unpacked\agent-command.exe') -Destination $exe -Force
+    try {
+        Copy-Item -LiteralPath (Join-Path $temp 'unpacked\agent-command.exe') -Destination $exe -Force
+    } catch {
+        if ($renamed -and (Test-Path -LiteralPath $old) -and -not (Test-Path -LiteralPath $exe)) {
+            Move-Item -LiteralPath $old -Destination $exe -Force
+        }
+        throw
+    }
+    if (Test-Path -LiteralPath $old) {
+        try { Remove-Item -LiteralPath $old -Force -ErrorAction Stop } catch {}
+    }
     if (-not $env:AGENT_COMMAND_INSTALL_DIR) {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         if ($bin -notin ($userPath -split ';')) {

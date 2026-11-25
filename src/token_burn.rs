@@ -118,12 +118,46 @@ impl TokenBurnPalette {
 
     pub fn tier_color(&self, tier: &str) -> Color {
         match tier.trim().to_ascii_uppercase().as_str() {
-            "MAX" => self.tier_max,
-            "PRO" => self.tier_pro,
-            "PLUS" => self.tier_plus,
+            "MAX" | "ULTRA" | "ENTERPRISE" => self.tier_max,
+            "PRO" | "WORKSPACE" | "VERTEX" => self.tier_pro,
+            "PLUS" | "GOOGLE" | "BEDROCK" => self.tier_plus,
             "" => self.unknown,
             _ => self.accent,
         }
+    }
+}
+
+pub fn normalize_tier(raw: Option<&str>) -> String {
+    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("max") {
+        "max".into()
+    } else if lower.contains("ultra") {
+        "ultra".into()
+    } else if lower.contains("enterprise") {
+        "enterprise".into()
+    } else if lower.contains("team") {
+        "team".into()
+    } else if lower.contains("workspace") {
+        "workspace".into()
+    } else if lower.contains("pro") {
+        "pro".into()
+    } else if lower.contains("plus") {
+        "plus".into()
+    } else if lower.contains("bedrock") {
+        "bedrock".into()
+    } else if lower.contains("vertex") {
+        "vertex".into()
+    } else if lower.contains("foundry") {
+        "foundry".into()
+    } else if lower.contains("google") || lower.contains("oauth") {
+        "google".into()
+    } else if lower.contains("api") {
+        "api".into()
+    } else {
+        lower
     }
 }
 

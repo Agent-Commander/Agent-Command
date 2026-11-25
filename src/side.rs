@@ -88,6 +88,7 @@ pub(crate) fn read_only_arguments(provider: Provider) -> &'static [&'static str]
             "read-only",
             "-",
         ],
+        Provider::Gemini => &["-o", "stream-json", "--approval-mode", "plan", "-p", ""],
     }
 }
 
@@ -98,17 +99,36 @@ fn ask(profile: &Profile, workspace: PathBuf, prompt: &str) -> io::Result<Vec<St
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().expect("side chat stdin is piped");
     let input = prompt.to_owned();
     let writer = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let stderr = child.stderr.take().expect("side chat stderr is piped");
+    let stderr_reader = thread::spawn(move || {
+        BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .take(10)
+            .collect::<Vec<_>>()
+    });
     let stdout = child.stdout.take().expect("side chat stdout is piped");
     let answer = answer_lines(profile.provider, BufReader::new(stdout))?;
     let status = child.wait()?;
     let _ = writer.join();
+    let stderr_lines = stderr_reader.join().unwrap_or_default();
     if !status.success() && answer.is_empty() {
-        return Err(io::Error::other(format!("Side chat exited with {status}")));
+        let detail = if stderr_lines.is_empty() {
+            format!("Side chat exited with {status}")
+        } else {
+            format!(
+                "Side chat exited with {status}: {}",
+                stderr_lines.join(" | ")
+            )
+        };
+        return Err(io::Error::other(detail));
     }
     Ok(answer)
 }
@@ -164,10 +184,14 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--sandbox", "read-only"]));
         assert!(!codex.contains(&"workspace-write"));
+        let gemini = read_only_arguments(Provider::Gemini);
+        assert!(gemini
+            .windows(2)
+            .any(|pair| pair == ["--approval-mode", "plan"]));
     }
 
     #[test]
-    fn answer_lines_extract_text_from_both_providers() {
+    fn answer_lines_extract_text_from_all_providers() {
         let claude = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"First\\n\\nSecond\"}]}}\nnot json\n";
         assert_eq!(
             answer_lines(Provider::Claude, claude.as_bytes()).unwrap(),
@@ -177,6 +201,12 @@ mod tests {
         assert_eq!(
             answer_lines(Provider::Codex, codex.as_bytes()).unwrap(),
             ["Codex says hi"]
+        );
+        let gemini =
+            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Gemini says hi\"}\n";
+        assert_eq!(
+            answer_lines(Provider::Gemini, gemini.as_bytes()).unwrap(),
+            ["Gemini says hi"]
         );
     }
 }

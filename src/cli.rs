@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 pub fn run_cli(args: &[String]) -> io::Result<()> {
+    crate::update::cleanup_stale_old_binary();
     match args
         .split_first()
         .map(|(first, rest)| (first.as_str(), rest))
@@ -20,6 +21,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         Some(("catalog", rest)) => return crate::catalog::run(rest),
         Some(("connect", rest)) => return crate::connect::run(rest),
         Some(("daemon", rest)) => return crate::daemon::run(rest),
+        Some(("init" | "onboard", rest)) => return crate::onboard::run(rest),
         Some(("mcp", rest)) => return crate::mcp::run(rest),
         Some(("model", rest)) => return crate::native::run(rest),
         Some(("specialist", rest)) => return crate::specialists::run(rest),

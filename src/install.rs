@@ -4,11 +4,15 @@ use std::{ffi::OsString, path::PathBuf};
 pub(crate) const CLAUDE_DOCS: &str = "https://code.claude.com/docs/en/setup";
 pub(crate) const CODEX_DOCS: &str =
     "https://github.com/openai/codex#installing-and-running-codex-cli";
+pub(crate) const GEMINI_DOCS: &str = "https://github.com/google-gemini/gemini-cli#quickstart";
 
 const CLAUDE_UNIX: &str = "curl -fsSL https://claude.ai/install.sh | bash";
 const CLAUDE_WINDOWS: &str = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_UNIX: &str = "curl -fsSL https://chatgpt.com/codex/install.sh | sh";
 const CODEX_WINDOWS: &str = "irm https://chatgpt.com/codex/install.ps1 | iex";
+const GEMINI_UNIX: &str = "npm install --prefix \"$HOME/.local\" @google/gemini-cli";
+const GEMINI_WINDOWS: &str =
+    "npm install --prefix \"$env:LOCALAPPDATA\\Programs\\GeminiCLI\" @google/gemini-cli";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Platform {
@@ -47,6 +51,7 @@ pub(crate) fn plan(provider: Provider, platform: Platform) -> Plan {
     match (provider, platform) {
         (Provider::Claude, Platform::Unix) => shell_plan(provider, CLAUDE_UNIX, &["curl", "bash"]),
         (Provider::Codex, Platform::Unix) => shell_plan(provider, CODEX_UNIX, &["curl", "sh"]),
+        (Provider::Gemini, Platform::Unix) => shell_plan(provider, GEMINI_UNIX, &["npm", "sh"]),
         (Provider::Claude, Platform::Windows) => {
             powershell_plan(provider, vec!["-NoProfile", "-Command", CLAUDE_WINDOWS])
         }
@@ -54,6 +59,9 @@ pub(crate) fn plan(provider: Provider, platform: Platform) -> Plan {
             provider,
             vec!["-ExecutionPolicy", "ByPass", "-c", CODEX_WINDOWS],
         ),
+        (Provider::Gemini, Platform::Windows) => {
+            powershell_plan(provider, vec!["-NoProfile", "-Command", GEMINI_WINDOWS])
+        }
     }
 }
 
@@ -61,6 +69,7 @@ pub(crate) fn docs(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => CLAUDE_DOCS,
         Provider::Codex => CODEX_DOCS,
+        Provider::Gemini => GEMINI_DOCS,
     }
 }
 
@@ -126,6 +135,15 @@ pub(crate) fn documented_executable(
                     .join("bin"),
             )
         })?,
+        (Provider::Gemini, Platform::Unix) => absolute("HOME")?.join(".local").join("bin"),
+        (Provider::Gemini, Platform::Windows) => {
+            return Some(
+                absolute("LOCALAPPDATA")?
+                    .join("Programs")
+                    .join("GeminiCLI")
+                    .join("gemini.cmd"),
+            );
+        }
     };
     Some(directory.join(platform.executable(provider.binary())))
 }

@@ -1,5 +1,9 @@
+use sha2::{Digest, Sha256};
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsString,
+    fs::{self, File},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -8,8 +12,50 @@ use std::{
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const LATEST: &str = "https://github.com/Agent-Commander/Agent-Command/releases/latest";
+const RELEASE_DOWNLOAD_BASE: &str =
+    "https://github.com/Agent-Commander/Agent-Command/releases/download";
 const INSTALLER: &str =
     "https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate {
+        current: String,
+    },
+    Available {
+        tag: String,
+        current: String,
+    },
+    Downloading {
+        pct: u8,
+    },
+    Failed(String),
+}
+
+impl UpdateState {
+    pub fn pill_label(&self) -> String {
+        match self {
+            Self::Idle => format!("v{CURRENT}"),
+            Self::Checking => format!("v{CURRENT} · checking…"),
+            Self::UpToDate { current } => format!("v{current} ✓"),
+            Self::Available { tag, .. } => {
+                format!("⬆ Update v{} (F6)", tag.trim_start_matches('v'))
+            }
+            Self::Downloading { pct } => format!("Updating… {pct}%"),
+            Self::Failed(_) => format!("v{CURRENT} · update check offline (retry)"),
+        }
+    }
+
+    pub fn available_version(&self) -> Option<&str> {
+        match self {
+            Self::Available { tag, .. } => Some(tag.trim_start_matches('v')),
+            _ => None,
+        }
+    }
+}
 
 fn parse(version: &str) -> Option<[u64; 3]> {
     let core = version.trim().trim_start_matches('v');
@@ -42,18 +88,248 @@ pub fn watch(enabled: bool) -> Option<Receiver<String>> {
         return None;
     }
     let (found, results) = mpsc::channel();
-    thread::spawn(move || found.send(newer(&latest_tag()?, CURRENT)?).ok());
+    thread::spawn(move || found.send(newer(&latest_tag().ok()?, CURRENT)?).ok());
     Some(results)
 }
 
-fn latest_tag() -> Option<String> {
-    let headers = Command::new("curl")
+pub fn check_now() -> Receiver<UpdateState> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let state = evaluate_release_check(latest_tag(), CURRENT);
+        let _ = sender.send(state);
+    });
+    receiver
+}
+
+pub fn evaluate_release_check(latest: io::Result<String>, current: &str) -> UpdateState {
+    match latest {
+        Ok(found_tag) => match newer(&found_tag, current) {
+            Some(version) => UpdateState::Available {
+                tag: format!("v{version}"),
+                current: current.to_owned(),
+            },
+            None => UpdateState::UpToDate {
+                current: current.to_owned(),
+            },
+        },
+        Err(error) => UpdateState::Failed(error.to_string()),
+    }
+}
+
+fn curl_binary() -> &'static str {
+    if cfg!(windows) {
+        "curl.exe"
+    } else {
+        "curl"
+    }
+}
+
+fn latest_tag() -> io::Result<String> {
+    let headers = Command::new(curl_binary())
         .args(["--silent", "--head", "--max-time", "5", LATEST])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    tag(&String::from_utf8_lossy(&headers.stdout)).map(str::to_owned)
+        .stderr(Stdio::piped())
+        .output()?;
+    if !headers.status.success() {
+        let stderr = String::from_utf8_lossy(&headers.stderr).trim().to_owned();
+        return Err(io::Error::other(if stderr.is_empty() {
+            format!("Release check failed ({})", headers.status)
+        } else {
+            stderr
+        }));
+    }
+    tag(&String::from_utf8_lossy(&headers.stdout))
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("Release redirect missing version tag"))
+}
+
+pub fn old_binary_path(executable: &Path) -> PathBuf {
+    let mut name = OsString::from(executable.as_os_str());
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+pub fn cleanup_stale_old_binary() {
+    if let Ok(current) = env::current_exe() {
+        let _ = cleanup_old_at(&current);
+    }
+}
+
+pub fn cleanup_old_at(executable: &Path) -> io::Result<bool> {
+    let stale = old_binary_path(executable);
+    match fs::remove_file(&stale) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn parse_sha256_manifest(manifest: &str) -> Option<String> {
+    let token = manifest.split_whitespace().next()?;
+    (token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| token.to_ascii_lowercase())
+}
+
+pub fn verify_sha256_bytes(bytes: &[u8], expected_hex: &str) -> io::Result<()> {
+    let expected = parse_sha256_manifest(expected_hex).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "SHA-256 manifest is malformed.")
+    })?;
+    let actual: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Download checksum mismatch (expected {expected}, got {actual})."),
+        ));
+    }
+    Ok(())
+}
+
+pub fn swap_executable_in_place(current_exe: &Path, staged_exe: &Path) -> io::Result<PathBuf> {
+    let backup = old_binary_path(current_exe);
+    let _ = fs::remove_file(&backup);
+    let parent = current_exe.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Current executable has no parent directory.",
+        )
+    })?;
+    let temp_target = parent.join(format!("agent-command.{}.new", uuid::Uuid::new_v4()));
+    let mut staged_bytes = Vec::new();
+    File::open(staged_exe)?.read_to_end(&mut staged_bytes)?;
+    let mut file = File::create_new(&temp_target)?;
+    file.write_all(&staged_bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    if let Err(error) = fs::rename(current_exe, &backup) {
+        let _ = fs::remove_file(&temp_target);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp_target, current_exe) {
+        let _ = fs::rename(&backup, current_exe);
+        let _ = fs::remove_file(&temp_target);
+        return Err(error);
+    }
+    Ok(backup)
+}
+
+fn windows_asset_name() -> io::Result<&'static str> {
+    match env::consts::ARCH {
+        "x86_64" => Ok("agent-command-x86_64-pc-windows-msvc.zip"),
+        "aarch64" => Ok("agent-command-aarch64-pc-windows-msvc.zip"),
+        arch => Err(io::Error::other(format!(
+            "Unsupported Windows architecture {arch} for self-update."
+        ))),
+    }
+}
+
+fn release_asset_url(tag: &str, asset: &str) -> String {
+    if let Ok(base) = env::var("AGENT_COMMAND_RELEASE_URL") {
+        let trimmed = base.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return format!("{trimmed}/{asset}");
+        }
+    }
+    let normalized = if tag.starts_with('v') {
+        tag.to_owned()
+    } else {
+        format!("v{tag}")
+    };
+    format!("{RELEASE_DOWNLOAD_BASE}/{normalized}/{asset}")
+}
+
+fn curl_download(url: &str, destination: &Path) -> io::Result<()> {
+    let output = Command::new(curl_binary())
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-time",
+            "120",
+            "--output",
+        ])
+        .arg(destination)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(io::Error::other(if stderr.is_empty() {
+            format!("Download failed ({})", output.status)
+        } else {
+            stderr
+        }));
+    }
+    Ok(())
+}
+
+pub fn self_update_windows(tag: &str, mut progress: impl FnMut(u8)) -> io::Result<PathBuf> {
+    let current_exe = env::current_exe()?;
+    let asset = windows_asset_name()?;
+    let temp = env::temp_dir().join(format!("ac-update-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp)?;
+
+    let result = (|| {
+        progress(10);
+        let zip_path = temp.join(asset);
+        let sha_path = temp.join(format!("{asset}.sha256"));
+        curl_download(&release_asset_url(tag, asset), &zip_path)?;
+        progress(55);
+        curl_download(
+            &release_asset_url(tag, &format!("{asset}.sha256")),
+            &sha_path,
+        )?;
+        progress(70);
+
+        let zip_bytes = fs::read(&zip_path)?;
+        let sha_text = fs::read_to_string(&sha_path)?;
+        verify_sha256_bytes(&zip_bytes, &sha_text)?;
+        progress(80);
+
+        let unpacked = temp.join("unpacked");
+        fs::create_dir_all(&unpacked)?;
+        let tar_output = Command::new("tar.exe")
+            .arg("-xf")
+            .arg(&zip_path)
+            .arg("-C")
+            .arg(&unpacked)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !tar_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tar_output.stderr)
+                .trim()
+                .to_owned();
+            return Err(io::Error::other(format!(
+                "Failed to extract update archive: {stderr}"
+            )));
+        }
+        let staged = unpacked.join("agent-command.exe");
+        let header = fs::read(&staged)?;
+        if header.len() < 2 || &header[..2] != b"MZ" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Extracted update is not a valid Windows executable.",
+            ));
+        }
+        progress(90);
+        swap_executable_in_place(&current_exe, &staged)?;
+        progress(100);
+        Ok(current_exe)
+    })();
+
+    let _ = fs::remove_dir_all(&temp);
+    result
 }
 
 pub const DEVELOPMENT_REFUSAL: &str =
@@ -69,7 +345,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     if cfg!(debug_assertions) {
         return Err(io::Error::other(DEVELOPMENT_REFUSAL));
     }
-    apply(latest_tag().as_deref())
+    apply(latest_tag().ok().as_deref())
 }
 
 fn apply(latest: Option<&str>) -> io::Result<()> {
@@ -83,7 +359,10 @@ fn apply(latest: Option<&str>) -> io::Result<()> {
         return Ok(());
     };
     if cfg!(windows) {
-        print!("{}", notice(&latest));
+        self_update_windows(&latest, |_| {})?;
+        println!(
+            "Agent Command updated to {latest}. Restart agent-command to run the new version."
+        );
         return Ok(());
     }
     if install(&latest) {
@@ -93,9 +372,10 @@ fn apply(latest: Option<&str>) -> io::Result<()> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Applied {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Applied {
     Installed,
+    ReplacedInPlace { executable: PathBuf },
     HandedOff,
 }
 
@@ -103,6 +383,9 @@ pub(crate) fn finished_message(latest: &str, applied: Applied) -> String {
     match applied {
         Applied::Installed => {
             format!("Agent Command updated to {latest}. Run agent-command to open the new version.")
+        }
+        Applied::ReplacedInPlace { .. } => {
+            format!("Agent Command updated to {latest} in place. Relaunching in this terminal.")
         }
         Applied::HandedOff => format!(
             "Agent Command {latest} is installing in a new PowerShell window and opens when it finishes."
@@ -115,71 +398,14 @@ pub(crate) fn apply_in_app(latest: &str) -> io::Result<Applied> {
         return Err(io::Error::other(DEVELOPMENT_REFUSAL));
     }
     if cfg!(windows) {
-        let script = windows_updater_script(std::process::id(), custom_dir().as_deref());
-        return hand_off(&script).map(|()| Applied::HandedOff);
+        let executable = self_update_windows(latest, |_| {})?;
+        return Ok(Applied::ReplacedInPlace { executable });
     }
     if install(latest) {
         Ok(Applied::Installed)
     } else {
         Err(io::Error::other("the installer did not finish"))
     }
-}
-
-pub(crate) fn windows_updater_script(pid: u32, dir: Option<&Path>) -> String {
-    format!(
-        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; {}",
-        command(true, dir)
-    )
-}
-
-fn windows_launcher(script: &str) -> String {
-    format!(
-        "Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{}'",
-        encoded_command(script)
-    )
-}
-
-fn encoded_command(script: &str) -> String {
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    base64(&bytes)
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let value = chunk.iter().enumerate().fold(0u32, |value, (index, byte)| {
-            value | u32::from(*byte) << (16 - 8 * index)
-        });
-        for position in 0..4 {
-            if position <= chunk.len() {
-                let sextet = (value >> (18 - 6 * position)) & 0x3f;
-                encoded.push(char::from(ALPHABET[sextet as usize]));
-            } else {
-                encoded.push('=');
-            }
-        }
-    }
-    encoded
-}
-
-fn hand_off(script: &str) -> io::Result<()> {
-    Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command"])
-        .arg(windows_launcher(script))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!(
-                    "the PowerShell updater did not start ({status})"
-                )))
-            }
-        })
 }
 
 pub fn one_line_notice(latest: &str) -> String {
@@ -296,6 +522,75 @@ mod tests {
         assert_eq!(tag(""), None);
     }
 
+    #[test]
+    fn update_state_labels_and_release_evaluation_cover_all_states() {
+        assert_eq!(
+            evaluate_release_check(Ok("v0.9.0".into()), "0.2.2"),
+            UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: "0.2.2".into(),
+            }
+        );
+        assert_eq!(
+            evaluate_release_check(Ok("v0.2.2".into()), "0.2.2"),
+            UpdateState::UpToDate {
+                current: "0.2.2".into(),
+            }
+        );
+        assert!(matches!(
+            evaluate_release_check(Err(io::Error::other("offline")), "0.2.2"),
+            UpdateState::Failed(_)
+        ));
+        assert!(UpdateState::Checking.pill_label().contains("checking"));
+        assert!(UpdateState::UpToDate {
+            current: "0.2.2".into()
+        }
+        .pill_label()
+        .contains("v0.2.2 ✓"));
+        assert!(UpdateState::Available {
+            tag: "v0.3.0".into(),
+            current: "0.2.2".into()
+        }
+        .pill_label()
+        .contains("Update v0.3.0"));
+        assert!(UpdateState::Downloading { pct: 45 }
+            .pill_label()
+            .contains("45%"));
+        assert!(UpdateState::Failed("net".into())
+            .pill_label()
+            .contains("offline"));
+    }
+
+    #[test]
+    fn sha256_verification_and_in_place_rename_swap_and_cleanup_work() {
+        let payload = b"MZ_new_binary_payload";
+        let expected: String = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let manifest = format!("{expected}  agent-command-x86_64-pc-windows-msvc.zip\n");
+        assert!(verify_sha256_bytes(payload, &manifest).is_ok());
+        assert!(verify_sha256_bytes(b"tampered", &manifest).is_err());
+        assert!(verify_sha256_bytes(payload, "not-a-hash").is_err());
+
+        let dir = env::temp_dir().join(format!("ac-swap-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("agent-command.exe");
+        let staged = dir.join("staged.exe");
+        fs::write(&current, b"MZ_old_version").unwrap();
+        fs::write(&staged, payload).unwrap();
+
+        let backup = swap_executable_in_place(&current, &staged).unwrap();
+        assert_eq!(backup, dir.join("agent-command.exe.old"));
+        assert_eq!(fs::read(&current).unwrap(), payload);
+        assert_eq!(fs::read(&backup).unwrap(), b"MZ_old_version");
+
+        assert!(cleanup_old_at(&current).unwrap());
+        assert!(!backup.exists());
+        assert!(!cleanup_old_at(&current).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn update_command_refuses_or_no_ops_without_a_newer_version() {
@@ -321,45 +616,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_updater_waits_for_this_process_then_runs_the_official_installer() {
-        let script = windows_updater_script(4242, None);
-        assert!(
-            script.starts_with("Wait-Process -Id 4242 -ErrorAction SilentlyContinue; "),
-            "{script}"
-        );
-        assert!(
-            script.ends_with(&format!("irm {INSTALLER}.ps1 | iex")),
-            "{script}"
-        );
-        assert_eq!(
-            format!("{INSTALLER}.ps1"),
-            "https://raw.githubusercontent.com/Agent-Commander/Agent-Command/main/install/install.ps1"
-        );
-        let custom = windows_updater_script(7, Some(Path::new(r"C:\Tools\it's here")));
-        assert!(
-            custom.contains(r"$env:AGENT_COMMAND_INSTALL_DIR = 'C:\Tools\it''s here'; irm "),
-            "{custom}"
-        );
-        assert!(custom.find("Wait-Process") < custom.find("AGENT_COMMAND_INSTALL_DIR"));
-    }
-
-    #[test]
-    fn windows_launcher_passes_the_script_as_an_encoded_command() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(encoded_command("ab"), "YQBiAA==");
-        let launcher = windows_launcher(&windows_updater_script(1, None));
-        assert!(launcher.starts_with("Start-Process powershell -ArgumentList "));
-        assert!(launcher.contains("'-EncodedCommand','"));
-        assert!(!launcher.contains('|') && !launcher.contains('"'));
-    }
-
-    #[test]
     fn finished_messages_name_the_new_version() {
         assert!(finished_message("9.9.9", Applied::Installed).contains("updated to 9.9.9"));
+        assert!(finished_message(
+            "9.9.9",
+            Applied::ReplacedInPlace {
+                executable: PathBuf::from("agent-command.exe")
+            }
+        )
+        .contains("in place"));
         assert!(finished_message("9.9.9", Applied::HandedOff).contains("PowerShell window"));
     }
 

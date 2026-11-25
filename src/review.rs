@@ -79,6 +79,15 @@ pub(crate) fn opposite(provider: Provider) -> Provider {
     match provider {
         Provider::Claude => Provider::Codex,
         Provider::Codex => Provider::Claude,
+        Provider::Gemini => Provider::Claude,
+    }
+}
+
+pub(crate) fn cross_family_candidates(author: Provider) -> [Provider; 2] {
+    match author {
+        Provider::Claude => [Provider::Codex, Provider::Gemini],
+        Provider::Codex => [Provider::Claude, Provider::Gemini],
+        Provider::Gemini => [Provider::Claude, Provider::Codex],
     }
 }
 
@@ -97,8 +106,10 @@ pub(crate) fn select_reviewer(
     let author = author.ok_or_else(|| {
         format!("{name} has no recorded changes yet; delegate work before /review.")
     })?;
-    let reviewer = opposite(author);
-    if signed_in.contains(&reviewer) {
+    if let Some(reviewer) = cross_family_candidates(author)
+        .into_iter()
+        .find(|candidate| signed_in.contains(candidate))
+    {
         return Ok(ReviewerSelection {
             target: Target::Provider(reviewer),
             cross_family: true,
@@ -109,13 +120,14 @@ pub(crate) fn select_reviewer(
             ),
         });
     }
+    let preferred = opposite(author);
     if signed_in.contains(&author) {
         return Ok(ReviewerSelection {
             target: Target::Provider(author),
             cross_family: false,
             note: format!(
                 "Fallback: no {} profile is signed in, so {} reviews its own family's work",
-                reviewer.binary(),
+                preferred.binary(),
                 author.binary()
             ),
         });
@@ -353,6 +365,13 @@ mod tests {
             "Cross-family review: claude wrote it, codex reviews it"
         );
         let selection = select_reviewer("nova", Some(Provider::Codex), &both).unwrap();
+        assert_eq!(selection.target, Target::Provider(Provider::Claude));
+        assert!(selection.cross_family);
+        let with_gemini = [Provider::Claude, Provider::Gemini];
+        let selection = select_reviewer("nova", Some(Provider::Claude), &with_gemini).unwrap();
+        assert_eq!(selection.target, Target::Provider(Provider::Gemini));
+        assert!(selection.cross_family);
+        let selection = select_reviewer("nova", Some(Provider::Gemini), &with_gemini).unwrap();
         assert_eq!(selection.target, Target::Provider(Provider::Claude));
         assert!(selection.cross_family);
     }

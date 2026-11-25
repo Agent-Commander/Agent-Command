@@ -219,7 +219,7 @@ fn triage_reports_json_without_a_terminal_and_never_prints_secrets() {
         .as_array()
         .is_some_and(|lines| !lines.is_empty()));
     let usage = Command::new(env!("CARGO_BIN_EXE_agent-command"))
-        .args(["triage", "--pipe", "gemini"])
+        .args(["triage", "--pipe", "unknown"])
         .output()
         .unwrap();
     assert!(!usage.status.success());

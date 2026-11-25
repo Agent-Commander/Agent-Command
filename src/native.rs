@@ -8,6 +8,7 @@ use std::{
 pub(crate) const SCORED_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
+const GEMINI_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 const CLAUDE_ROLLING_ALIASES: [&str; 6] =
     ["default", "best", "opus", "sonnet", "haiku", "opusplan"];
 const ROLLING_SUFFIX: &str = "-latest";
@@ -21,6 +22,7 @@ pub(crate) fn native_efforts(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &CLAUDE_EFFORTS,
         Provider::Codex => &CODEX_EFFORTS,
+        Provider::Gemini => &GEMINI_EFFORTS,
     }
 }
 
@@ -93,6 +95,16 @@ pub(crate) fn validate_pinned_model(provider: Provider, model: &str) -> Result<(
         Provider::Codex if !model_characters_valid(model, b".") => {
             Err(format!("{model} has characters outside a-z, 0-9, . and -"))
         }
+        Provider::Gemini
+            if !model.starts_with("gemini-")
+                || model == "default"
+                || model.ends_with(ROLLING_SUFFIX) =>
+        {
+            Err(format!("{model} is not a full Gemini model name"))
+        }
+        Provider::Gemini if !model_characters_valid(model, b".") => {
+            Err(format!("{model} has characters outside a-z, 0-9, . and -"))
+        }
         _ => Ok(()),
     }
 }
@@ -101,7 +113,7 @@ pub(crate) fn benchmark_slug(provider: Provider, model: &str) -> Option<String> 
     validate_pinned_model(provider, model).ok()?;
     Some(match provider {
         Provider::Claude => model.to_owned(),
-        Provider::Codex => model.replace('.', "-"),
+        Provider::Codex | Provider::Gemini => model.replace('.', "-"),
     })
 }
 

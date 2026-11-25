@@ -17,17 +17,17 @@ const SPLIT_DELIMITER: &str = ";;";
 const MAX_SPLIT_UNITS: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Model {
+pub enum Model {
     Default,
     Alias(&'static str),
     Pinned(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Configuration {
-    pub(crate) provider: Provider,
-    pub(crate) model: Model,
-    pub(crate) effort: Option<String>,
+pub struct Configuration {
+    pub provider: Provider,
+    pub model: Model,
+    pub effort: Option<String>,
 }
 
 const CLAUDE_DISPATCH_ALIASES: [&str; 2] = ["opus", "sonnet"];
@@ -110,6 +110,11 @@ impl Configuration {
                         "-c".to_owned(),
                         format!("model_reasoning_effort={}", toml_value(effort)),
                     ]);
+                }
+            }
+            Provider::Gemini => {
+                if let Some(model) = self.native_model() {
+                    arguments.extend(["--model".to_owned(), model.to_owned()]);
                 }
             }
         }

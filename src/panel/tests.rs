@@ -14,10 +14,10 @@ struct Script {
     calls: Vec<String>,
     checks: Vec<String>,
     signed: BTreeSet<String>,
-    installed: [bool; 2],
+    installed: [bool; 3],
     refuse_sign_in: bool,
-    accounts: [Option<&'static str>; 2],
-    adopted: [Option<PathBuf>; 2],
+    accounts: [Option<&'static str>; 3],
+    adopted: [Option<PathBuf>; 3],
     absent_programs: Vec<&'static str>,
     home: Option<PathBuf>,
     installs: Option<Landing>,
@@ -169,7 +169,7 @@ impl Host for FakeHost {
 
 fn fake(installed: [bool; 2], signed: &[&str]) -> FakeHost {
     FakeHost(Rc::new(RefCell::new(Script {
-        installed,
+        installed: [installed[0], installed[1], false],
         signed: signed.iter().map(|label| (*label).to_owned()).collect(),
         ..Script::default()
     })))
@@ -424,7 +424,7 @@ fn missing_cli_shows_the_recheck_state_until_it_is_found() {
         press(&mut app, KeyCode::Enter);
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("claude is not installed"), "{text}");
-        host.0.borrow_mut().installed = [true, false];
+        host.0.borrow_mut().installed = [true, false, false];
         if index == 0 {
             press(&mut app, KeyCode::Char('R'));
         } else {
@@ -434,7 +434,7 @@ fn missing_cli_shows_the_recheck_state_until_it_is_found() {
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("✓ claude on PATH"), "{text}");
         assert!(text.contains("✗ codex not found"), "{text}");
-        host.0.borrow_mut().installed = [true, true];
+        host.0.borrow_mut().installed = [true, true, true];
         press(&mut app, KeyCode::Char('r'));
         let text = screen(&render(&mut app, width, height));
         assert!(!text.contains("R Recheck"), "{text}");
@@ -1088,6 +1088,7 @@ fn install_appears_only_for_a_missing_cli_in_connect_and_settings() {
             assert_inside(&app, width, height);
 
             let ready = fake([true, true], &[]);
+            ready.0.borrow_mut().installed[2] = true;
             let mut app = preview(&ready, LaunchConfig::default());
             open(&mut app, settings);
             let text = screen(&render(&mut app, width, height));
@@ -1286,7 +1287,7 @@ fn onboarding_pre_checks_every_installed_cli_and_shows_the_auto_name() {
         let sandbox = Sandbox::new(&format!("onboarding-both-{width}"));
         let mut app = launched(&sandbox, &fake([true, true], &[]));
         assert_eq!(origin(&app), Some(Origin::Onboarding));
-        assert_eq!(chosen(&app), Provider::ALL);
+        assert_eq!(chosen(&app), [Provider::Claude, Provider::Codex]);
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("[x] Claude Code"), "{text}");
         assert!(text.contains("[x] Codex CLI"), "{text}");
@@ -1333,7 +1334,7 @@ fn connect_pre_checks_only_installed_providers_that_are_not_signed_in() {
         render(&mut app, width, height);
         let area = hit(&app, Action::Toggle(Provider::Claude));
         click(&mut app, area);
-        assert_eq!(chosen(&app), Provider::ALL);
+        assert_eq!(chosen(&app), [Provider::Claude, Provider::Codex]);
     }
 }
 

@@ -130,6 +130,7 @@ mod tests {
         let cases = [
             ("@claude", Target::Provider(Provider::Claude)),
             ("@codex", Target::Provider(Provider::Codex)),
+            ("@gemini", Target::Provider(Provider::Gemini)),
             (
                 "@opus",
                 Target::Model {

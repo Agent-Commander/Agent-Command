@@ -426,6 +426,7 @@ pub(crate) struct ServiceSpec<'a> {
     pub(crate) executable: &'a Path,
     pub(crate) bind: SocketAddr,
     pub(crate) allow_remote: bool,
+    pub(crate) scope: Scope,
     pub(crate) root: &'a Path,
     pub(crate) home: &'a Path,
 }
@@ -439,6 +440,8 @@ impl ServiceSpec<'_> {
             self.bind.to_string(),
             "--root".into(),
             path_text(self.root)?,
+            "--scope".into(),
+            self.scope.label().into(),
         ];
         if self.allow_remote {
             arguments.push("--allow-remote".into());
@@ -447,17 +450,28 @@ impl ServiceSpec<'_> {
     }
 }
 
+pub(crate) fn strip_windows_verbatim(text: &str) -> String {
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        stripped.to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
 fn path_text(path: &Path) -> Result<String, String> {
     let text = path
         .to_str()
         .ok_or_else(|| format!("{} is not valid UTF-8", path.display()))?;
-    if text.chars().any(|c| c.is_control() || c == '"') {
+    let cleaned = strip_windows_verbatim(text);
+    if cleaned.chars().any(|c| c.is_control() || c == '"') {
         return Err(format!(
             "{} contains quotes or control characters",
             path.display()
         ));
     }
-    Ok(text.to_owned())
+    Ok(cleaned)
 }
 
 fn systemd_quote(argument: &str) -> String {
@@ -613,6 +627,7 @@ fn service(action: &ServiceAction, options: &Options, root: &Path) -> io::Result
         executable: &executable,
         bind: options.bind,
         allow_remote: options.allow_remote,
+        scope: options.scope,
         root,
         home: &home,
     };
@@ -955,6 +970,7 @@ pub(crate) mod tests {
             executable,
             bind: default_bind(),
             allow_remote: false,
+            scope: Scope::Supervised,
             root,
             home,
         }
@@ -962,15 +978,13 @@ pub(crate) mod tests {
 
     #[test]
     fn renders_a_user_level_systemd_unit() {
-        let file = render_service(
-            ServiceOs::Linux,
-            &spec(
-                Path::new("/opt/ac/agent-command"),
-                Path::new("/srv/50%_work"),
-                Path::new("/home/me"),
-            ),
-        )
-        .unwrap();
+        let mut unit = spec(
+            Path::new("/opt/ac/agent-command"),
+            Path::new("/srv/50%_work"),
+            Path::new("/home/me"),
+        );
+        unit.scope = Scope::ReadOnly;
+        let file = render_service(ServiceOs::Linux, &unit).unwrap();
         assert_eq!(
             file.location,
             Some(PathBuf::from(
@@ -978,7 +992,7 @@ pub(crate) mod tests {
             ))
         );
         assert!(file.contents.contains(
-            "ExecStart=\"/opt/ac/agent-command\" \"daemon\" \"--bind\" \"127.0.0.1:47100\" \"--root\" \"/srv/50%%_work\"\n"
+            "ExecStart=\"/opt/ac/agent-command\" \"daemon\" \"--bind\" \"127.0.0.1:47100\" \"--root\" \"/srv/50%%_work\" \"--scope\" \"read-only\"\n"
         ));
         assert!(file.contents.contains("WantedBy=default.target"));
         assert!(file.contents.contains("NoNewPrivileges=true"));
@@ -1011,26 +1025,35 @@ pub(crate) mod tests {
             .contents
             .contains("<string>/Applications/a&amp;b/agent-command</string>"));
         assert!(file.contents.contains("<string>daemon</string>\n    <string>--bind</string>\n    <string>127.0.0.1:47100</string>"));
+        assert!(file
+            .contents
+            .contains("<string>--scope</string>\n    <string>supervised</string>"));
         assert!(file.contents.contains("<key>KeepAlive</key>\n  <true/>"));
         assert!(file.activate[0].starts_with("launchctl bootstrap gui/$(id -u)"));
     }
 
     #[test]
-    fn renders_a_windows_logon_task_without_elevation() {
+    fn renders_a_windows_logon_task_without_elevation_and_strips_verbatim_prefix() {
         let mut remote = spec(
-            Path::new("C:\\Program Files\\Agent Command\\agent-command.exe"),
-            Path::new("C:\\work"),
-            Path::new("C:\\Users\\me"),
+            Path::new(r"\\?\C:\Program Files\Agent Command\agent-command.exe"),
+            Path::new(r"\\?\C:\work"),
+            Path::new(r"C:\Users\me"),
         );
         remote.bind = "100.64.0.7:47100".parse().unwrap();
         remote.allow_remote = true;
+        remote.scope = Scope::ReadOnly;
         let file = render_service(ServiceOs::Windows, &remote).unwrap();
         assert_eq!(file.location, None);
         assert_eq!(
             file.contents,
-            "schtasks /Create /TN \"AgentCommandDaemon\" /SC ONLOGON /RL LIMITED /F /TR \"\\\"C:\\Program Files\\Agent Command\\agent-command.exe\\\" \\\"daemon\\\" \\\"--bind\\\" \\\"100.64.0.7:47100\\\" \\\"--root\\\" \\\"C:\\work\\\" \\\"--allow-remote\\\"\"\n"
+            "schtasks /Create /TN \"AgentCommandDaemon\" /SC ONLOGON /RL LIMITED /F /TR \"\\\"C:\\Program Files\\Agent Command\\agent-command.exe\\\" \\\"daemon\\\" \\\"--bind\\\" \\\"100.64.0.7:47100\\\" \\\"--root\\\" \\\"C:\\work\\\" \\\"--scope\\\" \\\"read-only\\\" \\\"--allow-remote\\\"\"\n"
         );
+        assert!(!file.contents.contains(r"\\?\"));
         assert!(!file.contents.contains("HIGHEST"));
+        assert_eq!(
+            strip_windows_verbatim(r"\\?\UNC\fileserver\share\repo"),
+            r"\\fileserver\share\repo"
+        );
         assert!(render_service(
             ServiceOs::Windows,
             &spec(

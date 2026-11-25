@@ -2,10 +2,11 @@
 
 Applies to profiles, usage, routing, continuations, checkpoints and any durable state. Each rule is `blocking`.
 
-## 1. Subscription-only
+## 1. Zero-reauth default and isolated profiles
 
-- Missions run only on signed-in subscription profiles under the isolated `sub-auth` root (`~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`).
-- Never fall back to a provider API key, the provider's standalone login, or another user's profile.
+- Existing signed-in local CLI sessions (`~/.claude`, `~/.codex`, `~/.gemini`, and `gh`) are auto-adopted as `ProfileSource::SystemDefault` (Account #1) without stripping credentials or forcing re-authentication.
+- Additional, multi-org, and enterprise profiles live under the isolated `sub-auth` root (`~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`) with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GEMINI_CLI_HOME`.
+- Never leak secrets into state files, command arguments, or logs.
 - A relative `SUB_AUTH_DIR` is refused.
 - Tests always use a temporary profile root.
 
