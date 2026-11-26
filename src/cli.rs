@@ -1,4 +1,4 @@
-use crate::{editor, token_burn::SixelRingCache, App};
+use crate::{editor, token_burn::InlineFrameUpdate, App};
 use crossterm::{
     cursor::MoveTo,
     event::{
@@ -20,6 +20,20 @@ use std::{
 
 const PASTE_COALESCE_POLL: Duration = Duration::from_millis(8);
 const MAX_EVENTS_PER_FRAME: usize = 4096;
+
+fn write_inline_update(stdout: &mut io::Stdout, update: &InlineFrameUpdate) {
+    if update.is_empty() {
+        return;
+    }
+    for delete in &update.deletes {
+        let _ = stdout.write_all(delete.as_bytes());
+    }
+    for (x, y, payload) in &update.sequences {
+        let _ = execute!(stdout, MoveTo(*x, *y));
+        let _ = stdout.write_all(payload.as_bytes());
+    }
+    let _ = stdout.flush();
+}
 
 fn restore_terminal() {
     let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
@@ -263,7 +277,6 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         app.graphics = graphics;
         app.attach_fast(Box::new(crate::panel::TerminalHost), launch);
         app.start_background_probes();
-        let mut sixel_cache = SixelRingCache::default();
 
         while !app.quit {
             if !app.mission_running()
@@ -292,26 +305,20 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             let force_redraw = std::mem::take(&mut app.full_redraw);
             if force_redraw {
                 terminal.clear()?;
-                sixel_cache.clear();
+                app.inline_ring_cache.clear();
             }
-            app.pending_sixel_rings.clear();
-            if app.graphics.use_sixel() {
+            app.pending_graphic_rings.clear();
+            if let Some(protocol) = app.graphics.inline_protocol() {
                 let mut stdout = io::stdout();
                 let _ = execute!(stdout, BeginSynchronizedUpdate);
                 let draw_result = terminal.draw(|f| app.draw(f));
                 if draw_result.is_ok() {
-                    let update = sixel_cache.diff_and_encode(
-                        &app.pending_sixel_rings,
+                    let update = app.inline_ring_cache.diff_and_encode(
+                        &app.pending_graphic_rings,
+                        protocol,
                         app.graphics.cell_px,
-                        force_redraw,
                     );
-                    if !update.sequences.is_empty() {
-                        for (x, y, payload) in &update.sequences {
-                            let _ = execute!(stdout, MoveTo(*x, *y));
-                            let _ = stdout.write_all(payload.as_bytes());
-                        }
-                        let _ = stdout.flush();
-                    }
+                    write_inline_update(&mut stdout, &update);
                 }
                 let _ = execute!(stdout, EndSynchronizedUpdate);
                 draw_result?;
@@ -322,11 +329,14 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             if event::poll(Duration::from_millis(33))? {
                 let batch = drain_input_batch()?;
                 if batch.iter().any(|ev| matches!(ev, Event::Resize(_, _))) {
-                    sixel_cache.clear();
+                    app.graphics
+                        .remeasure(crate::tui::graphics::window_metrics());
+                    app.inline_ring_cache.clear();
                 }
                 dispatch_input_batch(&mut app, batch);
             }
         }
+        write_inline_update(&mut io::stdout(), &app.inline_ring_cache.release());
         app.interrupt_all_runs();
         exit_message = app.take_exit_message();
         relaunch_executable = app.take_relaunch_executable();

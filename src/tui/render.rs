@@ -1,5 +1,4 @@
 use ratatui::{
-    buffer::CellDiffOption,
     layout::{Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -102,7 +101,7 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
     app.focus_banner_hits.clear();
     app.welcome_hits.clear();
     app.left_hits.clear();
-    app.pending_sixel_rings.clear();
+    app.pending_graphic_rings.clear();
     app.last_frame_width = area.width;
 
     if area.width < 12 || area.height < 6 {
@@ -234,7 +233,7 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
 
     app.draw_panel(frame, area);
 
-    apply_sixel_occlusion(app, frame, area, canvas_area, autocomplete_rect, vault_rect);
+    apply_graphic_occlusion(app, frame, area, canvas_area, autocomplete_rect, vault_rect);
 }
 
 fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette) {
@@ -1421,7 +1420,7 @@ fn estimated_autocomplete_rect(anchor_area: Rect, bounds: Rect) -> Rect {
     Rect::new(popup_x, popup_y, popup_w, popup_h)
 }
 
-fn apply_sixel_occlusion(
+fn apply_graphic_occlusion(
     app: &mut App,
     frame: &mut Frame,
     area: Rect,
@@ -1429,8 +1428,8 @@ fn apply_sixel_occlusion(
     autocomplete_rect: Rect,
     vault_rect: Rect,
 ) {
-    if !app.graphics.sixel {
-        app.pending_sixel_rings.clear();
+    if !app.graphics.use_inline_graphics() {
+        app.pending_graphic_rings.clear();
         return;
     }
 
@@ -1481,16 +1480,13 @@ fn apply_sixel_occlusion(
         overlays.push(popover_rect);
     }
 
-    app.pending_sixel_rings.retain(|slot| {
+    app.pending_graphic_rings.retain(|slot| {
         slot.fits_without_scroll(area) && !token_burn::rect_intersects_any(slot.rect, &overlays)
     });
 
     let buf = frame.buffer_mut();
-    for slot in &app.pending_sixel_rings {
-        for y in slot.rect.y..slot.rect.bottom() {
-            for x in slot.rect.x..slot.rect.right() {
-                buf[(x, y)].set_diff_option(CellDiffOption::Skip);
-            }
-        }
+    for (index, slot) in app.pending_graphic_rings.iter().enumerate() {
+        let displayed = app.inline_ring_cache.is_displayed(index, &slot.cache_key());
+        slot.prepare_cells(buf, displayed);
     }
 }

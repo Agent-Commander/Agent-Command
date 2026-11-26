@@ -232,7 +232,7 @@ fn draw_usage_deck(
     bottom: u16,
     palette: &UiPalette,
 ) -> u16 {
-    app.pending_sixel_rings.clear();
+    app.pending_graphic_rings.clear();
     if start + 2 >= bottom {
         return start;
     }
@@ -272,8 +272,8 @@ fn draw_usage_deck(
             Paragraph::new(lines).style(Style::default().bg(palette.surface)),
             tile,
         );
-        if caps.use_sixel() {
-            app.pending_sixel_rings
+        if caps.use_inline_graphics() {
+            app.pending_graphic_rings
                 .push(card.ring_slot(tile, palette.surface, deck_palette));
         }
         app.left_hits.push((tile, TabHit::UsageTile(index)));

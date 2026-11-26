@@ -1,6 +1,6 @@
-use crate::tui::graphics::GraphicsCaps;
+use crate::tui::graphics::{GraphicsCaps, InlineProtocol};
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -510,6 +510,14 @@ const SIXEL_GLOW_WIDTH: f64 = 0.085;
 const SIXEL_GLOW_STRENGTH: f64 = 0.24;
 const SIXEL_BAND_HEIGHT: usize = 6;
 const SIXEL_RLE_MIN_RUN: usize = 4;
+const UNKNOWN_DASH_SEGMENTS: f64 = 8.0;
+const UNKNOWN_DASH_DUTY: f64 = 0.5;
+const UNKNOWN_TRACK_DIM: f64 = 0.6;
+const PNG_MIN_SIDE_PX: usize = 160;
+const LABEL_SCALES: [usize; 8] = [8, 7, 6, 5, 4, 3, 2, 1];
+const KITTY_IMAGE_ID_BASE: u32 = 7100;
+const KITTY_CHUNK_BYTES: usize = 4096;
+const SIXEL_TRANSPARENT_REGISTER: usize = 0;
 
 const OCTANT_EXCEPTIONS: [(u8, char); 26] = [
     (0x00, ' '),
@@ -625,12 +633,25 @@ struct RingBand {
     remaining: Option<f64>,
     fill_rgb: Rgb,
     track_rgb: Rgb,
+    dashed: bool,
+}
+
+fn unknown_track_rgb(bg: Rgb, palette: &TokenBurnPalette) -> Rgb {
+    bg.lerp(
+        Rgb::from_color(palette.unknown, Rgb::new(0x5d, 0x65, 0x70)),
+        UNKNOWN_TRACK_DIM,
+    )
+}
+
+fn on_unknown_dash(x: f64, y: f64) -> bool {
+    (clockwise_fraction_from_top(x, y) * UNKNOWN_DASH_SEGMENTS).fract() < UNKNOWN_DASH_DUTY
 }
 
 fn ring_bands(rings: &[Option<f64>], bg: Rgb, palette: &TokenBurnPalette) -> Vec<RingBand> {
     let normalized = if rings.is_empty() { &[None][..] } else { rings };
     let border_rgb = Rgb::from_color(palette.border, Rgb::new(0x2a, 0x30, 0x39));
     let unknown_rgb = Rgb::from_color(palette.unknown, Rgb::new(0x5d, 0x65, 0x70));
+    let dim_unknown = unknown_track_rgb(bg, palette);
     let recessed_track = bg.lerp(border_rgb, 0.78);
     let specs: &[(f64, f64)] = if normalized.len() == 1 {
         &[(SINGLE_RING_RADIUS, SINGLE_RING_HALF_STROKE)]
@@ -649,7 +670,7 @@ fn ring_bands(rings: &[Option<f64>], bg: Rgb, palette: &TokenBurnPalette) -> Vec
             let track_rgb = if remaining.is_some() {
                 recessed_track
             } else {
-                unknown_rgb
+                dim_unknown
             };
             RingBand {
                 radius,
@@ -657,6 +678,7 @@ fn ring_bands(rings: &[Option<f64>], bg: Rgb, palette: &TokenBurnPalette) -> Vec
                 remaining,
                 fill_rgb,
                 track_rgb,
+                dashed: remaining.is_none(),
             }
         })
         .collect()
@@ -696,7 +718,7 @@ fn sample_ring_sdf(x: f64, y: f64, bands: &[RingBand], bg: Rgb, glow: bool) -> (
 
     for band in bands {
         let d_track = (dist - band.radius).abs() - band.half_stroke;
-        if d_track <= 0.0 {
+        if d_track <= 0.0 && (!band.dashed || on_unknown_dash(x, y)) {
             let radial_falloff = ((dist - band.radius).abs() / band.half_stroke).clamp(0.0, 1.0);
             let shaded_track = if band.remaining.is_some() {
                 band.track_rgb.lerp(bg, radial_falloff * 0.25)
@@ -793,7 +815,7 @@ fn headline_from_slice(rings: &[Option<f64>]) -> Option<f64> {
         .reduce(f64::min)
 }
 
-fn sixel_center_label(rings: &[Option<f64>]) -> String {
+fn ring_center_label(rings: &[Option<f64>]) -> String {
     let headline = headline_from_slice(rings);
     match (headline, rings.len() > 1) {
         (None, _) => "--".to_owned(),
@@ -802,99 +824,186 @@ fn sixel_center_label(rings: &[Option<f64>]) -> String {
     }
 }
 
-fn stamp_sixel_center_label(
-    pixels: &mut [Rgb],
-    px_w: usize,
-    px_h: usize,
-    rings: &[Option<f64>],
-    bg: Rgb,
-    palette: &TokenBurnPalette,
-) {
-    let label = sixel_center_label(rings);
-    let glyphs: Vec<[u8; 7]> = label.chars().filter_map(glyph_5x7).collect();
-    if glyphs.is_empty() {
-        return;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rgba {
+    rgb: Rgb,
+    alpha: u8,
+}
+
+impl Rgba {
+    const TRANSPARENT: Self = Self {
+        rgb: Rgb::new(0, 0, 0),
+        alpha: 0,
+    };
+
+    fn over(self, bg: Rgb) -> Rgb {
+        bg.lerp(self.rgb, f64::from(self.alpha) / 255.0)
     }
-    let hole_norm = if rings.len() > 1 {
-        DUAL_INNER_RADIUS - DUAL_INNER_HALF_STROKE
-    } else {
-        SINGLE_RING_RADIUS - SINGLE_RING_HALF_STROKE
-    };
-    let hole_radius_px = (px_w.min(px_h) as f64 * 0.5) * hole_norm;
-    let base_w = glyphs.len() * 5 + glyphs.len().saturating_sub(1);
-    let base_h = 7usize;
-    let scale = [2usize, 1usize].into_iter().find(|&candidate| {
-        let half_w = (base_w * candidate) as f64 * 0.5;
-        let half_h = (base_h * candidate) as f64 * 0.5;
-        half_w.hypot(half_h) + 2.0 < hole_radius_px
-    });
-    let Some(scale) = scale else {
-        return;
-    };
+}
 
-    let total_w = base_w * scale;
-    let total_h = base_h * scale;
-    let origin_x = (px_w.saturating_sub(total_w)) / 2;
-    let origin_y = (px_h.saturating_sub(total_h)) / 2;
-    let headline = headline_from_slice(rings);
-    let label_rgb = match headline {
-        Some(_) => Rgb::from_color(
-            palette.allowance_color(headline),
-            Rgb::new(0xee, 0xf1, 0xf5),
-        )
-        .brighten(0.18),
-        None => Rgb::from_color(palette.unknown, Rgb::new(0x5d, 0x65, 0x70)),
-    };
+struct RingRaster {
+    width: usize,
+    height: usize,
+    pixels: Vec<Rgba>,
+}
 
+impl RingRaster {
+    fn render(
+        rings: &[Option<f64>],
+        width: usize,
+        height: usize,
+        bg: Rgb,
+        palette: &TokenBurnPalette,
+    ) -> Self {
+        let rings = if rings.is_empty() { &[None][..] } else { rings };
+        let bands = ring_bands(rings, bg, palette);
+        let glow = !all_rings_unknown(rings);
+        let side = width.min(height).max(1) as f64;
+        let half_w = width as f64 * 0.5;
+        let half_h = height as f64 * 0.5;
+        let inv_half = 2.0 / side;
+        let mut pixels = Vec::with_capacity(width * height);
+        for py in 0..height {
+            let v0 = (py as f64 - half_h) * inv_half;
+            let v1 = ((py + 1) as f64 - half_h) * inv_half;
+            for px in 0..width {
+                let u0 = (px as f64 - half_w) * inv_half;
+                let u1 = ((px + 1) as f64 - half_w) * inv_half;
+                pixels.push(supersample_rgba(u0, v0, u1, v1, &bands, bg, glow));
+            }
+        }
+        let mut raster = Self {
+            width,
+            height,
+            pixels,
+        };
+        raster.stamp_center_label(rings, bg, palette);
+        raster
+    }
+
+    fn rgba_bytes(&self) -> Vec<u8> {
+        self.pixels
+            .iter()
+            .flat_map(|pixel| [pixel.rgb.r, pixel.rgb.g, pixel.rgb.b, pixel.alpha])
+            .collect()
+    }
+
+    fn stamp_center_label(&mut self, rings: &[Option<f64>], bg: Rgb, palette: &TokenBurnPalette) {
+        let glyphs: Vec<[u8; 7]> = ring_center_label(rings)
+            .chars()
+            .filter_map(glyph_5x7)
+            .collect();
+        if glyphs.is_empty() {
+            return;
+        }
+        let hole_norm = if rings.len() > 1 {
+            DUAL_INNER_RADIUS - DUAL_INNER_HALF_STROKE
+        } else {
+            SINGLE_RING_RADIUS - SINGLE_RING_HALF_STROKE
+        };
+        let hole_radius_px = (self.width.min(self.height) as f64 * 0.5) * hole_norm;
+        let base_w = glyphs.len() * 5 + glyphs.len().saturating_sub(1);
+        let base_h = 7usize;
+        let Some(scale) = LABEL_SCALES.into_iter().find(|&candidate| {
+            let half_w = (base_w * candidate) as f64 * 0.5;
+            let half_h = (base_h * candidate) as f64 * 0.5;
+            half_w.hypot(half_h) + 2.0 < hole_radius_px
+        }) else {
+            return;
+        };
+        let mask = label_mask(&glyphs, scale);
+        let total_w = base_w * scale;
+        let total_h = base_h * scale;
+        let origin_x = (self.width.saturating_sub(total_w)) / 2;
+        let origin_y = (self.height.saturating_sub(total_h)) / 2;
+        let label = Rgba {
+            rgb: center_label_rgb(rings, palette),
+            alpha: 255,
+        };
+        for (my, mx) in (0..total_h).flat_map(|my| (0..total_w).map(move |mx| (my, mx))) {
+            if !mask[my * total_w + mx] {
+                continue;
+            }
+            for (oy, ox) in (-1isize..=1).flat_map(|oy| (-1isize..=1).map(move |ox| (oy, ox))) {
+                let px = origin_x as isize + mx as isize + ox;
+                let py = origin_y as isize + my as isize + oy;
+                if px >= 0 && py >= 0 && (px as usize) < self.width && (py as usize) < self.height {
+                    let pixel = &mut self.pixels[py as usize * self.width + px as usize];
+                    pixel.rgb = pixel.rgb.lerp(bg, 0.72);
+                }
+            }
+        }
+        for (my, mx) in (0..total_h).flat_map(|my| (0..total_w).map(move |mx| (my, mx))) {
+            let (px, py) = (origin_x + mx, origin_y + my);
+            if mask[my * total_w + mx] && px < self.width && py < self.height {
+                self.pixels[py * self.width + px] = label;
+            }
+        }
+    }
+}
+
+fn label_mask(glyphs: &[[u8; 7]], scale: usize) -> Vec<bool> {
+    let total_w = (glyphs.len() * 5 + glyphs.len().saturating_sub(1)) * scale;
+    let total_h = 7 * scale;
     let mut mask = vec![false; total_w * total_h];
     for (glyph_index, rows) in glyphs.iter().enumerate() {
         let gx = glyph_index * 6 * scale;
         for (row_idx, &bits) in rows.iter().enumerate() {
-            for col_idx in 0..5usize {
-                if (bits & (1 << (4 - col_idx))) == 0 {
-                    continue;
-                }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let mx = gx + col_idx * scale + dx;
-                        let my = row_idx * scale + dy;
-                        if mx < total_w && my < total_h {
-                            mask[my * total_w + mx] = true;
-                        }
+            for col_idx in (0..5usize).filter(|col| bits & (1 << (4 - col)) != 0) {
+                for (dy, dx) in (0..scale).flat_map(|dy| (0..scale).map(move |dx| (dy, dx))) {
+                    let mx = gx + col_idx * scale + dx;
+                    let my = row_idx * scale + dy;
+                    if mx < total_w && my < total_h {
+                        mask[my * total_w + mx] = true;
                     }
                 }
             }
         }
     }
+    mask
+}
 
-    for my in 0..total_h {
-        for mx in 0..total_w {
-            if !mask[my * total_w + mx] {
-                continue;
-            }
-            for oy in -1isize..=1 {
-                for ox in -1isize..=1 {
-                    let px = origin_x as isize + mx as isize + ox;
-                    let py = origin_y as isize + my as isize + oy;
-                    if px >= 0 && py >= 0 && (px as usize) < px_w && (py as usize) < px_h {
-                        let idx = py as usize * px_w + px as usize;
-                        pixels[idx] = pixels[idx].lerp(bg, 0.72);
-                    }
-                }
-            }
+fn center_label_rgb(rings: &[Option<f64>], palette: &TokenBurnPalette) -> Rgb {
+    match headline_from_slice(rings) {
+        Some(headline) => Rgb::from_color(
+            palette.allowance_color(Some(headline)),
+            Rgb::new(0xee, 0xf1, 0xf5),
+        )
+        .brighten(0.18),
+        None => Rgb::from_color(palette.unknown, Rgb::new(0x5d, 0x65, 0x70)),
+    }
+}
+
+fn supersample_rgba(
+    u0: f64,
+    v0: f64,
+    u1: f64,
+    v1: f64,
+    bands: &[RingBand],
+    bg: Rgb,
+    glow: bool,
+) -> Rgba {
+    let mut sum = [0.0_f64; 3];
+    let mut sum_cov = 0.0_f64;
+    let n = SUPERSAMPLE_GRID as f64;
+    for sy in 0..SUPERSAMPLE_GRID {
+        let v = v0 + ((sy as f64 + 0.5) / n) * (v1 - v0);
+        for sx in 0..SUPERSAMPLE_GRID {
+            let u = u0 + ((sx as f64 + 0.5) / n) * (u1 - u0);
+            let (rgb, cov) = sample_ring_sdf(u, v, bands, bg, glow);
+            sum[0] += f64::from(rgb.r) * cov;
+            sum[1] += f64::from(rgb.g) * cov;
+            sum[2] += f64::from(rgb.b) * cov;
+            sum_cov += cov;
         }
     }
-
-    for my in 0..total_h {
-        for mx in 0..total_w {
-            if mask[my * total_w + mx] {
-                let px = origin_x + mx;
-                let py = origin_y + my;
-                if px < px_w && py < px_h {
-                    pixels[py * px_w + px] = label_rgb;
-                }
-            }
-        }
+    if sum_cov <= f64::EPSILON {
+        return Rgba::TRANSPARENT;
+    }
+    let channel = |value: f64| (value / sum_cov).round().clamp(0.0, 255.0) as u8;
+    Rgba {
+        rgb: Rgb::new(channel(sum[0]), channel(sum[1]), channel(sum[2])),
+        alpha: ((sum_cov / (n * n)) * 255.0).round().clamp(0.0, 255.0) as u8,
     }
 }
 
@@ -941,15 +1050,9 @@ fn build_sixel_palette(
         push_unique_rgb(&mut table, band.fill_rgb.brighten(0.26));
     }
 
-    if let Some(headline) = headline_from_slice(rings) {
-        let label = Rgb::from_color(
-            palette.allowance_color(Some(headline)),
-            Rgb::new(0xee, 0xf1, 0xf5),
-        )
-        .brighten(0.18);
-        for step in [0.45, 0.75, 1.0] {
-            push_unique_rgb(&mut table, bg.lerp(label, step));
-        }
+    let label = center_label_rgb(rings, palette);
+    for step in [0.45, 0.75, 1.0] {
+        push_unique_rgb(&mut table, bg.lerp(label, step));
     }
     table
 }
@@ -995,6 +1098,42 @@ pub fn sixel_pixel_dimensions(
     (px_w, px_h)
 }
 
+pub fn png_pixel_dimensions(
+    width_cells: u16,
+    height_cells: u16,
+    cell_px: (u16, u16),
+) -> (usize, usize) {
+    let base_w = usize::from(width_cells) * usize::from(cell_px.0.max(1));
+    let base_h = usize::from(height_cells) * usize::from(cell_px.1.max(1));
+    let longest = base_w.max(base_h).max(1);
+    let scale = ((PNG_MIN_SIDE_PX + longest / 2) / longest).max(1);
+    (base_w * scale, base_h * scale)
+}
+
+fn surface_rgb(bg: Color, palette: &TokenBurnPalette) -> Rgb {
+    Rgb::from_color(
+        bg,
+        Rgb::from_color(palette.panel, Rgb::new(0x15, 0x18, 0x1e)),
+    )
+}
+
+pub fn encode_ring_png(
+    rings: &[Option<f64>],
+    width_cells: u16,
+    height_cells: u16,
+    cell_px: (u16, u16),
+    bg: Color,
+    palette: &TokenBurnPalette,
+) -> Vec<u8> {
+    let (px_w, px_h) = png_pixel_dimensions(width_cells, height_cells, cell_px);
+    if px_w == 0 || px_h == 0 {
+        return Vec::new();
+    }
+    let raster = RingRaster::render(rings, px_w, px_h, surface_rgb(bg, palette), palette);
+    crate::clipboard::encode_rgba_to_png(px_w as u32, px_h as u32, &raster.rgba_bytes())
+        .unwrap_or_default()
+}
+
 pub fn encode_ring_sixel(
     rings: &[Option<f64>],
     width_cells: u16,
@@ -1008,40 +1147,21 @@ pub fn encode_ring_sixel(
         return String::new();
     }
     let rings = if rings.is_empty() { &[None][..] } else { rings };
-    let bg_rgb = Rgb::from_color(
-        bg,
-        Rgb::from_color(palette.panel, Rgb::new(0x15, 0x18, 0x1e)),
-    );
-    let bands = ring_bands(rings, bg_rgb, palette);
-    let unknown_only = all_rings_unknown(rings);
-    let side = px_w.min(px_h) as f64;
-    let half_w = px_w as f64 * 0.5;
-    let half_h = px_h as f64 * 0.5;
-    let inv_half = 2.0 / side;
-
-    let mut pixels = vec![bg_rgb; px_w * px_h];
-    for py in 0..px_h {
-        let v0 = (py as f64 - half_h) * inv_half;
-        let v1 = ((py + 1) as f64 - half_h) * inv_half;
-        for px in 0..px_w {
-            let u0 = (px as f64 - half_w) * inv_half;
-            let u1 = ((px + 1) as f64 - half_w) * inv_half;
-            let (rgb, _) = supersample_region(u0, v0, u1, v1, &bands, bg_rgb, !unknown_only);
-            pixels[py * px_w + px] = rgb;
-        }
-    }
-
-    stamp_sixel_center_label(&mut pixels, px_w, px_h, rings, bg_rgb, palette);
-
-    let table = build_sixel_palette(&bands, rings, bg_rgb, palette);
-    let indexed: Vec<usize> = pixels
+    let bg_rgb = surface_rgb(bg, palette);
+    let raster = RingRaster::render(rings, px_w, px_h, bg_rgb, palette);
+    let table = build_sixel_palette(&ring_bands(rings, bg_rgb, palette), rings, bg_rgb, palette);
+    let indexed: Vec<usize> = raster
+        .pixels
         .iter()
-        .map(|&pixel| nearest_palette_index(pixel, &table))
+        .map(|&pixel| match pixel.alpha {
+            0 => SIXEL_TRANSPARENT_REGISTER,
+            _ => nearest_palette_index(pixel.over(bg_rgb), &table),
+        })
         .collect();
 
     let mut out = String::with_capacity(px_w * (px_h / SIXEL_BAND_HEIGHT) + 256);
-    out.push_str(&format!("\x1bP0;0;0q\"1;1;{px_w};{px_h}"));
-    for (register, &rgb) in table.iter().enumerate() {
+    out.push_str(&format!("\x1bP0;1;0q\"1;1;{px_w};{px_h}"));
+    for (register, &rgb) in table.iter().enumerate().skip(1) {
         let (r, g, b) = rgb.sixel_percent();
         out.push_str(&format!("#{register};2;{r};{g};{b}"));
     }
@@ -1054,7 +1174,7 @@ pub fn encode_ring_sixel(
         }
         let y_base = band_idx * SIXEL_BAND_HEIGHT;
         let mut first_register = true;
-        for register in 0..table.len() {
+        for register in 1..table.len() {
             let mut last_non_zero = None;
             for (x, slot) in row_masks.iter_mut().enumerate() {
                 let mut mask = 0u8;
@@ -1084,13 +1204,42 @@ pub fn encode_ring_sixel(
                 while x <= end_x && row_masks[x] == value {
                     x += 1;
                 }
-                let ch = char::from(63 + value);
-                push_sixel_rle(&mut out, ch, x - start);
+                push_sixel_rle(&mut out, char::from(63 + value), x - start);
             }
         }
     }
     out.push_str("\x1b\\");
     out
+}
+
+pub fn kitty_transmit_sequence(image_id: u32, png: &[u8], cols: u16, rows: u16) -> String {
+    let encoded = crate::clipboard::base64_encode(png);
+    let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(KITTY_CHUNK_BYTES).collect();
+    let mut out = String::with_capacity(encoded.len() + chunks.len() * 16 + 64);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let more = u8::from(index + 1 < chunks.len());
+        if index == 0 {
+            out.push_str(&format!(
+                "\x1b_Ga=T,f=100,t=d,i={image_id},c={cols},r={rows},C=1,q=2,m={more};"
+            ));
+        } else {
+            out.push_str(&format!("\x1b_Gm={more};"));
+        }
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push_str("\x1b\\");
+    }
+    out
+}
+
+pub fn kitty_delete_sequence(image_id: u32) -> String {
+    format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
+}
+
+pub fn iterm2_inline_sequence(png: &[u8], cols: u16, rows: u16) -> String {
+    format!(
+        "\x1b]1337;File=inline=1;width={cols};height={rows};preserveAspectRatio=1:{}\x07",
+        crate::clipboard::base64_encode(png)
+    )
 }
 
 fn partition_octant_cell(
@@ -1192,8 +1341,7 @@ pub fn octant_ring_lines(
         Rgb::from_color(palette.panel, Rgb::new(0x15, 0x18, 0x1e)),
     );
     let bands = ring_bands(rings, bg_rgb, palette);
-    let unknown_rgb = all_rings_unknown(rings)
-        .then(|| Rgb::from_color(palette.unknown, Rgb::new(0x5d, 0x65, 0x70)));
+    let unknown_rgb = all_rings_unknown(rings).then(|| unknown_track_rgb(bg_rgb, palette));
 
     let sub_cols = (cols * 2) as f64;
     let sub_rows = (rows * 4) as f64;
@@ -1218,8 +1366,8 @@ pub fn octant_ring_lines(
                         Span::styled(" ", Style::default().bg(bg))
                     } else {
                         let ch = octant_char(mask);
-                        let style = if unknown_rgb.is_some() {
-                            Style::default().fg(palette.unknown).bg(bg)
+                        let style = if let Some(muted) = unknown_rgb {
+                            Style::default().fg(muted.to_color()).bg(bg)
                         } else {
                             Style::default()
                                 .fg(fg_rgb.to_color())
@@ -1254,6 +1402,7 @@ pub fn halfblock_ring_lines(
     );
     let bands = ring_bands(rings, bg_rgb, palette);
     let unknown_only = all_rings_unknown(rings);
+    let muted = unknown_track_rgb(bg_rgb, palette).to_color();
 
     let sub_cols = cols as f64;
     let sub_rows = (rows * 2) as f64;
@@ -1276,15 +1425,9 @@ pub fn halfblock_ring_lines(
                         let bot_on = bot_cov >= 0.35;
                         return match (top_on, bot_on) {
                             (false, false) => Span::styled(" ", Style::default().bg(bg)),
-                            (true, false) => {
-                                Span::styled("▀", Style::default().fg(palette.unknown).bg(bg))
-                            }
-                            (false, true) => {
-                                Span::styled("▄", Style::default().fg(palette.unknown).bg(bg))
-                            }
-                            (true, true) => {
-                                Span::styled("█", Style::default().fg(palette.unknown).bg(bg))
-                            }
+                            (true, false) => Span::styled("▀", Style::default().fg(muted).bg(bg)),
+                            (false, true) => Span::styled("▄", Style::default().fg(muted).bg(bg)),
+                            (true, true) => Span::styled("█", Style::default().fg(muted).bg(bg)),
                         };
                     }
                     let top_empty = top_rgb.dist_sq(bg_rgb) <= 18;
@@ -1332,6 +1475,7 @@ pub fn ascii_ring_lines(
     );
     let bands = ring_bands(rings, bg_rgb, palette);
     let unknown_only = all_rings_unknown(rings);
+    let muted = unknown_track_rgb(bg_rgb, palette).to_color();
 
     let mut lines: Vec<Vec<Span<'static>>> = (0..rows)
         .map(|cell_y| {
@@ -1348,7 +1492,11 @@ pub fn ascii_ring_lines(
                         return Span::styled(" ", Style::default().bg(bg));
                     };
                     if unknown_only {
-                        return Span::styled(".", Style::default().fg(palette.unknown).bg(bg));
+                        return if on_unknown_dash(u, v) {
+                            Span::styled(".", Style::default().fg(muted).bg(bg))
+                        } else {
+                            Span::styled(" ", Style::default().bg(bg))
+                        };
                     }
                     let sweep = clockwise_fraction_from_top(u, v);
                     match band.remaining {
@@ -1456,11 +1604,62 @@ impl RingSlot {
         )
     }
 
+    pub fn encode_png(&self, cell_px: (u16, u16)) -> Vec<u8> {
+        encode_ring_png(
+            &self.rings,
+            self.rect.width,
+            self.rect.height,
+            cell_px,
+            self.bg,
+            &self.palette,
+        )
+    }
+
+    pub fn encode_inline(
+        &self,
+        protocol: InlineProtocol,
+        cell_px: (u16, u16),
+        image_id: u32,
+    ) -> String {
+        let (cols, rows) = (self.rect.width, self.rect.height);
+        match protocol {
+            InlineProtocol::Sixel => self.encode_sixel(cell_px),
+            InlineProtocol::Kitty => {
+                let png = self.encode_png(cell_px);
+                if png.is_empty() {
+                    return String::new();
+                }
+                kitty_transmit_sequence(image_id, &png, cols, rows)
+            }
+            InlineProtocol::Iterm2 => {
+                let png = self.encode_png(cell_px);
+                if png.is_empty() {
+                    return String::new();
+                }
+                iterm2_inline_sequence(&png, cols, rows)
+            }
+        }
+    }
+
     pub fn fits_without_scroll(&self, frame_area: Rect) -> bool {
         self.rect.width > 0
             && self.rect.height > 0
             && self.rect.right() <= frame_area.right()
             && self.rect.bottom() < frame_area.bottom()
+    }
+
+    pub fn prepare_cells(&self, buf: &mut Buffer, displayed: bool) {
+        let area = self.rect.intersection(buf.area);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let cell = &mut buf[(x, y)];
+                cell.reset();
+                cell.set_symbol(" ").set_bg(self.bg);
+                if displayed {
+                    cell.set_diff_option(CellDiffOption::Skip);
+                }
+            }
+        }
     }
 }
 
@@ -1476,62 +1675,96 @@ pub fn rect_intersects_any(rect: Rect, overlays: &[Rect]) -> bool {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SixelFrameUpdate {
-    pub needs_sync: bool,
+pub struct InlineFrameUpdate {
+    pub deletes: Vec<String>,
     pub sequences: Vec<(u16, u16, String)>,
 }
 
+impl InlineFrameUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.deletes.is_empty() && self.sequences.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct SixelRingCache {
-    active: Vec<RingCacheKey>,
-    encoded: Vec<String>,
+pub struct InlineRingCache {
+    displayed: Vec<Option<RingCacheKey>>,
+    placed_ids: Vec<u32>,
+    protocol: Option<InlineProtocol>,
     cell_px: (u16, u16),
 }
 
-impl SixelRingCache {
+impl InlineRingCache {
+    pub fn image_id(index: usize) -> u32 {
+        KITTY_IMAGE_ID_BASE + u32::try_from(index).unwrap_or(u32::MAX - KITTY_IMAGE_ID_BASE)
+    }
+
     pub fn clear(&mut self) {
-        self.active.clear();
-        self.encoded.clear();
+        self.displayed.clear();
+    }
+
+    pub fn is_displayed(&self, index: usize, key: &RingCacheKey) -> bool {
+        self.displayed
+            .get(index)
+            .is_some_and(|shown| shown.as_ref() == Some(key))
+    }
+
+    pub fn release(&mut self) -> InlineFrameUpdate {
+        self.displayed.clear();
+        InlineFrameUpdate {
+            deletes: self.take_deletes(|_| true),
+            sequences: Vec::new(),
+        }
     }
 
     pub fn diff_and_encode(
         &mut self,
         slots: &[RingSlot],
+        protocol: InlineProtocol,
         cell_px: (u16, u16),
-        force_redraw: bool,
-    ) -> SixelFrameUpdate {
-        let next_keys: Vec<RingCacheKey> = slots.iter().map(RingSlot::cache_key).collect();
-        let geometry_changed = self.cell_px != cell_px || force_redraw;
-        let unchanged = !geometry_changed && self.active == next_keys;
-        if unchanged {
-            return SixelFrameUpdate::default();
+    ) -> InlineFrameUpdate {
+        if self.protocol != Some(protocol) || self.cell_px != cell_px {
+            self.clear();
+            self.protocol = Some(protocol);
+            self.cell_px = cell_px;
         }
-        let mut next_encoded = Vec::with_capacity(slots.len());
+        let mut next = Vec::with_capacity(slots.len());
         let mut sequences = Vec::new();
-        for (slot, key) in slots.iter().zip(next_keys.iter()) {
-            let cached = (!geometry_changed)
-                .then(|| {
-                    self.active
-                        .iter()
-                        .position(|prev| prev == key)
-                        .and_then(|pos| self.encoded.get(pos).cloned())
-                })
-                .flatten();
-            let payload = cached.unwrap_or_else(|| slot.encode_sixel(cell_px));
-            let changed = geometry_changed || !self.active.contains(key);
-            if changed && !payload.is_empty() {
-                sequences.push((slot.rect.x, slot.rect.y, payload.clone()));
+        let mut retained_ids = Vec::new();
+        for (index, slot) in slots.iter().enumerate() {
+            let key = slot.cache_key();
+            if self.is_displayed(index, &key) {
+                retained_ids.push(Self::image_id(index));
+                next.push(Some(key));
+                continue;
             }
-            next_encoded.push(payload);
+            let payload = slot.encode_inline(protocol, cell_px, Self::image_id(index));
+            if payload.is_empty() {
+                next.push(None);
+                continue;
+            }
+            sequences.push((slot.rect.x, slot.rect.y, payload));
+            next.push(Some(key));
         }
-        let removed_any = self.active.iter().any(|prev| !next_keys.contains(prev));
-        self.active = next_keys;
-        self.encoded = next_encoded;
-        self.cell_px = cell_px;
-        SixelFrameUpdate {
-            needs_sync: removed_any || !sequences.is_empty(),
-            sequences,
+        self.displayed = next;
+        let deletes = self.take_deletes(|id| !retained_ids.contains(&id));
+        if protocol == InlineProtocol::Kitty {
+            self.placed_ids = self
+                .displayed
+                .iter()
+                .enumerate()
+                .filter(|(_, shown)| shown.is_some())
+                .map(|(index, _)| Self::image_id(index))
+                .collect();
         }
+        InlineFrameUpdate { deletes, sequences }
+    }
+
+    fn take_deletes(&mut self, removable: impl Fn(u32) -> bool) -> Vec<String> {
+        let (removed, kept): (Vec<u32>, Vec<u32>) =
+            self.placed_ids.drain(..).partition(|&id| removable(id));
+        self.placed_ids = kept;
+        removed.into_iter().map(kitty_delete_sequence).collect()
     }
 }
 
@@ -2319,38 +2552,23 @@ mod tests {
     fn sixel_encoder_emits_valid_rle_frame_and_keeps_unknown_muted() {
         let p = TokenBurnPalette::default();
         let bg = p.panel;
-        let single = encode_ring_sixel(
-            &[Some(64.0)],
-            RING_CELL_WIDTH,
-            RING_CELL_HEIGHT,
-            (10, 20),
-            bg,
-            &p,
-        );
-        assert!(
-            single.starts_with("\x1bP0;0;0q\"1;1;80;78#0;2;"),
-            "{single}"
-        );
-        assert!(single.ends_with("\x1b\\"));
-        assert!(single.contains('!'));
-        assert_eq!(single.matches('-').count(), 12);
+        let header = "\x1bP0;1;0q\"1;1;80;78#1;2;";
+        let encode = |rings: &[Option<f64>]| {
+            encode_ring_sixel(rings, RING_CELL_WIDTH, RING_CELL_HEIGHT, (10, 20), bg, &p)
+        };
+        for rings in [&[Some(64.0)][..], &[Some(64.0), Some(12.0)], &[None]] {
+            let sixel = encode(rings);
+            assert!(sixel.starts_with(header), "{sixel}");
+            assert!(sixel.ends_with("\x1b\\"));
+            assert!(sixel.contains('!'));
+            assert_eq!(sixel.matches('-').count(), 12);
+            assert!(
+                !sixel.contains("#0"),
+                "register 0 is the transparent background"
+            );
+        }
 
-        let dual = encode_ring_sixel(
-            &[Some(64.0), Some(12.0)],
-            RING_CELL_WIDTH,
-            RING_CELL_HEIGHT,
-            (10, 20),
-            bg,
-            &p,
-        );
-        assert!(dual.starts_with("\x1bP0;0;0q\"1;1;80;78#0;2;"));
-        assert!(dual.ends_with("\x1b\\"));
-        assert_eq!(dual.matches('-').count(), 12);
-
-        let unknown =
-            encode_ring_sixel(&[None], RING_CELL_WIDTH, RING_CELL_HEIGHT, (10, 20), bg, &p);
-        assert!(unknown.starts_with("\x1bP0;0;0q\"1;1;80;78#0;2;"));
-        assert!(unknown.ends_with("\x1b\\"));
+        let unknown = encode(&[None]);
         let healthy_pct = Rgb::from_color(p.healthy, Rgb::new(0, 0, 0)).sixel_percent();
         let depleted_pct = Rgb::from_color(p.depleted, Rgb::new(0, 0, 0)).sixel_percent();
         assert!(!unknown.contains(&format!(
@@ -2361,10 +2579,8 @@ mod tests {
             ";2;{};{};{}",
             depleted_pct.0, depleted_pct.1, depleted_pct.2
         )));
-        assert_eq!(
-            encode_ring_sixel(&[], RING_CELL_WIDTH, RING_CELL_HEIGHT, (10, 20), bg, &p),
-            unknown
-        );
+        assert_eq!(encode(&[]), unknown);
+        assert_ne!(unknown, encode(&[Some(100.0)]));
     }
 
     #[test]
@@ -2405,18 +2621,21 @@ mod tests {
                 cell_px: (10, 20),
                 octants_safe: true,
                 mode: GraphicsMode::Unicode,
+                ..GraphicsCaps::default()
             },
             GraphicsCaps {
                 sixel: false,
                 cell_px: (10, 20),
                 octants_safe: false,
                 mode: GraphicsMode::Unicode,
+                ..GraphicsCaps::default()
             },
             GraphicsCaps {
                 sixel: false,
                 cell_px: (10, 20),
                 octants_safe: false,
                 mode: GraphicsMode::Ascii,
+                ..GraphicsCaps::default()
             },
         ];
 
@@ -2455,11 +2674,26 @@ mod tests {
             let unknown_text = ring_text(&unknown).join("\n");
             assert!(unknown_text.contains("--"), "{caps:?}: {unknown_text}");
             assert!(!unknown_text.contains('0'), "{caps:?}: {unknown_text}");
+            let dim_track =
+                unknown_track_rgb(Rgb::from_color(bg, Rgb::new(0, 0, 0)), &p).to_color();
             for span in unknown.iter().flat_map(|line| &line.spans) {
-                if span.content != " " {
-                    assert_eq!(span.style.fg, Some(p.unknown), "{caps:?}: {span:?}");
+                match span.content.as_ref() {
+                    " " => {}
+                    "-" => assert_eq!(span.style.fg, Some(p.unknown), "{caps:?}: {span:?}"),
+                    _ => assert_eq!(span.style.fg, Some(dim_track), "{caps:?}: {span:?}"),
                 }
             }
+            let painted = |lines: &[Line<'static>]| {
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|span| is_ring_cell_symbol(&span.content))
+                    .count()
+            };
+            assert!(
+                painted(&unknown) < painted(&full_hundred),
+                "{caps:?}: unknown must be a segmented track, not a full ring"
+            );
 
             let dual = ring_lines_for_caps(
                 &[Some(64.0), Some(12.0)],
@@ -2507,8 +2741,10 @@ mod tests {
         let caps = GraphicsCaps {
             sixel: true,
             cell_px: (10, 20),
+            cell_px_measured: true,
             octants_safe: true,
             mode: GraphicsMode::Auto,
+            ..GraphicsCaps::default()
         };
         for width in [20u16, 24, 29] {
             let lines = card.ring_tile_lines_for_caps(width, p.panel, &p, caps);
@@ -2529,23 +2765,220 @@ mod tests {
         assert!(!rect_intersects_any(slot.rect, &[Rect::new(40, 5, 60, 20)]));
         assert!(rect_intersects_any(slot.rect, &[Rect::new(5, 8, 40, 10)]));
 
-        let mut cache = SixelRingCache::default();
-        let first = cache.diff_and_encode(std::slice::from_ref(&slot), (10, 20), false);
-        assert!(first.needs_sync);
+        let mut cache = InlineRingCache::default();
+        assert!(!cache.is_displayed(0, &slot.cache_key()));
+        let first =
+            cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Sixel, (10, 20));
         assert_eq!(first.sequences.len(), 1);
         assert_eq!(first.sequences[0].0, 1);
         assert_eq!(first.sequences[0].1, 6);
+        assert!(first.deletes.is_empty());
+        assert!(cache.is_displayed(0, &slot.cache_key()));
 
-        let idle = cache.diff_and_encode(std::slice::from_ref(&slot), (10, 20), false);
-        assert!(!idle.needs_sync);
-        assert!(idle.sequences.is_empty());
+        let idle =
+            cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Sixel, (10, 20));
+        assert!(idle.is_empty());
 
-        let forced = cache.diff_and_encode(std::slice::from_ref(&slot), (10, 20), true);
-        assert!(forced.needs_sync);
+        cache.clear();
+        assert!(!cache.is_displayed(0, &slot.cache_key()));
+        let forced =
+            cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Sixel, (10, 20));
         assert_eq!(forced.sequences.len(), 1);
 
-        let hidden = cache.diff_and_encode(&[], (10, 20), false);
-        assert!(hidden.needs_sync);
+        let remeasured =
+            cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Sixel, (20, 40));
+        assert_eq!(remeasured.sequences.len(), 1);
+
+        let hidden = cache.diff_and_encode(&[], InlineProtocol::Sixel, (20, 40));
+        assert!(hidden.is_empty());
+        assert!(!cache.is_displayed(0, &slot.cache_key()));
+    }
+
+    fn decode_stored_png(png: &[u8]) -> (usize, usize, Vec<u8>) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let mut offset = 8;
+        let mut size = (0usize, 0usize);
+        let mut zlib = Vec::new();
+        while offset + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+            let kind = &png[offset + 4..offset + 8];
+            let data = &png[offset + 8..offset + 8 + len];
+            if kind == b"IHDR" {
+                size = (
+                    u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize,
+                    u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize,
+                );
+                assert_eq!(data[8], 8, "bit depth");
+                assert_eq!(data[9], 6, "RGBA color type");
+            }
+            if kind == b"IDAT" {
+                zlib.extend_from_slice(data);
+            }
+            offset += 12 + len;
+        }
+        let mut raw = Vec::new();
+        let mut cursor = 2;
+        loop {
+            let last = zlib[cursor] & 1 == 1;
+            let len = u16::from_le_bytes([zlib[cursor + 1], zlib[cursor + 2]]) as usize;
+            raw.extend_from_slice(&zlib[cursor + 5..cursor + 5 + len]);
+            cursor += 5 + len;
+            if last {
+                break;
+            }
+        }
+        let rgba = raw
+            .chunks_exact(size.0 * 4 + 1)
+            .flat_map(|row| {
+                assert_eq!(row[0], 0);
+                row[1..].to_vec()
+            })
+            .collect();
+        (size.0, size.1, rgba)
+    }
+
+    fn ring_pixel_at(raster: &RingRaster, radius_norm: f64, fraction: f64) -> Rgba {
+        let side = raster.width.min(raster.height) as f64;
+        let radius = radius_norm * side * 0.5;
+        let angle = fraction * std::f64::consts::TAU;
+        let x = raster.width as f64 * 0.5 + radius * angle.sin();
+        let y = raster.height as f64 * 0.5 - radius * angle.cos();
+        raster.pixels[y as usize * raster.width + x as usize]
+    }
+
+    #[test]
+    fn png_ring_is_transparent_rgba_sized_for_hidpi_cells() {
+        let p = TokenBurnPalette::default();
+        assert_eq!(png_pixel_dimensions(8, 4, (10, 20)), (160, 160));
+        assert_eq!(png_pixel_dimensions(8, 4, (18, 36)), (144, 144));
+        assert_eq!(png_pixel_dimensions(8, 4, (9, 18)), (144, 144));
+
+        let png = encode_ring_png(&[Some(64.0)], 8, 4, (10, 20), p.panel, &p);
+        let (width, height, rgba) = decode_stored_png(&png);
+        assert_eq!((width, height), (160, 160));
+        let alpha = |x: usize, y: usize| rgba[(y * width + x) * 4 + 3];
+        for (x, y) in [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ] {
+            assert_eq!(alpha(x, y), 0, "corner ({x},{y}) must be transparent");
+        }
+        assert!(rgba.iter().skip(3).step_by(4).any(|&alpha| alpha == 255));
+        assert!(rgba
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .any(|&alpha| alpha > 0 && alpha < 255));
+        assert!(encode_ring_png(&[Some(64.0)], 0, 4, (10, 20), p.panel, &p).is_empty());
+    }
+
+    #[test]
+    fn raster_ring_sweeps_clockwise_from_twelve_with_accurate_coverage() {
+        let p = TokenBurnPalette::default();
+        let bg = Rgb::from_color(p.panel, Rgb::new(0, 0, 0));
+        let probes = [0.125, 0.375, 0.625, 0.875];
+        for (percent, filled) in [(0.0, 0), (25.0, 1), (50.0, 2), (75.0, 3), (100.0, 4)] {
+            let raster = RingRaster::render(&[Some(percent)], 160, 160, bg, &p);
+            let fill = Rgb::from_color(p.allowance_color(Some(percent)), bg);
+            let track = bg.lerp(Rgb::from_color(p.border, bg), 0.78);
+            for (index, fraction) in probes.into_iter().enumerate() {
+                let pixel = ring_pixel_at(&raster, SINGLE_RING_RADIUS, fraction);
+                assert_eq!(pixel.alpha, 255, "{percent}% at {fraction}");
+                let is_fill = pixel.rgb.dist_sq(fill) < pixel.rgb.dist_sq(track);
+                assert_eq!(
+                    is_fill,
+                    index < filled,
+                    "{percent}% at {fraction}: {pixel:?}"
+                );
+            }
+        }
+
+        let dual = RingRaster::render(&[Some(75.0), Some(25.0)], 160, 160, bg, &p);
+        let healthy = Rgb::from_color(p.healthy, bg);
+        let outer_q3 = ring_pixel_at(&dual, DUAL_OUTER_RADIUS, 0.625);
+        let inner_q3 = ring_pixel_at(&dual, DUAL_INNER_RADIUS, 0.625);
+        let inner_q1 = ring_pixel_at(&dual, DUAL_INNER_RADIUS, 0.125);
+        assert!(outer_q3.rgb.dist_sq(healthy) < 6000, "{outer_q3:?}");
+        assert!(inner_q1.rgb.dist_sq(healthy) < 6000, "{inner_q1:?}");
+        assert!(inner_q3.rgb.dist_sq(healthy) > 6000, "{inner_q3:?}");
+    }
+
+    #[test]
+    fn unknown_raster_is_a_dim_segmented_track_distinct_from_full() {
+        let p = TokenBurnPalette::default();
+        let bg = Rgb::from_color(p.panel, Rgb::new(0, 0, 0));
+        let unknown = RingRaster::render(&[None], 160, 160, bg, &p);
+        let full = RingRaster::render(&[Some(100.0)], 160, 160, bg, &p);
+        let opaque = |raster: &RingRaster| raster.pixels.iter().filter(|px| px.alpha > 0).count();
+        assert!(opaque(&unknown) * 10 < opaque(&full) * 7);
+
+        let samples: Vec<u8> = (0..64)
+            .map(|step| {
+                ring_pixel_at(&unknown, SINGLE_RING_RADIUS, (f64::from(step) + 0.5) / 64.0).alpha
+            })
+            .collect();
+        assert!(samples.contains(&0), "dashes need gaps");
+        assert!(samples.contains(&255), "dashes need segments");
+        let dim = unknown_track_rgb(bg, &p);
+        let bright = Rgb::from_color(p.unknown, bg);
+        let segment = (0..64)
+            .map(|step| ring_pixel_at(&unknown, SINGLE_RING_RADIUS, (f64::from(step) + 0.5) / 64.0))
+            .find(|px| px.alpha == 255)
+            .unwrap();
+        assert!(segment.rgb.dist_sq(dim) < segment.rgb.dist_sq(bright));
+        let center = unknown.pixels[80 * 160 + 80 - 6];
+        assert_eq!(center.rgb, Rgb::from_color(p.unknown, bg), "muted -- label");
+    }
+
+    #[test]
+    fn kitty_and_iterm2_sequences_fit_exact_cells_and_kitty_deletes_hidden_ids() {
+        let p = TokenBurnPalette::default();
+        let card = &cards()[0];
+        let slot = card.ring_slot(Rect::new(1, 6, 28, RING_TILE_HEIGHT), p.panel, p);
+        let kitty = slot.encode_inline(InlineProtocol::Kitty, (10, 20), 7100);
+        assert!(
+            kitty.starts_with("\x1b_Ga=T,f=100,t=d,i=7100,c=8,r=4,C=1,q=2,m=1;"),
+            "{}",
+            &kitty[..60]
+        );
+        assert!(kitty.ends_with("\x1b\\"));
+        assert!(kitty.contains("\x1b_Gm=0;"));
+        let iterm = slot.encode_inline(InlineProtocol::Iterm2, (10, 20), 7100);
+        assert!(iterm.starts_with(
+            "\x1b]1337;File=inline=1;width=8;height=4;preserveAspectRatio=1:iVBORw0KGgo"
+        ));
+        assert!(iterm.ends_with('\x07'));
+
+        let mut cache = InlineRingCache::default();
+        let placed =
+            cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Kitty, (10, 20));
+        assert_eq!(placed.sequences.len(), 1);
+        assert!(placed.deletes.is_empty());
+        assert!(cache
+            .diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Kitty, (10, 20))
+            .is_empty());
+
+        let mut changed = slot.clone();
+        changed.rings = vec![Some(10.0)];
+        let replaced = cache.diff_and_encode(
+            std::slice::from_ref(&changed),
+            InlineProtocol::Kitty,
+            (10, 20),
+        );
+        assert_eq!(replaced.deletes, vec![kitty_delete_sequence(7100)]);
+        assert_eq!(replaced.sequences.len(), 1);
+
+        let hidden = cache.diff_and_encode(&[], InlineProtocol::Kitty, (10, 20));
+        assert_eq!(
+            hidden.deletes,
+            vec!["\x1b_Ga=d,d=I,i=7100,q=2\x1b\\".to_owned()]
+        );
         assert!(hidden.sequences.is_empty());
+        assert!(cache.release().is_empty());
+
+        cache.diff_and_encode(std::slice::from_ref(&slot), InlineProtocol::Kitty, (10, 20));
+        assert_eq!(cache.release().deletes, vec![kitty_delete_sequence(7100)]);
     }
 }

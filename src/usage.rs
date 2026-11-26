@@ -17,6 +17,19 @@ const POLL_SECONDS: u64 = 300;
 const STALE_SECONDS: u64 = 900;
 const UNSCHEDULED_RESET: i64 = 0;
 const GEMINI_PROBE_TIMEOUT: Duration = Duration::from_secs(18);
+const CLAUDE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CLAUDE_USAGE_ARGS: [&str; 10] = [
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--strict-mcp-config",
+    "--tools",
+    "",
+    "--",
+    "/usage",
+];
 pub const SHORT_WINDOW_BUFFER_PCT: f64 = 15.0;
 pub const WEEKLY_WINDOW_BUFFER_PCT: f64 = 5.0;
 pub const RESET_TIE_HYSTERESIS_SECS: i64 = 600;
@@ -1019,38 +1032,14 @@ fn refresh_gemini_with(
     now: Tick,
     readback: impl FnOnce(&Profile) -> io::Result<String>,
 ) -> io::Result<Option<Allowance>> {
-    if profile.provider != Provider::Gemini || !Usage::read(profile)?.poll_due(now) {
-        return Ok(None);
-    }
-    let reserved = update(profile, |state| {
-        if !state.poll_due(now) {
-            return Ok(false);
-        }
-        state.probe = Some(Probe {
-            id: uuid::Uuid::new_v4(),
-            started: now.into(),
-        });
-        state.next_poll = None;
-        Ok(true)
-    })?;
-    if !reserved {
+    if profile.provider != Provider::Gemini || !reserve_poll(profile, now)? {
         return Ok(None);
     }
     let result = readback(profile);
     update(profile, |state| match result {
         Ok(output) => {
             let (five, week, limit) = gemini_windows(&output, now);
-            state.five = five.or(state.five);
-            state.week = week.or(state.week);
-            state.unavailable = five.is_none() && week.is_none();
-            if let Some(reset) = limit {
-                state.record_limit(reset, now);
-            } else if (five.is_some() || week.is_some())
-                && (!state.blocked(now) || state.latch == Some(i64::MAX))
-            {
-                state.latch = None;
-            }
-            Ok((five.is_some() || week.is_some() || limit.is_some()).then(|| state.allowance(now)))
+            Ok(apply_polled_windows(state, five, week, limit, now).then(|| state.allowance(now)))
         }
         Err(_) => {
             state.unavailable = true;
@@ -1070,6 +1059,265 @@ fn gemini_readback(profile: &Profile) -> io::Result<String> {
         "15s",
     ]);
     run_with_timeout(&mut command, GEMINI_PROBE_TIMEOUT)
+}
+
+pub fn refresh_claude(profile: &Profile, now: Tick) -> io::Result<Option<Allowance>> {
+    refresh_claude_with(profile, now, claude_readback)
+}
+
+pub(crate) fn refresh_claude_with(
+    profile: &Profile,
+    now: Tick,
+    readback: impl FnOnce(&Profile) -> io::Result<String>,
+) -> io::Result<Option<Allowance>> {
+    if profile.provider != Provider::Claude || !reserve_poll(profile, now)? {
+        return Ok(None);
+    }
+    let report = readback(profile).and_then(|raw| parse_claude_usage(&raw, now));
+    let allowance = update(profile, |state| match &report {
+        Ok(report) => Ok(
+            apply_polled_windows(state, report.five, report.week, report.limit, now)
+                .then(|| state.allowance(now)),
+        ),
+        Err(_) => {
+            state.unavailable = true;
+            Ok(None)
+        }
+    })?;
+    let Ok(report) = report else {
+        return Ok(None);
+    };
+    if report.rate_limit_events.is_empty() {
+        return Ok(allowance);
+    }
+    for event in &report.rate_limit_events {
+        Usage::observe_claude(profile, event, now)?;
+    }
+    Ok(Some(Usage::read(profile)?.allowance(now)))
+}
+
+fn reserve_poll(profile: &Profile, now: Tick) -> io::Result<bool> {
+    if !Usage::read(profile)?.poll_due(now) {
+        return Ok(false);
+    }
+    update(profile, |state| {
+        if !state.poll_due(now) {
+            return Ok(false);
+        }
+        state.probe = Some(Probe {
+            id: uuid::Uuid::new_v4(),
+            started: now.into(),
+        });
+        state.next_poll = None;
+        Ok(true)
+    })
+}
+
+fn apply_polled_windows(
+    state: &mut Usage,
+    five: Option<Window>,
+    week: Option<Window>,
+    limit: Option<Option<i64>>,
+    now: Tick,
+) -> bool {
+    state.five = five.or(state.five);
+    state.week = week.or(state.week);
+    state.unavailable = five.is_none() && week.is_none();
+    if let Some(reset) = limit {
+        state.record_limit(reset, now);
+    } else if (five.is_some() || week.is_some())
+        && (!state.blocked(now) || state.latch == Some(i64::MAX))
+    {
+        state.latch = None;
+    }
+    five.is_some() || week.is_some() || limit.is_some()
+}
+
+fn claude_readback(profile: &Profile) -> io::Result<String> {
+    let mut command = profile.authenticated_command()?;
+    command
+        .current_dir(profile.usage_directory()?)
+        .args(CLAUDE_USAGE_ARGS);
+    run_with_timeout(&mut command, CLAUDE_PROBE_TIMEOUT)
+}
+
+#[derive(Debug, Default)]
+struct ClaudeUsageReport {
+    five: Option<Window>,
+    week: Option<Window>,
+    limit: Option<Option<i64>>,
+    rate_limit_events: Vec<Value>,
+}
+
+fn parse_claude_usage(raw: &str, now: Tick) -> io::Result<ClaudeUsageReport> {
+    let mut parsed = ParsedWindows::default();
+    let mut found_report = false;
+    let mut result_text = None;
+    let mut rate_limit_events = Vec::new();
+    for line in raw.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if event["type"] == "result" {
+            if claude_result_billed(&event) {
+                return Err(io::Error::other("Claude usage readback was billable"));
+            }
+            result_text = event["result"].as_str().map(str::to_owned);
+        }
+        if event["type"] == "rate_limit_event" {
+            rate_limit_events.push(event.clone());
+        }
+        if let Some(limits) = find_usage_report(&event, USAGE_REPORT_SEARCH_DEPTH)
+            .and_then(|report| report["rate_limits"]["limits"].as_array())
+        {
+            found_report = true;
+            for limit in limits {
+                record_claude_limit(&mut parsed, limit, now);
+            }
+        }
+    }
+    if !found_report {
+        if let Some(text) = &result_text {
+            record_claude_usage_text(&mut parsed, text, now);
+        }
+    }
+    let (five, week, limit) = parsed.finish();
+    Ok(ClaudeUsageReport {
+        five,
+        week,
+        limit,
+        rate_limit_events,
+    })
+}
+
+const USAGE_REPORT_SEARCH_DEPTH: usize = 4;
+
+fn claude_result_billed(result: &Value) -> bool {
+    result["num_turns"].as_u64().is_some_and(|turns| turns > 0)
+        || result["total_cost_usd"]
+            .as_f64()
+            .is_some_and(|cost| cost > 0.0)
+}
+
+fn find_usage_report(value: &Value, depth: usize) -> Option<&Value> {
+    if let Some(report) = value
+        .get("usage_report")
+        .filter(|report| report.is_object())
+    {
+        return Some(report);
+    }
+    if depth == 0 {
+        return None;
+    }
+    match value {
+        Value::Object(map) => map
+            .values()
+            .find_map(|child| find_usage_report(child, depth - 1)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_usage_report(child, depth - 1)),
+        _ => None,
+    }
+}
+
+fn classify_claude_label(label: &str) -> Option<UsageBucket> {
+    let lower = label.to_ascii_lowercase();
+    if ["five", "5h", "5-hour", "5_hour", "session"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        Some(UsageBucket::FiveHour)
+    } else if ["week", "seven_day", "7d"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        Some(UsageBucket::Weekly)
+    } else {
+        None
+    }
+}
+
+fn claude_limit_used_percent(limit: &Value) -> Option<f64> {
+    limit["percent"]
+        .as_f64()
+        .or_else(|| limit["used_percent"].as_f64())
+        .or_else(|| {
+            limit["utilization"]
+                .as_f64()
+                .map(|fraction| fraction * 100.0)
+        })
+        .filter(|used| used.is_finite() && *used >= 0.0)
+}
+
+fn claude_limit_reset(limit: &Value) -> Option<i64> {
+    let raw = &limit["resets_at"];
+    raw.as_str()
+        .and_then(|text| parse_rfc3339_utc(text.trim()))
+        .or_else(|| raw.as_i64())
+}
+
+fn record_claude_limit(parsed: &mut ParsedWindows, limit: &Value, now: Tick) {
+    if limit["active"] == false {
+        return;
+    }
+    let label = ["kind", "group", "id", "window"]
+        .iter()
+        .filter_map(|key| limit[*key].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (Some(bucket), Some(used)) = (
+        classify_claude_label(&label),
+        claude_limit_used_percent(limit),
+    ) else {
+        return;
+    };
+    parsed.record(bucket, used, claude_limit_reset(limit), now);
+}
+
+fn record_claude_usage_text(parsed: &mut ParsedWindows, text: &str, now: Tick) {
+    let mut section = None;
+    let mut pending: Option<(UsageBucket, f64)> = None;
+    for line in text.lines() {
+        if let Some(used) = used_percent_in_line(line) {
+            if let Some((bucket, previous)) = pending.take() {
+                parsed.record(bucket, previous, None, now);
+            }
+            if let Some(bucket) = classify_claude_label(line).or(section) {
+                pending = Some((bucket, used));
+            }
+            continue;
+        }
+        if line.to_ascii_lowercase().contains("reset") {
+            if let Some((bucket, used)) = pending.take() {
+                parsed.record(bucket, used, rfc3339_in_line(line), now);
+            }
+            continue;
+        }
+        if let Some(bucket) = classify_claude_label(line) {
+            section = Some(bucket);
+        }
+    }
+    if let Some((bucket, used)) = pending {
+        parsed.record(bucket, used, None, now);
+    }
+}
+
+fn used_percent_in_line(line: &str) -> Option<f64> {
+    let lower = line.to_ascii_lowercase();
+    let marker = lower.find("% used")?;
+    let digits_start = lower[..marker]
+        .rfind(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .map_or(0, |index| index + 1);
+    lower[digits_start..marker]
+        .parse::<f64>()
+        .ok()
+        .filter(|used| used.is_finite())
+}
+
+fn rfc3339_in_line(line: &str) -> Option<i64> {
+    line.split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| matches!(ch, '(' | ')' | ',' | '.' | ';')))
+        .find_map(parse_rfc3339_utc)
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<String> {
@@ -1098,7 +1346,7 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Stri
             }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Gemini usage readback timed out",
+                "usage readback timed out",
             ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1106,13 +1354,12 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Stri
     };
     let bytes = receiver
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| io::Error::other("Gemini usage output unavailable"))??;
+        .map_err(|_| io::Error::other("usage output unavailable"))??;
     let _ = reader.join();
     if !status.success() {
-        return Err(io::Error::other("Gemini usage readback failed"));
+        return Err(io::Error::other("usage readback failed"));
     }
-    String::from_utf8(bytes)
-        .map_err(|_| io::Error::other("Gemini usage readback was not valid UTF-8"))
+    String::from_utf8(bytes).map_err(|_| io::Error::other("usage readback was not valid UTF-8"))
 }
 
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
@@ -1220,21 +1467,21 @@ fn parse_rfc3339_utc(input: &str) -> Option<i64> {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum GeminiBucket {
+enum UsageBucket {
     FiveHour,
     Weekly,
 }
 
 #[derive(Default)]
-struct GeminiParsed {
+struct ParsedWindows {
     five: Option<Window>,
     week: Option<Window>,
     limited: bool,
     exhausted_reset: Option<i64>,
 }
 
-impl GeminiParsed {
-    fn record(&mut self, bucket: GeminiBucket, used: f64, reset: Option<i64>, now: Tick) {
+impl ParsedWindows {
+    fn record(&mut self, bucket: UsageBucket, used: f64, reset: Option<i64>, now: Tick) {
         if !used.is_finite() {
             return;
         }
@@ -1248,8 +1495,8 @@ impl GeminiParsed {
         }
         let parsed = gemini_window(clamped, reset, now);
         match bucket {
-            GeminiBucket::FiveHour => self.five = tighter_window(self.five, parsed),
-            GeminiBucket::Weekly => self.week = tighter_window(self.week, parsed),
+            UsageBucket::FiveHour => self.five = tighter_window(self.five, parsed),
+            UsageBucket::Weekly => self.week = tighter_window(self.week, parsed),
         }
     }
 
@@ -1281,29 +1528,29 @@ fn gemini_window(used: f64, reset: Option<i64>, now: Tick) -> Option<Window> {
     None
 }
 
-fn classify_gemini_json_bucket(bucket: &Value) -> Option<GeminiBucket> {
+fn classify_gemini_json_bucket(bucket: &Value) -> Option<UsageBucket> {
     let id = bucket["id"].as_str();
     let window_kind = bucket["window"].as_str();
     if id.is_some_and(|v| v.eq_ignore_ascii_case("gemini-5h"))
         || window_kind.is_some_and(|v| v.eq_ignore_ascii_case("5h"))
     {
-        Some(GeminiBucket::FiveHour)
+        Some(UsageBucket::FiveHour)
     } else if id.is_some_and(|v| v.eq_ignore_ascii_case("gemini-weekly"))
         || window_kind
             .is_some_and(|v| v.eq_ignore_ascii_case("weekly") || v.eq_ignore_ascii_case("7d"))
     {
-        Some(GeminiBucket::Weekly)
+        Some(UsageBucket::Weekly)
     } else {
         None
     }
 }
 
-fn classify_gemini_tsv_label(label: &str) -> Option<GeminiBucket> {
+fn classify_gemini_tsv_label(label: &str) -> Option<UsageBucket> {
     let lower = label.trim().to_ascii_lowercase();
     if lower.contains("five hour") || lower.contains("5h") {
-        Some(GeminiBucket::FiveHour)
+        Some(UsageBucket::FiveHour)
     } else if lower.contains("weekly") || lower.contains("7d") {
-        Some(GeminiBucket::Weekly)
+        Some(UsageBucket::Weekly)
     } else {
         None
     }
@@ -1313,7 +1560,7 @@ fn gemini_windows_from_groups(
     groups: &[Value],
     now: Tick,
 ) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
-    let mut parsed = GeminiParsed::default();
+    let mut parsed = ParsedWindows::default();
     for group in groups {
         if !group["name"]
             .as_str()
@@ -1346,7 +1593,7 @@ fn gemini_windows_from_tsv(
     tsv: &str,
     now: Tick,
 ) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
-    let mut parsed = GeminiParsed::default();
+    let mut parsed = ParsedWindows::default();
     for line in tsv.lines() {
         let mut columns = line.split('\t');
         let Some(group) = columns.next() else {
@@ -1507,6 +1754,8 @@ pub(crate) mod tests {
     esac
 }"#;
 
+    const CLAUDE_USAGE_PROBE_EXIT: &str = r#"case "$*" in *"-- /usage") exit 0 ;; esac"#;
+
     pub(crate) struct Fixture {
         pub(crate) root: PathBuf,
         pub(crate) executable: PathBuf,
@@ -1517,7 +1766,11 @@ pub(crate) mod tests {
             let root = std::env::temp_dir().join(format!("ac-{name}-{}", std::process::id()));
             fs::create_dir(&root).unwrap();
             let executable = root.join("provider");
-            fs::write(&executable, format!("#!/bin/sh\n{READ_PROMPT}\n{script}")).unwrap();
+            fs::write(
+                &executable,
+                format!("#!/bin/sh\n{CLAUDE_USAGE_PROBE_EXIT}\n{READ_PROMPT}\n{script}"),
+            )
+            .unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             Self { root, executable }
         }
@@ -1855,6 +2108,7 @@ printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","response":"","command"
 #[cfg(test)]
 mod pool_tests {
     use super::*;
+    use serde_json::json;
 
     fn usage_with(
         five_used: f64,
@@ -2704,5 +2958,142 @@ mod pool_tests {
         assert_eq!(calls, 2);
         assert_eq!(recovered.five, Some(82.0));
         assert!(!recovered.stale);
+    }
+
+    fn claude_usage_stream(limits: Value) -> String {
+        [
+            json!({"type": "system", "subtype": "init", "tools": []}),
+            json!({"type": "system", "subtype": "usage_report", "usage_report": {"rate_limits": {"limits": limits}}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 0, "total_cost_usd": 0.0, "result": ""}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    #[test]
+    fn refresh_claude_parses_weekly_only_usage_report() {
+        let temp = TempRoot::new("claude-weekly");
+        let profile = temp.profile(Provider::Claude, "main");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 0);
+        let weekly_reset = parse_rfc3339_utc("2026-12-01T09:00:00Z").unwrap();
+        let stream = claude_usage_stream(json!([
+            {"kind": "weekly_all", "group": "overall", "percent": 38, "resets_at": "2026-12-01T09:00:00Z"},
+            {"kind": "weekly_scoped", "group": "opus", "percent": 12, "resets_at": "2026-12-01T09:00:00Z"}
+        ]));
+        let mut ran_args = Vec::new();
+        let allowance = refresh_claude_with(&profile, now, |_| {
+            ran_args.extend(CLAUDE_USAGE_ARGS.iter().map(|arg| arg.to_string()));
+            Ok(stream)
+        })
+        .unwrap()
+        .expect("weekly allowance");
+        assert_eq!(ran_args.last().map(String::as_str), Some("/usage"));
+        assert!(ran_args.iter().any(|arg| arg == "--no-session-persistence"));
+        assert_eq!(allowance.five, None);
+        assert!((allowance.week.unwrap() - 62.0).abs() < 1e-6);
+        assert_eq!(allowance.reset_in, Some(weekly_reset - now_wall));
+        assert!(!allowance.latched);
+        assert!(!Usage::read(&profile)
+            .unwrap()
+            .poll_due(tick(now_wall + 60, 60)));
+        assert!(refresh_claude_with(&profile, tick(now_wall + 60, 60), |_| {
+            panic!("Claude usage must not be polled before the five-minute cadence")
+        })
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn refresh_claude_parses_five_hour_and_weekly_with_tightest_window() {
+        let temp = TempRoot::new("claude-dual");
+        let profile = temp.profile(Provider::Claude, "main");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 0);
+        let session_reset = parse_rfc3339_utc("2026-11-26T04:30:00Z").unwrap();
+        let stream = claude_usage_stream(json!([
+            {"kind": "session", "group": "5-hour", "percent": 41.5, "resets_at": "2026-11-26T04:30:00Z"},
+            {"kind": "weekly_all", "group": "overall", "percent": 20, "resets_at": "2026-12-01T09:00:00Z"},
+            {"kind": "weekly_scoped", "group": "sonnet", "percent": 27, "resets_at": "2026-12-01T09:00:00Z"}
+        ]));
+        let allowance = refresh_claude_with(&profile, now, |_| Ok(stream))
+            .unwrap()
+            .expect("dual allowance");
+        assert!((allowance.five.unwrap() - 58.5).abs() < 1e-6);
+        assert!((allowance.week.unwrap() - 73.0).abs() < 1e-6);
+        assert_eq!(allowance.reset_in, Some(session_reset - now_wall));
+        assert!(!allowance.latched);
+    }
+
+    #[test]
+    fn refresh_claude_latches_fully_used_window_and_rejects_billable_output() {
+        let temp = TempRoot::new("claude-latched");
+        let profile = temp.profile(Provider::Claude, "main");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 0);
+        let session_reset = parse_rfc3339_utc("2026-11-26T03:15:00Z").unwrap();
+        let stream = claude_usage_stream(json!([
+            {"kind": "five_hour", "group": "session", "percent": 100, "resets_at": "2026-11-26T03:15:00Z"},
+            {"kind": "weekly_all", "group": "overall", "percent": 64, "resets_at": "2026-12-01T09:00:00Z"}
+        ]));
+        let allowance = refresh_claude_with(&profile, now, |_| Ok(stream))
+            .unwrap()
+            .expect("latched allowance");
+        assert!(allowance.latched);
+        assert_eq!(allowance.five, Some(0.0));
+        assert_eq!(allowance.reset_in, Some(session_reset - now_wall));
+        assert!(Usage::read(&profile).unwrap().blocked(now));
+
+        let billed_profile = temp.profile(Provider::Claude, "billed");
+        let billed = [
+            json!({"type": "system", "usage_report": {"rate_limits": {"limits": [
+                {"kind": "weekly_all", "percent": 10, "resets_at": "2026-12-01T09:00:00Z"}
+            ]}}}),
+            json!({"type": "result", "num_turns": 1, "total_cost_usd": 0.02}),
+        ]
+        .map(|event| event.to_string())
+        .join("\n");
+        assert!(refresh_claude_with(&billed_profile, now, |_| Ok(billed))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            Usage::read(&billed_profile).unwrap().allowance(now).week,
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_claude_falls_back_to_result_text_and_rate_limit_events() {
+        let temp = TempRoot::new("claude-text");
+        let profile = temp.profile(Provider::Claude, "main");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 0);
+        let text = "Current session\n  12% used\n  Resets 2026-11-26T05:00:00Z\nCurrent week (all models)\n  30% used\n  Resets 2026-12-01T09:00:00Z\n";
+        let stream = json!({"type": "result", "num_turns": 0, "total_cost_usd": 0, "result": text})
+            .to_string();
+        let allowance = refresh_claude_with(&profile, now, |_| Ok(stream))
+            .unwrap()
+            .expect("text allowance");
+        assert!((allowance.five.unwrap() - 88.0).abs() < 1e-6);
+        assert!((allowance.week.unwrap() - 70.0).abs() < 1e-6);
+
+        let event_profile = temp.profile(Provider::Claude, "events");
+        let event = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.5, "resetsAt": now_wall + 3600}
+                }
+            }
+        })
+        .to_string();
+        let from_event = refresh_claude_with(&event_profile, now, |_| Ok(event))
+            .unwrap()
+            .expect("event allowance");
+        assert_eq!(from_event.five, Some(50.0));
+        assert_eq!(from_event.reset_in, Some(3600));
     }
 }
