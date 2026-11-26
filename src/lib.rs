@@ -590,12 +590,7 @@ impl Live {
         let due: Vec<_> = self
             .profiles
             .iter()
-            .filter(|profile| {
-                matches!(
-                    profile.provider,
-                    auth::Provider::Codex | auth::Provider::Gemini
-                ) && usage::Usage::read(profile).is_ok_and(|usage| usage.poll_due(now))
-            })
+            .filter(|profile| usage::Usage::read(profile).is_ok_and(|usage| usage.poll_due(now)))
             .cloned()
             .collect();
         if !due.is_empty() {
@@ -608,7 +603,9 @@ impl Live {
                         auth::Provider::Gemini => {
                             usage::refresh_gemini(&profile, tick).is_ok_and(|a| a.is_some())
                         }
-                        auth::Provider::Claude => false,
+                        auth::Provider::Claude => {
+                            usage::refresh_claude(&profile, tick).is_ok_and(|a| a.is_some())
+                        }
                     };
                     if refreshed {
                         usage::Usage::sync_peer_accounts(&all_profiles, &profile, tick);
@@ -699,7 +696,8 @@ pub struct App {
     pub(crate) inbox_dismissed: std::collections::HashSet<String>,
     pub(crate) inbox_wakes: Vec<tui::tabs::WakeNote>,
     pub graphics: tui::graphics::GraphicsCaps,
-    pub pending_sixel_rings: Vec<token_burn::RingSlot>,
+    pub pending_graphic_rings: Vec<token_burn::RingSlot>,
+    pub inline_ring_cache: token_burn::InlineRingCache,
     pub decision_cards: Vec<inbox::DecisionCard>,
     pub inbox_filter: tui::tabs::DecisionFilter,
     pub inbox_search: String,
@@ -803,7 +801,8 @@ impl Default for App {
             inbox_dismissed: std::collections::HashSet::new(),
             inbox_wakes: Vec::new(),
             graphics: tui::graphics::GraphicsCaps::default(),
-            pending_sixel_rings: Vec::new(),
+            pending_graphic_rings: Vec::new(),
+            inline_ring_cache: token_burn::InlineRingCache::default(),
             decision_cards: Vec::new(),
             inbox_filter: tui::tabs::DecisionFilter::default(),
             inbox_search: String::new(),
@@ -4983,6 +4982,34 @@ esac
         assert_eq!(app.top_bar_quota_badge().as_deref(), Some("7d 0%"));
         assert!(app.live.as_ref().unwrap().allowances[0].latched);
         assert!(!app.live.as_ref().unwrap().allowances[1].latched);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refresh_usage_schedules_claude_usage_poll_when_due() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-claude-async-usage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude = auth::Profile::new(root, auth::Provider::Claude, "main")
+            .unwrap()
+            .without_provider();
+        claude.prepare().unwrap();
+        assert!(usage::Usage::read(&claude).unwrap().poll_due(usage::now()));
+
+        let mut live = Live::new(workspace, vec![claude.clone()], None);
+        live.refresh_usage();
+        let worker = live
+            .usage_worker
+            .take()
+            .expect("Claude usage poll scheduled");
+        worker.join().unwrap();
+
+        assert!(!usage::Usage::read(&claude).unwrap().poll_due(usage::now()));
 
         let _ = fs::remove_dir_all(&base);
     }

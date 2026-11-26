@@ -4,7 +4,7 @@ use agent_command::{
     auth::{Profile, Provider},
     markdown::{ToolKind, TranscriptEntry},
     tui::{
-        graphics::GraphicsMode,
+        graphics::{GraphicsMode, InlineProtocol},
         tabs::{VaultModalMode, VaultModalState},
     },
     update::{self, UpdateState},
@@ -566,8 +566,25 @@ fn composer_image_chip_and_vault_modal_render_safely_at_80x24_and_120x40() {
     assert!(app.editing);
 }
 
+fn mark_graphics_displayed(app: &mut App) {
+    let slots = app.pending_graphic_rings.clone();
+    let cell_px = app.graphics.cell_px;
+    app.inline_ring_cache
+        .diff_and_encode(&slots, InlineProtocol::Sixel, cell_px);
+}
+
 #[test]
-fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
+fn sixel_auto_needs_measured_cell_pixels_before_queuing_rings() {
+    let mut app = App::default();
+    app.graphics.sixel = true;
+    app.graphics.mode = GraphicsMode::Auto;
+    assert!(!app.graphics.use_inline_graphics());
+    app.graphics.cell_px_measured = true;
+    assert!(app.graphics.use_inline_graphics());
+}
+
+#[test]
+fn sixel_ring_cells_paint_first_then_skip_and_repaint_when_overlays_open() {
     let root = env::temp_dir().join(format!(
         "agent-command-sixel-layout-{}",
         uuid::Uuid::new_v4().simple()
@@ -594,23 +611,24 @@ fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
     app.graphics.sixel = false;
     app.graphics.mode = GraphicsMode::Auto;
     let no_sixel_buf = render(&mut app, 120, 40);
-    assert!(app.pending_sixel_rings.is_empty());
+    assert!(app.pending_graphic_rings.is_empty());
 
     app.graphics.sixel = true;
+    app.graphics.cell_px_measured = true;
     let _ = render(&mut app, 80, 24);
     assert!(
-        app.pending_sixel_rings.is_empty(),
+        app.pending_graphic_rings.is_empty(),
         "narrow 80x24 layout hides left panel and must not queue Sixel rings"
     );
 
     let wide_buf = render(&mut app, 120, 40);
     assert!(
-        !app.pending_sixel_rings.is_empty(),
+        !app.pending_graphic_rings.is_empty(),
         "120x40 layout with Sixel enabled must queue ring slots"
     );
-    let ring_rect = app.pending_sixel_rings[0].rect;
+    let ring_rect = app.pending_graphic_rings[0].rect;
     assert!(
-        app.pending_sixel_rings
+        app.pending_graphic_rings
             .iter()
             .all(|slot| slot.fits_without_scroll(Rect::new(0, 0, 120, 40))),
         "all Sixel ring slots must fit without scrolling"
@@ -624,8 +642,20 @@ fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
         for x in ring_rect.x..ring_rect.right() {
             assert_eq!(
                 wide_buf[(x, y)].bg,
+                app.ui_palette.surface,
+                "newly placed ring cell ({x},{y}) must paint the surface before the graphic"
+            );
+            assert_eq!(wide_buf[(x, y)].symbol(), " ");
+        }
+    }
+    mark_graphics_displayed(&mut app);
+    let steady_buf = render(&mut app, 120, 40);
+    for y in ring_rect.y..ring_rect.bottom() {
+        for x in ring_rect.x..ring_rect.right() {
+            assert_eq!(
+                steady_buf[(x, y)].bg,
                 Color::Reset,
-                "unobstructed Sixel ring cell ({x},{y}) must be skipped during Terminal flush"
+                "displayed ring cell ({x},{y}) must be skipped on steady-state frames"
             );
         }
     }
@@ -638,8 +668,9 @@ fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
     app.open_diff_viewer(None);
     assert!(app.diff_modal.is_open());
     let occluded_buf = render(&mut app, 120, 40);
+    mark_graphics_displayed(&mut app);
     assert!(
-        app.pending_sixel_rings.is_empty(),
+        app.pending_graphic_rings.is_empty(),
         "Diff overlay covering left panel must occlude pending Sixel rings"
     );
     for y in ring_rect.y..ring_rect.bottom() {
@@ -656,17 +687,24 @@ fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
     assert!(!app.diff_modal.is_open());
     let resumed_buf = render(&mut app, 120, 40);
     assert!(
-        !app.pending_sixel_rings.is_empty(),
+        !app.pending_graphic_rings.is_empty(),
         "Sixel rings must resume once Diff overlay closes"
     );
-    assert_eq!(resumed_buf[(ring_rect.x, ring_rect.y)].bg, Color::Reset);
+    assert_eq!(
+        resumed_buf[(ring_rect.x, ring_rect.y)].bg,
+        app.ui_palette.surface,
+        "uncovered ring must repaint the surface before the graphic returns"
+    );
+    mark_graphics_displayed(&mut app);
+    let resumed_steady = render(&mut app, 120, 40);
+    assert_eq!(resumed_steady[(ring_rect.x, ring_rect.y)].bg, Color::Reset);
 
     let settings_btn = app.settings_area;
     click_center(&mut app, settings_btn, 120, 40);
     assert!(app.panel_open());
     let settings_buf = render(&mut app, 120, 40);
     assert!(
-        app.pending_sixel_rings.is_empty(),
+        app.pending_graphic_rings.is_empty(),
         "Settings overlay must occlude all pending Sixel rings"
     );
     for y in ring_rect.y..ring_rect.bottom() {
@@ -683,7 +721,7 @@ fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
     assert!(!app.panel_open());
     let final_buf = render(&mut app, 120, 40);
     assert!(
-        !app.pending_sixel_rings.is_empty(),
+        !app.pending_graphic_rings.is_empty(),
         "Sixel rings must resume once Settings overlay closes"
     );
     assert_eq!(final_buf[(ring_rect.x, ring_rect.y)].bg, Color::Reset);

@@ -3,7 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{parse_terminal_probe_reply, probe_reply_complete, ProbeReply, CAPABILITY_QUERY};
+use super::{
+    parse_terminal_probe_reply, probe_reply_complete, ProbeReply, WindowMetrics, CAPABILITY_QUERY,
+};
 
 const MAX_PROBE_BYTES: usize = 512;
 
@@ -88,4 +90,17 @@ pub(super) fn probe_da1_and_cell_px(timeout: Duration) -> Option<ProbeReply> {
     } else {
         Some(parse_terminal_probe_reply(&response))
     }
+}
+
+pub(super) fn window_metrics() -> Option<WindowMetrics> {
+    let mut size: libc::winsize = unsafe { zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return None;
+    }
+    Some(WindowMetrics {
+        cols: size.ws_col,
+        rows: size.ws_row,
+        width_px: size.ws_xpixel,
+        height_px: size.ws_ypixel,
+    })
 }

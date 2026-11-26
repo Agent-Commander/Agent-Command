@@ -3973,8 +3973,9 @@ mod tests {
     }
 
     #[test]
-    fn right_rail_shows_bot_badges_hides_decommissioned_and_sixel_occlusion_skips_cells() {
-        use ratatui::{backend::TestBackend, Terminal};
+    fn right_rail_shows_bot_badges_and_graphic_slots_paint_before_skipping() {
+        use crate::tui::graphics::InlineProtocol;
+        use ratatui::{backend::TestBackend, buffer::CellDiffOption, Terminal};
 
         let root =
             std::env::temp_dir().join(format!("ac-wave2c-sixel-{}", uuid::Uuid::new_v4().simple()));
@@ -3996,6 +3997,7 @@ mod tests {
             ..App::default()
         };
         app.graphics.sixel = true;
+        app.graphics.cell_px_measured = true;
         app.crew
             .push(specialists::Member::new("scout", "Research", None, None));
         app.crew.push(specialists::Member::new(
@@ -4023,17 +4025,84 @@ mod tests {
         assert!(!rail.contains("retired-bot"), "{rail}");
 
         assert!(
-            !app.pending_sixel_rings.is_empty(),
+            !app.pending_graphic_rings.is_empty(),
             "expected Sixel ring slot in left usage deck"
         );
-        let slot = app.pending_sixel_rings[0].rect;
+        let slot = app.pending_graphic_rings[0].rect;
         assert!(slot.bottom() < 40);
+        let surface = app.ui_palette.surface;
+        let slot_cells = |buf: &ratatui::buffer::Buffer| -> Vec<(String, ratatui::style::Color, CellDiffOption)> {
+            (slot.y..slot.bottom())
+                .flat_map(|y| (slot.x..slot.right()).map(move |x| (x, y)))
+                .map(|pos| {
+                    let cell = &buf[pos];
+                    (cell.symbol().to_owned(), cell.bg, cell.diff_option)
+                })
+                .collect()
+        };
+        let painted = |cells: &[(String, ratatui::style::Color, CellDiffOption)]| {
+            cells.iter().all(|(symbol, bg, diff)| {
+                symbol == " " && *bg == surface && *diff == CellDiffOption::None
+            })
+        };
+
+        let mut frame_buffer = terminal.draw(|f| app.draw(f)).unwrap().buffer.clone();
+        assert!(
+            painted(&slot_cells(&frame_buffer)),
+            "first frame paints surface"
+        );
+        let update = app.inline_ring_cache.diff_and_encode(
+            &app.pending_graphic_rings,
+            InlineProtocol::Sixel,
+            app.graphics.cell_px,
+        );
+        assert_eq!(update.sequences.len(), 1);
+
+        frame_buffer = terminal.draw(|f| app.draw(f)).unwrap().buffer.clone();
+        assert!(
+            slot_cells(&frame_buffer)
+                .iter()
+                .all(|(_, _, diff)| *diff == CellDiffOption::Skip),
+            "steady-state frame skips displayed slot"
+        );
+        assert!(app
+            .inline_ring_cache
+            .diff_and_encode(
+                &app.pending_graphic_rings,
+                InlineProtocol::Sixel,
+                app.graphics.cell_px,
+            )
+            .is_empty());
+
+        app.inline_ring_cache.clear();
+        frame_buffer = terminal.draw(|f| app.draw(f)).unwrap().buffer.clone();
+        assert!(
+            painted(&slot_cells(&frame_buffer)),
+            "redraw repaints surface"
+        );
+        app.inline_ring_cache.diff_and_encode(
+            &app.pending_graphic_rings,
+            InlineProtocol::Sixel,
+            app.graphics.cell_px,
+        );
 
         app.open_settings();
-        terminal.draw(|f| app.draw(f)).unwrap();
+        frame_buffer = terminal.draw(|f| app.draw(f)).unwrap().buffer.clone();
         assert!(
-            app.pending_sixel_rings.is_empty(),
-            "panel overlay must occlude Sixel ring slots"
+            app.pending_graphic_rings.is_empty(),
+            "panel overlay must occlude graphic ring slots"
+        );
+        assert!(slot_cells(&frame_buffer)
+            .iter()
+            .all(|(_, _, diff)| *diff == CellDiffOption::None));
+        app.inline_ring_cache
+            .diff_and_encode(&[], InlineProtocol::Sixel, app.graphics.cell_px);
+
+        app.panel = None;
+        frame_buffer = terminal.draw(|f| app.draw(f)).unwrap().buffer.clone();
+        assert!(
+            painted(&slot_cells(&frame_buffer)),
+            "uncovered slot repaints"
         );
 
         let _ = std::fs::remove_dir_all(&root);
