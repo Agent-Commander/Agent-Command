@@ -8,7 +8,7 @@ use std::{
 pub(crate) const SCORED_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
-const GEMINI_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
+const GEMINI_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const CLAUDE_ROLLING_ALIASES: [&str; 6] =
     ["default", "best", "opus", "sonnet", "haiku", "opusplan"];
 const ROLLING_SUFFIX: &str = "-latest";
@@ -365,11 +365,22 @@ mod tests {
             identity(Provider::Claude, "claude-opus-5-5", None),
             Some(("claude-opus-5-5".into(), "claude-opus-5-5".into()))
         );
+        assert_eq!(
+            identity(Provider::Gemini, "gemini-3.8-flash", Some("xhigh")),
+            Some(("gemini-3-8-flash".into(), "gemini-3-8-flash-xhigh".into()))
+        );
+        assert_eq!(
+            identity(Provider::Gemini, "gemini-3.8-flash", None),
+            Some(("gemini-3-8-flash".into(), "gemini-3-8-flash".into()))
+        );
         for effort in ["low", "medium", "high", "xhigh"] {
             assert!(identity(Provider::Codex, "gpt-reserve", Some(effort)).is_some());
+            assert!(identity(Provider::Gemini, "gemini-3.8-flash", Some(effort)).is_some());
         }
         for (provider, model, effort) in [
             (Provider::Claude, "claude-opus-5-5", Some("max")),
+            (Provider::Gemini, "gemini-3.8-flash", Some("max")),
+            (Provider::Gemini, "gemini-3.8-flash", Some("minimal")),
             (Provider::Codex, "gpt-6.2-sol", Some("minimal")),
             (Provider::Codex, "gpt-6.2-sol", Some("ultra")),
             (Provider::Claude, "opus", None),
@@ -449,9 +460,13 @@ mod tests {
             .unwrap();
         pins.set(pin("codex/work", "gpt-6.2-sol", Some("minimal")))
             .unwrap();
+        pins.set(pin("gemini/work", "gemini-3.8-flash", Some("xhigh")))
+            .unwrap();
+        pins.set(pin("gemini/work", "gemini-3.8-flash", Some("max")))
+            .unwrap();
         pins.set(pin("claude/work", "claude-opus-5-5", None))
             .unwrap();
-        assert_eq!(pins.iter().count(), 2);
+        assert_eq!(pins.iter().count(), 3);
         assert_eq!(
             pins.get("claude/work").unwrap().label(),
             "claude-opus-5-5 AA default setting"
@@ -464,6 +479,8 @@ mod tests {
             pin("codex/work", "gpt-6.2-sol", Some("max")),
             pin("codex/work", "GPT-6.2", None),
             pin("gemini/work", "claude-opus-5-5", None),
+            pin("gemini/work", "gemini-3.8-flash", Some("minimal")),
+            pin("gemini/work", "gemini-3.8-flash", Some("ultra")),
             pin("claude/work", "claude-opus-5-5-high", None),
             pin("codex/work", "gpt-6.2-sol-high", None),
         ] {

@@ -4,15 +4,14 @@ use std::{ffi::OsString, path::PathBuf};
 pub(crate) const CLAUDE_DOCS: &str = "https://code.claude.com/docs/en/setup";
 pub(crate) const CODEX_DOCS: &str =
     "https://github.com/openai/codex#installing-and-running-codex-cli";
-pub(crate) const GEMINI_DOCS: &str = "https://github.com/google-gemini/gemini-cli#quickstart";
+pub(crate) const GEMINI_DOCS: &str = "https://antigravity.google/docs/getting-started";
 
 const CLAUDE_UNIX: &str = "curl -fsSL https://claude.ai/install.sh | bash";
 const CLAUDE_WINDOWS: &str = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_UNIX: &str = "curl -fsSL https://chatgpt.com/codex/install.sh | sh";
 const CODEX_WINDOWS: &str = "irm https://chatgpt.com/codex/install.ps1 | iex";
-const GEMINI_UNIX: &str = "npm install --prefix \"$HOME/.local\" @google/gemini-cli";
-const GEMINI_WINDOWS: &str =
-    "npm install --prefix \"$env:LOCALAPPDATA\\Programs\\GeminiCLI\" @google/gemini-cli";
+const GEMINI_UNIX: &str = "curl -fsSL https://antigravity.google/cli/install.sh | bash";
+const GEMINI_WINDOWS: &str = "irm https://antigravity.google/cli/install.ps1 | iex";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Platform {
@@ -51,7 +50,7 @@ pub(crate) fn plan(provider: Provider, platform: Platform) -> Plan {
     match (provider, platform) {
         (Provider::Claude, Platform::Unix) => shell_plan(provider, CLAUDE_UNIX, &["curl", "bash"]),
         (Provider::Codex, Platform::Unix) => shell_plan(provider, CODEX_UNIX, &["curl", "sh"]),
-        (Provider::Gemini, Platform::Unix) => shell_plan(provider, GEMINI_UNIX, &["npm", "sh"]),
+        (Provider::Gemini, Platform::Unix) => shell_plan(provider, GEMINI_UNIX, &["curl", "bash"]),
         (Provider::Claude, Platform::Windows) => {
             powershell_plan(provider, vec!["-NoProfile", "-Command", CLAUDE_WINDOWS])
         }
@@ -136,16 +135,9 @@ pub(crate) fn documented_executable(
             )
         })?,
         (Provider::Gemini, Platform::Unix) => absolute("HOME")?.join(".local").join("bin"),
-        (Provider::Gemini, Platform::Windows) => {
-            return Some(
-                absolute("LOCALAPPDATA")?
-                    .join("Programs")
-                    .join("GeminiCLI")
-                    .join("gemini.cmd"),
-            );
-        }
+        (Provider::Gemini, Platform::Windows) => absolute("LOCALAPPDATA")?.join("agy").join("bin"),
     };
-    Some(directory.join(platform.executable(provider.binary())))
+    Some(directory.join(platform.executable(provider.executable())))
 }
 
 #[cfg(test)]
@@ -190,6 +182,13 @@ mod tests {
             "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
         );
         assert_eq!(codex.docs, CODEX_DOCS);
+        let gemini = plan(Provider::Gemini, Platform::Unix);
+        assert_eq!(
+            gemini.command,
+            "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+        );
+        assert_eq!(gemini.needs, ["curl", "bash"]);
+        assert_eq!(gemini.docs, GEMINI_DOCS);
     }
 
     #[test]
@@ -206,6 +205,14 @@ mod tests {
         );
         assert_eq!(codex.program, "powershell");
         assert_eq!(codex.arguments.last(), Some(&CODEX_WINDOWS));
+        let gemini = plan(Provider::Gemini, Platform::Windows);
+        assert_eq!(
+            gemini.command,
+            "powershell -NoProfile -Command \"irm https://antigravity.google/cli/install.ps1 | iex\""
+        );
+        assert_eq!(gemini.program, "powershell");
+        assert_eq!(gemini.arguments.last(), Some(&GEMINI_WINDOWS));
+        assert_eq!(gemini.docs, GEMINI_DOCS);
     }
 
     #[test]
@@ -239,6 +246,10 @@ mod tests {
             documented_executable(Provider::Codex, Platform::Unix, &unix).unwrap(),
             Path::new(&home).join(".local").join("bin").join("codex")
         );
+        assert_eq!(
+            documented_executable(Provider::Gemini, Platform::Unix, &unix).unwrap(),
+            Path::new(&home).join(".local").join("bin").join("agy")
+        );
         let custom = absolute("/opt/pilot/codex");
         let chosen = lookup(&[("HOME", &home), ("CODEX_INSTALL_DIR", &custom)]);
         assert_eq!(
@@ -263,6 +274,10 @@ mod tests {
                 .join("Codex")
                 .join("bin")
                 .join("codex.exe")
+        );
+        assert_eq!(
+            documented_executable(Provider::Gemini, Platform::Windows, &windows).unwrap(),
+            Path::new(&local).join("agy").join("bin").join("agy.exe")
         );
     }
 

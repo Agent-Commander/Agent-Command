@@ -292,6 +292,9 @@ fn annotate_usage_tile(
         return;
     };
 
+    let has_five = token_burn::clamp_percent(allowance.five).is_some();
+    let has_week = token_burn::clamp_percent(allowance.week).is_some();
+
     if profile.provider == crate::auth::Provider::Gemini {
         if allowance.latched {
             let label = match (dual, allowance.reset_in.is_none()) {
@@ -305,7 +308,7 @@ fn annotate_usage_tile(
             *last = token_burn::fit_line(spans, max_width);
             return;
         }
-        if allowance.five.is_none() && allowance.week.is_none() {
+        if !has_five && !has_week {
             let mut spans = std::mem::take(&mut last.spans);
             spans.push(styled("no CLI quota", palette.subtle, bg));
             *last = token_burn::fit_line(spans, max_width);
@@ -325,12 +328,12 @@ fn annotate_usage_tile(
         return;
     }
 
-    if allowance.stale && (allowance.five.is_some() || allowance.week.is_some()) {
+    if allowance.stale && (has_five || has_week) {
         let mut spans = std::mem::take(&mut last.spans);
         if dual {
             spans.push(styled(" · stale", palette.subtle, bg));
         } else {
-            let label = match (allowance.five.is_some(), allowance.week.is_some()) {
+            let label = match (has_five, has_week) {
                 (false, true) => "7d · stale",
                 (true, false) => "5h · stale",
                 _ => "stale",
@@ -342,7 +345,7 @@ fn annotate_usage_tile(
     }
 
     if !dual {
-        let window_label = match (allowance.five.is_some(), allowance.week.is_some()) {
+        let window_label = match (has_five, has_week) {
             (false, true) => Some("7d window"),
             (true, false) => Some("5h window"),
             _ => None,

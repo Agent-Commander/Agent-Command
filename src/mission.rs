@@ -573,6 +573,16 @@ pub fn claude_user_turn_json(prompt: &str) -> String {
     .to_string()
 }
 
+fn agy_user_turn_json(prompt: &str) -> String {
+    json!({
+        "event": "user",
+        "message": {
+            "content": prompt
+        }
+    })
+    .to_string()
+}
+
 pub fn claude_interrupt_request_json(request_id: &str) -> String {
     json!({
         "type": "control_request",
@@ -715,16 +725,82 @@ pub fn build_provider_arguments(
                 .map(str::to_owned)
                 .collect();
             if let Some(session_id) = &options.resume_session {
-                args.extend(["--resume".to_owned(), session_id.clone()]);
+                args.extend(["--conversation".to_owned(), session_id.clone()]);
             }
             args.extend(options.extra_args.iter().cloned());
-            args.extend(["-p".to_owned(), String::new()]);
-            args
+            merge_agy_settings_args(args)
         }
     }
 }
 
-const BENIGN_STDERR_WARNINGS: [&str; 11] = [
+fn merge_json_value(base: &mut Value, incoming: Value) {
+    match (base, incoming) {
+        (Value::Object(base_map), Value::Object(in_map)) => {
+            for (key, value) in in_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_json_value(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Array(base_arr), Value::Array(in_arr)) => {
+            for item in in_arr {
+                if !base_arr.contains(&item) {
+                    base_arr.push(item);
+                }
+            }
+        }
+        (slot, value) => {
+            *slot = value;
+        }
+    }
+}
+
+fn merge_agy_settings_args(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut merged_slot: Option<usize> = None;
+    let mut merged_value: Option<Value> = None;
+    let mut merged_count = 0usize;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let settings_raw = if arg == "--settings" {
+            iter.next()
+        } else {
+            arg.strip_prefix("--settings=").map(str::to_owned)
+        };
+        if let Some(raw) = settings_raw {
+            if let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(&raw) {
+                merged_count += 1;
+                match merged_value.as_mut() {
+                    Some(existing) => merge_json_value(existing, parsed),
+                    None => {
+                        merged_slot = Some(out.len());
+                        out.push("--settings".to_owned());
+                        out.push(raw);
+                        merged_value = Some(parsed);
+                    }
+                }
+            } else if arg == "--settings" {
+                out.push(arg);
+                out.push(raw);
+            } else {
+                out.push(arg);
+            }
+        } else {
+            out.push(arg);
+        }
+    }
+    if merged_count > 1 {
+        if let (Some(slot), Some(value)) = (merged_slot, merged_value) {
+            out[slot + 1] = value.to_string();
+        }
+    }
+    out
+}
+
+const BENIGN_STDERR_WARNINGS: [&str; 13] = [
     "warning: 256-color support not detected",
     "warning: true color (24-bit) support not detected",
     "warning: basic terminal detected",
@@ -732,6 +808,8 @@ const BENIGN_STDERR_WARNINGS: [&str; 11] = [
     "warning: windows 10 detected",
     "warning: gnu screen detected",
     "warning: jetbrains terminal detected",
+    "warning: --mode auto is not available",
+    "warning: --mode plan has no effect",
     "ripgrep is not available",
     "experimentalwarning:",
     "deprecationwarning:",
@@ -874,11 +952,23 @@ pub fn classify_tool_kind(tool_name: &str) -> ToolKind {
         "bash" | "shell" | "execute" | "command_execution" | "run_command"
         | "run_shell_command" => ToolKind::Shell,
         "read" | "read_file" | "view_file" | "cat" => ToolKind::Read,
-        "edit" | "edit_file" | "multiedit" | "patch" | "replace_file_content" => ToolKind::Edit,
-        "write" | "write_file" | "notebookedit" | "create_file" => ToolKind::Write,
-        "glob" | "grep" | "ls" | "find" | "search" | "ripgrep" | "list_dir" => ToolKind::Search,
-        "webfetch" | "websearch" | "web_search" | "fetch" => ToolKind::Web,
-        "task" | "agent" | "subagent" | "spawn_worker" | "collab_tool_call" => ToolKind::Subagent,
+        "edit"
+        | "edit_file"
+        | "multiedit"
+        | "patch"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "sed_file" => ToolKind::Edit,
+        "write" | "write_file" | "write_to_file" | "notebookedit" | "notebook_edit"
+        | "create_file" => ToolKind::Write,
+        "glob" | "grep" | "grep_search" | "ls" | "find" | "find_by_name" | "search" | "ripgrep"
+        | "list_dir" => ToolKind::Search,
+        "webfetch" | "websearch" | "web_search" | "search_web" | "read_url_content" | "fetch" => {
+            ToolKind::Web
+        }
+        "task" | "agent" | "subagent" | "spawn_worker" | "collab_tool_call" | "invoke_subagent" => {
+            ToolKind::Subagent
+        }
         "todowrite" | "todo_list" => ToolKind::Todo,
         name if name.starts_with("mcp__") || name.contains("mcp") => ToolKind::Mcp,
         _ => ToolKind::Generic,
@@ -886,7 +976,21 @@ pub fn classify_tool_kind(tool_name: &str) -> ToolKind {
 }
 
 fn tool_resource(tool_name: &str, input: &Value) -> String {
-    for key in ["command", "file_path", "path", "url", "pattern", "query"] {
+    for key in [
+        "command",
+        "CommandLine",
+        "file_path",
+        "TargetFile",
+        "AbsolutePath",
+        "path",
+        "DirectoryPath",
+        "url",
+        "Url",
+        "pattern",
+        "Pattern",
+        "query",
+        "Query",
+    ] {
         if let Some(val) = input.get(key).and_then(Value::as_str) {
             return val.to_owned();
         }
@@ -897,13 +1001,20 @@ fn tool_resource(tool_name: &str, input: &Value) -> String {
 fn summarize_tool(name: &str, input: &Value) -> String {
     for key in [
         "command",
+        "CommandLine",
         "cmd",
         "file_path",
+        "TargetFile",
+        "AbsolutePath",
         "path",
+        "DirectoryPath",
         "notebook_path",
         "pattern",
+        "Pattern",
         "query",
+        "Query",
         "url",
+        "Url",
         "description",
     ] {
         if let Some(val) = input.get(key).and_then(Value::as_str) {
@@ -920,13 +1031,20 @@ fn summarize_tool(name: &str, input: &Value) -> String {
 fn summarize_partial_tool_json(name: &str, partial_json: &str) -> Option<String> {
     for key in [
         "command",
+        "CommandLine",
         "cmd",
         "file_path",
+        "TargetFile",
+        "AbsolutePath",
         "path",
+        "DirectoryPath",
         "notebook_path",
         "pattern",
+        "Pattern",
         "query",
+        "Query",
         "url",
+        "Url",
         "description",
     ] {
         if let Some(val) = extract_partial_json_string_field(partial_json, key) {
@@ -1019,13 +1137,15 @@ pub struct EventParser {
     active_stream_message_id: Option<String>,
     streamed_text_in_message: bool,
     streamed_thinking_in_message: bool,
-    gemini_streamed_delta: bool,
+    gemini_streamed_text: bool,
+    gemini_emitted_step_usage: bool,
     final_text: String,
     tool_names_by_id: HashMap<String, (String, Value)>,
     emitted_tool_summaries: HashMap<String, String>,
     active_blocks: HashMap<usize, ActiveStreamBlock>,
     codex_item_text: HashMap<String, String>,
     codex_started_tools: HashSet<String>,
+    gemini_started_tools: HashSet<String>,
 }
 
 impl EventParser {
@@ -1045,13 +1165,15 @@ impl EventParser {
             active_stream_message_id: None,
             streamed_text_in_message: false,
             streamed_thinking_in_message: false,
-            gemini_streamed_delta: false,
+            gemini_streamed_text: false,
+            gemini_emitted_step_usage: false,
             final_text: String::new(),
             tool_names_by_id: HashMap::new(),
             emitted_tool_summaries: HashMap::new(),
             active_blocks: HashMap::new(),
             codex_item_text: HashMap::new(),
             codex_started_tools: HashSet::new(),
+            gemini_started_tools: HashSet::new(),
         }
     }
 
@@ -1795,122 +1917,251 @@ impl EventParser {
         out
     }
 
+    fn emit_gemini_tool_start(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        out: &mut Vec<NormalizedEvent>,
+    ) {
+        if input.as_object().is_some_and(|map| !map.is_empty())
+            || !self.tool_names_by_id.contains_key(call_id)
+        {
+            self.tool_names_by_id
+                .insert(call_id.to_owned(), (name.to_owned(), input.clone()));
+        }
+        if !self.gemini_started_tools.insert(call_id.to_owned()) {
+            return;
+        }
+        out.push(NormalizedEvent::ToolStart {
+            call_id: call_id.to_owned(),
+            kind: classify_tool_kind(name),
+            summary: summarize_tool(name, input),
+            name: name.to_owned(),
+            raw_input: input.clone(),
+        });
+    }
+
     fn parse_gemini(&mut self, event: &Value, interrupted: bool) -> Vec<NormalizedEvent> {
         let mut out = Vec::new();
-        match event["type"].as_str() {
+        match event["event"].as_str() {
             Some("init") => {
-                self.gemini_streamed_delta = false;
-                if let Some(session_id) = event["session_id"].as_str() {
+                self.gemini_streamed_text = false;
+                self.gemini_emitted_step_usage = false;
+                self.gemini_started_tools.clear();
+                if let Some(session_id) = event["conversation_id"]
+                    .as_str()
+                    .or_else(|| event["init"]["conversation_id"].as_str())
+                    .filter(|id| !id.is_empty())
+                {
                     out.push(NormalizedEvent::SessionStarted {
                         session_id: session_id.to_owned(),
-                        model: event["model"].as_str().map(str::to_owned),
+                        model: event["init"]["model"]
+                            .as_str()
+                            .filter(|model| !model.is_empty())
+                            .map(str::to_owned),
                         profile: self.profile.clone(),
                     });
                 }
             }
-            Some("thought" | "thinking") => {
-                if let Some(thought) = event["content"]
-                    .as_str()
-                    .or_else(|| event["text"].as_str())
-                    .filter(|t| !t.is_empty())
-                {
-                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
-                }
-            }
-            Some("message") if event["role"] == "assistant" => {
-                if let Some(thought) = event["thought"].as_str().filter(|t| !t.is_empty()) {
-                    out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
-                }
-                if let Some(text) = event["content"].as_str().filter(|t| !t.is_empty()) {
-                    let is_delta = event["delta"] == true;
-                    if is_delta {
-                        self.gemini_streamed_delta = true;
-                        self.final_text.push_str(text);
-                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
-                    } else if !self.gemini_streamed_delta || !self.final_text.ends_with(text) {
-                        self.final_text.push_str(text);
-                        out.push(NormalizedEvent::TextDelta(text.to_owned()));
-                    }
-                }
-            }
-            Some("tool_use") => {
-                let call_id = event["tool_id"].as_str().unwrap_or_default().to_owned();
-                let name = event["tool_name"].as_str().unwrap_or("tool").to_owned();
-                let input = event["parameters"].clone();
-                self.tool_names_by_id
-                    .insert(call_id.clone(), (name.clone(), input.clone()));
-                out.push(NormalizedEvent::ToolStart {
-                    call_id,
-                    kind: classify_tool_kind(&name),
-                    summary: summarize_tool(&name, &input),
-                    name,
-                    raw_input: input,
-                });
-            }
-            Some("tool_result") => {
-                let call_id = event["tool_id"].as_str().unwrap_or_default().to_owned();
-                let ok = event["status"] == "success";
-                let output = event["output"]
-                    .as_str()
-                    .or_else(|| event["error"]["message"].as_str())
-                    .unwrap_or_default();
-                out.push(NormalizedEvent::ToolEnd {
-                    call_id: call_id.clone(),
-                    ok,
-                    output_preview: preview_text(output),
-                    exit_code: None,
-                });
-                if ok {
-                    if let Some((name, input)) = self.tool_names_by_id.get(&call_id) {
-                        if let Some(path) = input
-                            .get("file_path")
-                            .or_else(|| input.get("path"))
-                            .and_then(Value::as_str)
-                        {
-                            let kind = match classify_tool_kind(name) {
-                                ToolKind::Write => Some(PatchKind::Add),
-                                ToolKind::Edit => Some(PatchKind::Update),
-                                _ => None,
-                            };
-                            if let Some(kind) = kind {
-                                out.push(NormalizedEvent::FileChanged {
-                                    path: path.to_owned(),
-                                    kind,
-                                });
+            Some("step_update") => {
+                let update = &event["step_update"];
+                let state = update["state"].as_str().unwrap_or_default();
+                match update["step_type"].as_str() {
+                    Some("agent_response") => {
+                        if matches!(state, "ACTIVE" | "DONE") {
+                            if let Some(thought) = update["thinking_delta"]
+                                .as_str()
+                                .or_else(|| update["thought"].as_str())
+                                .filter(|text| !text.is_empty())
+                            {
+                                out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                            }
+                            if let Some(delta) = update["text_delta"]
+                                .as_str()
+                                .filter(|text| !text.is_empty())
+                            {
+                                self.gemini_streamed_text = true;
+                                self.final_text.push_str(delta);
+                                out.push(NormalizedEvent::TextDelta(delta.to_owned()));
+                            }
+                        }
+                        if state == "DONE" {
+                            if let Some(usage_event) = parse_agy_usage(&update["usage"]) {
+                                self.gemini_emitted_step_usage = true;
+                                out.push(usage_event);
                             }
                         }
                     }
+                    Some("thinking" | "thought") => {
+                        if matches!(state, "ACTIVE" | "DONE") {
+                            if let Some(thought) = update["thinking_delta"]
+                                .as_str()
+                                .or_else(|| update["text_delta"].as_str())
+                                .or_else(|| update["content"].as_str())
+                                .filter(|text| !text.is_empty())
+                            {
+                                out.push(NormalizedEvent::ThinkingDelta(thought.to_owned()));
+                            }
+                        }
+                    }
+                    Some("tool") => {
+                        let step_index = update["step_index"].as_u64().unwrap_or(0);
+                        let call_id = format!("agy-step-{step_index}");
+                        let tool_info = &update["tool_info"];
+                        let name = update["tool_name"]
+                            .as_str()
+                            .or_else(|| tool_info["name"].as_str())
+                            .unwrap_or("tool");
+                        let input = tool_info
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        match state {
+                            "ACTIVE" => {
+                                self.emit_gemini_tool_start(&call_id, name, &input, &mut out);
+                            }
+                            "DONE" | "ERROR" => {
+                                self.emit_gemini_tool_start(&call_id, name, &input, &mut out);
+                                self.gemini_started_tools.remove(&call_id);
+                                let error_val =
+                                    tool_info.get("error").filter(|value| !value.is_null());
+                                let ok = state == "DONE" && error_val.is_none();
+                                let output = if let Some(err) = error_val {
+                                    err["message"]
+                                        .as_str()
+                                        .or_else(|| err.as_str())
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| err.to_string())
+                                } else {
+                                    match &tool_info["output"] {
+                                        Value::Null => String::new(),
+                                        Value::String(text) => text.clone(),
+                                        other => other.to_string(),
+                                    }
+                                };
+                                out.push(NormalizedEvent::ToolEnd {
+                                    call_id: call_id.clone(),
+                                    ok,
+                                    output_preview: preview_text(&output),
+                                    exit_code: None,
+                                });
+                                if ok {
+                                    if let Some((tool_name, tool_input)) =
+                                        self.tool_names_by_id.get(&call_id)
+                                    {
+                                        if let Some(path) = tool_input
+                                            .get("TargetFile")
+                                            .or_else(|| tool_input.get("file_path"))
+                                            .or_else(|| tool_input.get("AbsolutePath"))
+                                            .or_else(|| tool_input.get("path"))
+                                            .and_then(Value::as_str)
+                                        {
+                                            let kind = match classify_tool_kind(tool_name) {
+                                                ToolKind::Write => Some(PatchKind::Add),
+                                                ToolKind::Edit => Some(PatchKind::Update),
+                                                _ => None,
+                                            };
+                                            if let Some(kind) = kind {
+                                                out.push(NormalizedEvent::FileChanged {
+                                                    path: path.to_owned(),
+                                                    kind,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some("error") => {
-                if let Some(msg) = event["message"].as_str() {
-                    out.push(NormalizedEvent::StderrLine(msg.to_owned()));
+                if let Some(msg) = extract_agy_error_message(event) {
+                    out.push(NormalizedEvent::StderrLine(msg));
                 }
             }
             Some("result") => {
-                self.gemini_streamed_delta = false;
-                let stats = &event["stats"];
-                if stats.is_object() {
-                    out.push(NormalizedEvent::UsageDelta {
-                        input: stats["input_tokens"].as_u64().unwrap_or(0),
-                        cached_read: stats["cached"].as_u64().unwrap_or(0),
-                        output: stats["output_tokens"].as_u64().unwrap_or(0),
-                        cost_usd: None,
-                        context_used: None,
-                    });
+                let res = &event["result"];
+                if !self.gemini_emitted_step_usage {
+                    if let Some(usage_event) = parse_agy_usage(&res["usage"]) {
+                        out.push(usage_event);
+                    }
                 }
-                let is_error = event["status"] != "success" && !interrupted;
+                let status = res["status"].as_str().unwrap_or_default();
+                let has_error = res.get("error").is_some_and(|value| !value.is_null());
+                let raw_is_error = !status.eq_ignore_ascii_case("SUCCESS") || has_error;
+                let error_message = extract_agy_error_message(res);
+                let is_error = raw_is_error && !interrupted;
+                if is_error {
+                    if let Some(msg) = &error_message {
+                        out.push(NormalizedEvent::StderrLine(msg.clone()));
+                    }
+                }
+                let final_text = if self.gemini_streamed_text {
+                    std::mem::take(&mut self.final_text)
+                } else if !raw_is_error {
+                    if let Some(response) = res["response"].as_str().filter(|t| !t.is_empty()) {
+                        out.push(NormalizedEvent::TextDelta(response.to_owned()));
+                        response.to_owned()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    error_message
+                        .clone()
+                        .unwrap_or_else(|| res["response"].as_str().unwrap_or_default().to_owned())
+                };
+                self.gemini_streamed_text = false;
+                self.gemini_emitted_step_usage = false;
+                self.gemini_started_tools.clear();
+                self.final_text.clear();
+                let error_code = is_error.then(|| {
+                    error_message
+                        .as_deref()
+                        .map(|msg| classify_health(&[msg.to_owned()], None))
+                        .unwrap_or(HealthCode::AgentFailed)
+                });
                 out.push(NormalizedEvent::TurnFinished {
                     interrupted,
                     is_error,
-                    error_code: is_error.then_some(HealthCode::AgentFailed),
-                    final_text: std::mem::take(&mut self.final_text),
+                    error_code,
+                    final_text,
                 });
             }
             _ => {}
         }
         out
     }
+}
+
+fn parse_agy_usage(usage_val: &Value) -> Option<NormalizedEvent> {
+    if !usage_val.is_object() {
+        return None;
+    }
+    let input = usage_val["input_tokens"].as_u64().unwrap_or(0);
+    let cached_read = usage_val["cache_read_tokens"].as_u64().unwrap_or(0);
+    let output = usage_val["output_tokens"].as_u64().unwrap_or(0);
+    let context_used = input.saturating_add(cached_read);
+    (context_used > 0 || output > 0).then_some(NormalizedEvent::UsageDelta {
+        input,
+        cached_read,
+        output,
+        cost_usd: None,
+        context_used: (context_used > 0).then_some(context_used),
+    })
+}
+
+fn extract_agy_error_message(container: &Value) -> Option<String> {
+    container["error"]["message"]
+        .as_str()
+        .or_else(|| container["error"].as_str())
+        .or_else(|| container["message"].as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 enum Work {
@@ -2643,6 +2894,13 @@ fn run(
             Ok(())
         });
         (handle, true)
+    } else if profile.provider == Provider::Gemini {
+        let payload = agy_user_turn_json(&prompt);
+        let handle = thread::spawn(move || -> io::Result<()> {
+            writeln!(stdin, "{payload}")?;
+            stdin.flush()
+        });
+        (handle, false)
     } else {
         let handle = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
         (handle, false)
@@ -2784,19 +3042,30 @@ pub(crate) fn restrict(
 }
 
 pub(crate) fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
-    match (provider, event["type"].as_str()) {
-        (Provider::Claude, Some("assistant")) => event["message"]["content"]
+    match provider {
+        Provider::Claude if event["type"] == "assistant" => event["message"]["content"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|item| item["type"] == "text")
             .filter_map(|item| item["text"].as_str())
             .collect(),
-        (Provider::Codex, Some("item.completed")) if event["item"]["type"] == "agent_message" => {
+        Provider::Codex
+            if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" =>
+        {
             event["item"]["text"].as_str().into_iter().collect()
         }
-        (Provider::Gemini, Some("message")) if event["role"] == "assistant" => {
-            event["content"].as_str().into_iter().collect()
+        Provider::Gemini
+            if event["event"] == "result"
+                && event["result"]["status"]
+                    .as_str()
+                    .is_none_or(|status| status.eq_ignore_ascii_case("SUCCESS")) =>
+        {
+            event["result"]["response"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .into_iter()
+                .collect()
         }
         _ => Vec::new(),
     }
@@ -2839,7 +3108,13 @@ fn read_output(
                     && event["is_error"] == false
             }
             Provider::Codex => event["type"] == "turn.completed",
-            Provider::Gemini => event["type"] == "result" && event["status"] == "success",
+            Provider::Gemini => {
+                event["event"] == "result"
+                    && event["result"]["status"]
+                        .as_str()
+                        .is_some_and(|status| status.eq_ignore_ascii_case("SUCCESS"))
+                    && event["result"].get("error").is_none_or(Value::is_null)
+            }
         };
         let mut suppress_limit_noise = false;
         let limit = match profile.provider {
@@ -3001,13 +3276,13 @@ fn record_synthetic_claude_limit(
 }
 
 fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
-    match (provider, event["type"].as_str()) {
-        (Provider::Claude, Some("assistant")) => {
+    match provider {
+        Provider::Claude if event["type"] == "assistant" => {
             if claude_limit_fallback(event).is_none() {
                 progress.assistant_messages += 1;
             }
         }
-        (Provider::Claude, Some("user")) => {
+        Provider::Claude if event["type"] == "user" => {
             let tools = event["message"]["content"]
                 .as_array()
                 .into_iter()
@@ -3015,20 +3290,28 @@ fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
                 .filter(|item| item["type"] == "tool_result" && item["is_error"] != true);
             progress.completed_tool_events += tools.count() as u64;
         }
-        (Provider::Codex, Some("item.completed")) => match event["item"]["type"].as_str() {
-            Some("agent_message") => progress.assistant_messages += 1,
-            Some("command_execution" | "file_change" | "mcp_tool_call")
-                if event["item"]["status"] == "completed" =>
-            {
-                progress.completed_tool_events += 1
+        Provider::Codex if event["type"] == "item.completed" => {
+            match event["item"]["type"].as_str() {
+                Some("agent_message") => progress.assistant_messages += 1,
+                Some("command_execution" | "file_change" | "mcp_tool_call")
+                    if event["item"]["status"] == "completed" =>
+                {
+                    progress.completed_tool_events += 1
+                }
+                _ => {}
             }
-            _ => {}
-        },
-        (Provider::Gemini, Some("message")) if event["role"] == "assistant" => {
-            progress.assistant_messages += 1;
         }
-        (Provider::Gemini, Some("tool_result")) if event["status"] == "success" => {
-            progress.completed_tool_events += 1;
+        Provider::Gemini if event["event"] == "step_update" => {
+            let update = &event["step_update"];
+            if update["state"] == "DONE" {
+                match update["step_type"].as_str() {
+                    Some("agent_response") => progress.assistant_messages += 1,
+                    Some("tool") if update["tool_info"].get("error").is_none_or(Value::is_null) => {
+                        progress.completed_tool_events += 1;
+                    }
+                    _ => {}
+                }
+            }
         }
         _ => {}
     }
@@ -3078,18 +3361,38 @@ fn claude_limit_fallback(event: &Value) -> Option<&'static str> {
 }
 
 fn gemini_limit(event: &Value) -> Option<Option<i64>> {
-    let is_error = event["type"] == "error"
-        || (event["type"] == "result" && event["status"].as_str().is_some_and(|s| s != "success"));
-    if !is_error {
+    let res = &event["result"];
+    let is_result_error = event["event"] == "result"
+        && (res["status"]
+            .as_str()
+            .is_some_and(|status| !status.eq_ignore_ascii_case("SUCCESS"))
+            || res.get("error").is_some_and(|err| !err.is_null()));
+    let is_top_error = event["event"] == "error";
+    if !is_result_error && !is_top_error {
         return None;
     }
-    let code_429 =
-        event["code"].as_i64() == Some(429) || event["error"]["code"].as_i64() == Some(429);
+    let code_429 = [
+        &event["code"],
+        &event["error"]["code"],
+        &res["code"],
+        &res["error"]["code"],
+    ]
+    .into_iter()
+    .any(|value| value.as_i64() == Some(429));
     let combined = [
         event["message"].as_str(),
         event["status"].as_str(),
+        event["error"].as_str(),
         event["error"]["message"].as_str(),
         event["error"]["status"].as_str(),
+        event["error"]["type"].as_str(),
+        res["status"].as_str(),
+        res["message"].as_str(),
+        res["response"].as_str(),
+        res["error"].as_str(),
+        res["error"]["message"].as_str(),
+        res["error"]["status"].as_str(),
+        res["error"]["type"].as_str(),
     ]
     .into_iter()
     .flatten()
@@ -3099,6 +3402,7 @@ fn gemini_limit(event: &Value) -> Option<Option<i64>> {
     let matched = code_429
         || combined.contains("resource_exhausted")
         || combined.contains("quota exceeded")
+        || combined.contains("quota limit")
         || combined.contains("rate limit")
         || combined.contains("too many requests")
         || combined.contains("usage limit")
@@ -3106,11 +3410,18 @@ fn gemini_limit(event: &Value) -> Option<Option<i64>> {
     if !matched {
         return None;
     }
-    let reset = event["resetsAt"]
-        .as_i64()
-        .or_else(|| event["resetAt"].as_i64())
-        .or_else(|| event["error"]["resetsAt"].as_i64())
-        .or_else(|| event["error"]["resetAt"].as_i64());
+    let reset = [
+        &event["resetsAt"],
+        &event["resetAt"],
+        &event["error"]["resetsAt"],
+        &event["error"]["resetAt"],
+        &res["resetsAt"],
+        &res["resetAt"],
+        &res["error"]["resetsAt"],
+        &res["error"]["resetAt"],
+    ]
+    .into_iter()
+    .find_map(Value::as_i64);
     Some(reset)
 }
 
@@ -3118,6 +3429,8 @@ fn is_gemini_stderr_limit(stderr_lines: &[String]) -> bool {
     let joined = stderr_lines.join("\n").to_ascii_lowercase();
     joined.contains("resource_exhausted")
         || joined.contains("quota exceeded")
+        || joined.contains("quota limit")
+        || joined.contains("usage limit")
         || joined.contains("rate limit")
         || joined.contains("too many requests")
         || joined.contains("status 429")
@@ -3126,11 +3439,12 @@ fn is_gemini_stderr_limit(stderr_lines: &[String]) -> bool {
 
 fn is_stale_session_error(stderr_lines: &[String]) -> bool {
     let joined = stderr_lines.join("\n").to_ascii_lowercase();
-    const SIGNALS: [&str; 9] = [
+    const SIGNALS: [&str; 10] = [
         "no conversation found with session id",
         "session not found",
         "no such session",
         "conversation not found",
+        "no such conversation",
         "thread not found",
         "no such thread",
         "unknown session",
@@ -3138,6 +3452,7 @@ fn is_stale_session_error(stderr_lines: &[String]) -> bool {
         "cannot resume session",
     ];
     SIGNALS.iter().any(|signal| joined.contains(signal))
+        || (joined.contains("conversation \"") && joined.contains("\" not found"))
 }
 
 fn codex_limit(event: &Value) -> bool {
@@ -3191,13 +3506,81 @@ mod engine_tests {
 
         let gemini =
             build_provider_arguments(Provider::Gemini, PermissionMode::WorktreeAuto, &options);
-        assert!(gemini.windows(2).any(|pair| pair == ["-o", "stream-json"]));
         assert!(gemini
             .windows(2)
-            .any(|pair| pair == ["--approval-mode", "yolo"]));
+            .any(|pair| pair == ["--input-format", "stream-json"]));
         assert!(gemini
             .windows(2)
-            .any(|pair| pair == ["--resume", "sess-123"]));
+            .any(|pair| pair == ["--output-format", "stream-json"]));
+        assert!(gemini.contains(&"--disable-slash-commands".to_owned()));
+        assert!(gemini.windows(2).any(|pair| pair == ["--mode", "auto"]));
+        assert!(gemini
+            .windows(2)
+            .any(|pair| pair == ["--conversation", "sess-123"]));
+        assert!(!gemini.contains(&"-p".to_owned()));
+        assert!(!gemini.contains(&"--resume".to_owned()));
+        assert!(!gemini.contains(&"--approval-mode".to_owned()));
+    }
+
+    #[test]
+    fn merges_multiple_agy_settings_flags_without_stripping_read_only_deny_rules() {
+        let diet_options = LaunchOptions {
+            extra_args: crate::bridge::worker_mcp_diet_args(crate::bridge::BridgeProvider::Gemini),
+            ..LaunchOptions::default()
+        };
+        let read_only =
+            build_provider_arguments(Provider::Gemini, PermissionMode::ReadOnly, &diet_options);
+        let settings_positions: Vec<usize> = read_only
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| (arg == "--settings").then_some(idx))
+            .collect();
+        assert_eq!(settings_positions.len(), 1, "{read_only:?}");
+        let merged: Value = serde_json::from_str(&read_only[settings_positions[0] + 1]).unwrap();
+        assert_eq!(merged["agentMode"], "");
+        assert_eq!(merged["toolPermission"], "request-review");
+        let denied = merged["permissions"]["deny"].as_array().unwrap();
+        assert!(denied.contains(&json!("write_file(*)")));
+        assert!(denied.contains(&json!("command(*)")));
+        assert!(denied.contains(&json!("mcp(*)")));
+
+        let supervised =
+            build_provider_arguments(Provider::Gemini, PermissionMode::Supervised, &diet_options);
+        let sup_count = supervised
+            .iter()
+            .filter(|arg| arg.as_str() == "--settings")
+            .count();
+        assert_eq!(sup_count, 1, "{supervised:?}");
+        let sup_idx = supervised
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        let sup_merged: Value = serde_json::from_str(&supervised[sup_idx + 1]).unwrap();
+        assert_eq!(sup_merged["agentMode"], "");
+        assert_eq!(sup_merged["toolPermission"], "request-review");
+        assert_eq!(sup_merged["permissions"]["deny"], json!(["mcp(*)"]));
+
+        let workspace_auto = build_provider_arguments(
+            Provider::Gemini,
+            PermissionMode::WorkspaceAuto,
+            &diet_options,
+        );
+        assert!(workspace_auto
+            .windows(2)
+            .any(|pair| pair == ["--mode", "auto"]));
+        assert_eq!(
+            workspace_auto
+                .iter()
+                .filter(|arg| arg.as_str() == "--settings")
+                .count(),
+            1
+        );
+
+        let encoded = agy_user_turn_json("Line 1\n\"quoted\" \\ path");
+        assert!(!encoded.contains('\n'));
+        let parsed: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["event"], "user");
+        assert_eq!(parsed["message"]["content"], "Line 1\n\"quoted\" \\ path");
     }
 
     #[test]
@@ -3287,7 +3670,11 @@ mod engine_tests {
 
         let mut gemini = EventParser::new(Provider::Gemini);
         let g_init = gemini.parse_value(
-            &json!({"type":"init","session_id":"g-7","model":"gemini-2.5-pro"}),
+            &json!({
+                "event":"init",
+                "conversation_id":"g-7",
+                "init":{"cwd":"/work","model":"gemini-3.8-flash","permission_mode":"request-review"}
+            }),
             false,
             None,
         );
@@ -3295,12 +3682,21 @@ mod engine_tests {
             g_init,
             vec![NormalizedEvent::SessionStarted {
                 session_id: "g-7".into(),
-                model: Some("gemini-2.5-pro".into()),
+                model: Some("gemini-3.8-flash".into()),
                 profile: None,
             }]
         );
         let g_msg = gemini.parse_value(
-            &json!({"type":"message","role":"assistant","content":"Hello from Gemini","delta":true}),
+            &json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"g-7",
+                    "step_index":1,
+                    "state":"ACTIVE",
+                    "step_type":"agent_response",
+                    "text_delta":"Hello from Gemini"
+                }
+            }),
             false,
             None,
         );
@@ -3659,14 +4055,115 @@ mod engine_tests {
 
         let mut gemini = EventParser::new(Provider::Gemini);
         let gemini_stream = [
-            json!({"type":"init","session_id":"gem-1","model":"gemini-2.5-pro"}),
-            json!({"type":"thought","content":"Inspect workspace"}),
-            json!({"type":"tool_use","tool_id":"gt1","tool_name":"write_file","parameters":{"file_path":"game.html"}}),
-            json!({"type":"tool_result","tool_id":"gt1","status":"success","output":"Wrote game.html"}),
-            json!({"type":"message","role":"assistant","content":"Done ","delta":true}),
-            json!({"type":"message","role":"assistant","content":"now.","delta":true}),
-            json!({"type":"message","role":"assistant","content":"Done now.","delta":false}),
-            json!({"type":"result","status":"success","stats":{"input_tokens":20,"cached":0,"output_tokens":8}}),
+            json!({
+                "event":"init",
+                "conversation_id":"gem-1",
+                "init":{"cwd":"/work","model":"gemini-3.8-flash","permission_mode":"request-review"}
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{"conversation_id":"gem-1","step_index":0,"state":"DONE","step_type":"user_input"}
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":1,
+                    "state":"ACTIVE",
+                    "step_type":"tool",
+                    "tool_name":"write_to_file",
+                    "tool_info":{"name":"write_to_file","parameters":{"TargetFile":"game.html"}}
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":1,
+                    "state":"DONE",
+                    "step_type":"tool",
+                    "tool_name":"write_to_file",
+                    "tool_info":{"name":"write_to_file","parameters":{"TargetFile":"game.html"},"output":"Wrote game.html"}
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":2,
+                    "state":"DONE",
+                    "step_type":"tool",
+                    "tool_name":"replace_file_content",
+                    "tool_info":{"name":"replace_file_content","parameters":{"TargetFile":"src/lib.rs"},"output":"Updated src/lib.rs"}
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":3,
+                    "state":"ACTIVE",
+                    "step_type":"tool",
+                    "tool_name":"run_command",
+                    "tool_info":{"name":"run_command","parameters":{"CommandLine":"git status"}}
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":3,
+                    "state":"ERROR",
+                    "step_type":"tool",
+                    "tool_name":"run_command",
+                    "tool_info":{
+                        "name":"run_command",
+                        "parameters":{"CommandLine":"git status"},
+                        "error":{"type":"TOOL_ERROR","message":"Permission denied"}
+                    }
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":4,
+                    "state":"ACTIVE",
+                    "step_type":"agent_response",
+                    "text_delta":"Done "
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":4,
+                    "state":"ACTIVE",
+                    "step_type":"agent_response",
+                    "text_delta":"now."
+                }
+            }),
+            json!({
+                "event":"step_update",
+                "step_update":{
+                    "conversation_id":"gem-1",
+                    "step_index":4,
+                    "state":"DONE",
+                    "step_type":"agent_response",
+                    "text_delta":"\n",
+                    "usage":{"input_tokens":20,"cache_read_tokens":5,"output_tokens":8,"thinking_tokens":4,"total_tokens":28}
+                }
+            }),
+            json!({
+                "event":"result",
+                "result":{
+                    "conversation_id":"gem-1",
+                    "status":"SUCCESS",
+                    "response":"Done now.\n",
+                    "num_turns":1,
+                    "usage":{"input_tokens":100,"cache_read_tokens":50,"output_tokens":30,"total_tokens":130}
+                }
+            }),
         ];
         let mut gem_events = Vec::new();
         for item in &gemini_stream {
@@ -3679,13 +4176,17 @@ mod engine_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(gem_text, "Done now.");
-        assert!(gem_events
-            .iter()
-            .any(|e| matches!(e, NormalizedEvent::ThinkingDelta(t) if t == "Inspect workspace")));
-        assert!(gem_events
-            .iter()
-            .any(|e| matches!(e, NormalizedEvent::ToolStart { call_id, summary, .. } if call_id == "gt1" && summary == "write_file: game.html")));
+        assert_eq!(gem_text, "Done now.\n");
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolStart { call_id, kind: ToolKind::Write, summary, .. }
+            if call_id == "agy-step-1" && summary == "write_to_file: game.html"
+        )));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd { call_id, ok: true, output_preview, .. }
+            if call_id == "agy-step-1" && output_preview == "Wrote game.html"
+        )));
         assert!(gem_events.iter().any(|e| matches!(
             e,
             NormalizedEvent::FileChanged {
@@ -3693,6 +4194,123 @@ mod engine_tests {
                 kind: PatchKind::Add
             } if path == "game.html"
         )));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolStart { call_id, kind: ToolKind::Edit, summary, .. }
+            if call_id == "agy-step-2" && summary == "replace_file_content: src/lib.rs"
+        )));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::FileChanged {
+                path,
+                kind: PatchKind::Update
+            } if path == "src/lib.rs"
+        )));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolStart { call_id, kind: ToolKind::Shell, summary, .. }
+            if call_id == "agy-step-3" && summary == "run_command: git status"
+        )));
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::ToolEnd { call_id, ok: false, output_preview, .. }
+            if call_id == "agy-step-3" && output_preview == "Permission denied"
+        )));
+        let usage_events: Vec<&NormalizedEvent> = gem_events
+            .iter()
+            .filter(|e| matches!(e, NormalizedEvent::UsageDelta { .. }))
+            .collect();
+        assert_eq!(
+            usage_events,
+            vec![&NormalizedEvent::UsageDelta {
+                input: 20,
+                cached_read: 5,
+                output: 8,
+                cost_usd: None,
+                context_used: Some(25),
+            }]
+        );
+        assert!(gem_events.iter().any(|e| matches!(
+            e,
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: false,
+                error_code: None,
+                final_text
+            } if final_text == "Done now.\n"
+        )));
+
+        let fallback = gemini.parse_value(
+            &json!({
+                "event":"result",
+                "result":{
+                    "conversation_id":"gem-1",
+                    "status":"SUCCESS",
+                    "response":"Fallback reply",
+                    "usage":{"input_tokens":12,"cache_read_tokens":3,"output_tokens":4}
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            fallback,
+            vec![
+                NormalizedEvent::UsageDelta {
+                    input: 12,
+                    cached_read: 3,
+                    output: 4,
+                    cost_usd: None,
+                    context_used: Some(15),
+                },
+                NormalizedEvent::TextDelta("Fallback reply".into()),
+                NormalizedEvent::TurnFinished {
+                    interrupted: false,
+                    is_error: false,
+                    error_code: None,
+                    final_text: "Fallback reply".into(),
+                },
+            ]
+        );
+
+        assert_eq!(classify_tool_kind("run_command"), ToolKind::Shell);
+        assert_eq!(classify_tool_kind("view_file"), ToolKind::Read);
+        assert_eq!(classify_tool_kind("write_to_file"), ToolKind::Write);
+        assert_eq!(classify_tool_kind("replace_file_content"), ToolKind::Edit);
+        assert_eq!(
+            classify_tool_kind("multi_replace_file_content"),
+            ToolKind::Edit
+        );
+        assert_eq!(classify_tool_kind("grep_search"), ToolKind::Search);
+        assert_eq!(classify_tool_kind("find_by_name"), ToolKind::Search);
+        assert_eq!(classify_tool_kind("list_dir"), ToolKind::Search);
+        assert_eq!(
+            summarize_tool("view_file", &json!({"AbsolutePath": "src/main.rs"})),
+            "view_file: src/main.rs"
+        );
+        assert_eq!(
+            summarize_tool("grep_search", &json!({"Query": "Provider::Gemini"})),
+            "grep_search: Provider::Gemini"
+        );
+        assert_eq!(
+            summarize_tool("find_by_name", &json!({"Pattern": "*.rs"})),
+            "find_by_name: *.rs"
+        );
+        assert_eq!(
+            summarize_tool("list_dir", &json!({"DirectoryPath": "src"})),
+            "list_dir: src"
+        );
+        assert_eq!(
+            tool_resource("run_command", &json!({"CommandLine": "cargo test"})),
+            "cargo test"
+        );
+        assert_eq!(
+            tool_resource(
+                "multi_replace_file_content",
+                &json!({"TargetFile": "src/mission.rs"})
+            ),
+            "src/mission.rs"
+        );
     }
 
     struct TempState {
@@ -3751,13 +4369,17 @@ mod engine_tests {
         let mut gemini = EventParser::with_profile(Provider::Gemini, "gemini/default".into());
         assert_eq!(
             gemini.parse_value(
-                &json!({"type":"init","session_id":"g-9","model":"gemini-2.5-pro"}),
+                &json!({
+                    "event":"init",
+                    "conversation_id":"g-9",
+                    "init":{"cwd":"/work","model":"gemini-3.8-flash","permission_mode":"request-review"}
+                }),
                 false,
                 None,
             ),
             vec![NormalizedEvent::SessionStarted {
                 session_id: "g-9".into(),
-                model: Some("gemini-2.5-pro".into()),
+                model: Some("gemini-3.8-flash".into()),
                 profile: Some("gemini/default".into()),
             }]
         );
@@ -3872,11 +4494,20 @@ mod engine_tests {
         assert!(is_stale_session_error(&[
             "No conversation found with session ID: f855ba63-1291-4822-bff2-07702cae2889".into()
         ]));
+        assert!(is_stale_session_error(&[
+            "warning: conversation \"00000000-0000-0000-0000-000000000000\" not found".into()
+        ]));
         assert!(is_stale_session_error(&["Error: thread not found".into()]));
         assert!(is_stale_session_error(&["no such thread".into()]));
         assert!(is_stale_session_error(&["Session not found".into()]));
         assert!(is_stale_session_error(&["no such session".into()]));
         assert!(!is_stale_session_error(&["fatal: disk full".into()]));
+        assert!(is_benign_stderr_warning(
+            "warning: --mode auto is not available for this account; continuing in the default mode."
+        ));
+        assert!(is_benign_stderr_warning(
+            "warning: --mode plan has no effect while slash command expansion is disabled."
+        ));
 
         let rate_msg = json!({
             "type": "assistant",
@@ -3905,17 +4536,74 @@ mod engine_tests {
         record_progress(Provider::Claude, &tool_ok, &mut progress);
         assert_eq!(progress.completed_tool_events, 1);
 
+        let mut agy_progress = Progress::default();
+        record_progress(
+            Provider::Gemini,
+            &json!({"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Hi"}}),
+            &mut agy_progress,
+        );
+        assert_eq!(agy_progress.assistant_messages, 0);
+        record_progress(
+            Provider::Gemini,
+            &json!({"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response","text_delta":"\n"}}),
+            &mut agy_progress,
+        );
+        assert_eq!(agy_progress.assistant_messages, 1);
+        record_progress(
+            Provider::Gemini,
+            &json!({"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_info":{"name":"list_dir","output":"ok"}}}),
+            &mut agy_progress,
+        );
+        record_progress(
+            Provider::Gemini,
+            &json!({"event":"step_update","step_update":{"state":"ERROR","step_type":"tool","tool_info":{"name":"run_command","error":{"message":"denied"}}}}),
+            &mut agy_progress,
+        );
+        assert_eq!(agy_progress.completed_tool_events, 1);
+
         assert_eq!(
             gemini_limit(&json!({
-                "type": "error",
-                "code": 429,
-                "status": "RESOURCE_EXHAUSTED",
-                "resetsAt": 12_345
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "Quota exceeded",
+                        "resetsAt": 12_345
+                    }
+                }
             })),
             Some(Some(12_345))
         );
         assert_eq!(
-            gemini_limit(&json!({"type": "error", "message": "network timeout"})),
+            gemini_limit(&json!({
+                "event": "result",
+                "result": {
+                    "status": "FAILED",
+                    "error": "HTTP 429 Too Many Requests"
+                }
+            })),
+            Some(None)
+        );
+        assert_eq!(
+            gemini_limit(&json!({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "429 is a number"
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            gemini_limit(&json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": {"message": "network timeout"}
+                }
+            })),
             None
         );
         assert!(is_gemini_stderr_limit(&[
@@ -4032,10 +4720,17 @@ mod engine_tests {
         );
 
         let gemini_stream = json!({
-            "type": "error",
-            "code": 429,
-            "status": "RESOURCE_EXHAUSTED",
-            "resetsAt": 8_500
+            "event": "result",
+            "result": {
+                "conversation_id": "gem-limit",
+                "status": "ERROR",
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": "Quota exceeded",
+                    "resetsAt": 8_500
+                }
+            }
         })
         .to_string();
         let (tx3, _rx3) = mpsc::sync_channel(16);

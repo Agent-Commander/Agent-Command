@@ -318,17 +318,24 @@ pub fn build_plan(
         AuthTrack::GeminiGoogle { workspace_project } => {
             if let Some(project) = workspace_project {
                 env_overrides.insert("GOOGLE_CLOUD_PROJECT".into(), project.clone());
-                notes.push("Configured for Google Workspace / Gemini Code Assist license.".into());
+                notes.push(
+                    "Configured for Google Cloud / Gemini Enterprise project selection.".into(),
+                );
             }
-            notes.push("Launch `gemini` interactively and pick 'Sign in with Google' to cache oauth_creds.json.".into());
-            ("gemini".to_owned(), Vec::new())
+            notes.push(
+                "Launch `agy` interactively to complete browser or SSH OAuth into your OS keyring."
+                    .into(),
+            );
+            ("agy".to_owned(), Vec::new())
         }
         AuthTrack::GeminiVertexAdc { project, location } => {
+            env_overrides.insert("AGY_ADC_AUTH".into(), "true".into());
             env_overrides.insert("GOOGLE_GENAI_USE_VERTEXAI".into(), "true".into());
             env_overrides.insert("GOOGLE_CLOUD_PROJECT".into(), project.clone());
+            env_overrides.insert("GOOGLE_CLOUD_QUOTA_PROJECT".into(), project.clone());
             env_overrides.insert("GOOGLE_CLOUD_LOCATION".into(), location.clone());
             notes.push(
-                "Runs gcloud ADC login; Gemini CLI automatically picks up Vertex AI env vars."
+                "Runs gcloud ADC login; Antigravity CLI uses ADC when AGY_ADC_AUTH=true is set."
                     .into(),
             );
             (
@@ -341,15 +348,17 @@ pub fn build_plan(
             location,
             credentials_path,
         } => {
+            env_overrides.insert("AGY_ADC_AUTH".into(), "true".into());
             env_overrides.insert("GOOGLE_GENAI_USE_VERTEXAI".into(), "true".into());
             env_overrides.insert("GOOGLE_CLOUD_PROJECT".into(), project.clone());
+            env_overrides.insert("GOOGLE_CLOUD_QUOTA_PROJECT".into(), project.clone());
             env_overrides.insert("GOOGLE_CLOUD_LOCATION".into(), location.clone());
             env_overrides.insert(
                 "GOOGLE_APPLICATION_CREDENTIALS".into(),
                 credentials_path.display().to_string(),
             );
             notes.push("Ensure the service account JSON file has owner-only permissions.".into());
-            ("gemini".to_owned(), vec!["--version".into()])
+            ("agy".to_owned(), vec!["--version".into()])
         }
         AuthTrack::GitHubEnterprise { hostname, scopes } => {
             let mut args = vec![
@@ -399,6 +408,11 @@ pub fn execute_plan(plan: &OnboardingPlan, root: &Path) -> io::Result<()> {
     let mut command =
         Command::new(auth::resolve(&plan.program).unwrap_or_else(|| PathBuf::from(&plan.program)));
     command.args(&plan.args);
+    for (key, _) in env::vars_os() {
+        if key.to_str().is_some_and(auth::nested_session_guard) {
+            command.env_remove(key);
+        }
+    }
     for (key, value) in &plan.env_overrides {
         command.env(key, value);
     }
@@ -412,7 +426,7 @@ pub fn execute_plan(plan: &OnboardingPlan, root: &Path) -> io::Result<()> {
         )
         .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
         let directory = profile.prepare_isolated_with_env()?;
-        command.env(provider.home_variable(), &directory);
+        provider.apply_isolated_home(&mut command, &directory);
         command.current_dir(&directory);
     }
     let status = command
@@ -745,6 +759,21 @@ mod tests {
         assert_eq!(bedrock.env_overrides["AWS_REGION"], "us-east-1");
         assert_eq!(bedrock.env_overrides["AWS_PROFILE"], "eng");
 
+        let gemini_google = build_plan(
+            AuthTrack::GeminiGoogle {
+                workspace_project: Some("acme-ai".into()),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(gemini_google.program, "agy");
+        assert!(gemini_google.args.is_empty());
+        assert_eq!(
+            gemini_google.env_overrides["GOOGLE_CLOUD_PROJECT"],
+            "acme-ai"
+        );
+
         let vertex = build_plan(
             AuthTrack::GeminiVertexAdc {
                 project: "acme-ai".into(),
@@ -755,7 +784,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vertex.program, "gcloud");
+        assert_eq!(vertex.env_overrides["AGY_ADC_AUTH"], "true");
         assert_eq!(vertex.env_overrides["GOOGLE_GENAI_USE_VERTEXAI"], "true");
+        assert_eq!(
+            vertex.env_overrides["GOOGLE_CLOUD_QUOTA_PROJECT"],
+            "acme-ai"
+        );
+
+        let service_account = build_plan(
+            AuthTrack::GeminiServiceAccount {
+                project: "acme-ai".into(),
+                location: "us-central1".into(),
+                credentials_path: PathBuf::from("/tmp/sa.json"),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(service_account.program, "agy");
+        assert_eq!(service_account.args, ["--version"]);
+        assert_eq!(service_account.env_overrides["AGY_ADC_AUTH"], "true");
 
         let ghe = build_plan(
             AuthTrack::GitHubEnterprise {

@@ -4,8 +4,8 @@ Applies to profiles, usage, routing, continuations, checkpoints and any durable 
 
 ## 1. Zero-reauth default and isolated profiles
 
-- Existing signed-in local CLI sessions (`~/.claude`, `~/.codex`, `~/.gemini`, and `gh`) are auto-adopted as `ProfileSource::SystemDefault` (Account #1) without stripping credentials or forcing re-authentication.
-- Additional, multi-org, and enterprise profiles live under the isolated `sub-auth` root (`~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`) with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GEMINI_CLI_HOME`.
+- Existing signed-in local CLI sessions (`~/.claude`, `~/.codex`, `~/.gemini/antigravity-cli` / OS keyring via `agy`, and `gh`) are auto-adopted as `ProfileSource::SystemDefault` (Account #1) without stripping credentials or forcing re-authentication.
+- Additional, multi-org, and enterprise profiles live under the isolated `sub-auth` root (`~/.local/share/sub-auth` or an absolute `SUB_AUTH_DIR`) with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or isolated `HOME`/`USERPROFILE` for `agy`.
 - Never leak secrets into state files, command arguments, or logs.
 - A relative `SUB_AUTH_DIR` is refused.
 - Tests always use a temporary profile root.

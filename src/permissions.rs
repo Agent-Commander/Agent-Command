@@ -270,6 +270,15 @@ const CLAUDE_STREAM_ARGUMENTS: [&str; 6] = [
     "--setting-sources",
     "user",
 ];
+const AGY_STREAM_ARGUMENTS: [&str; 5] = [
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--disable-slash-commands",
+];
+pub(crate) const AGY_READ_ONLY_SETTINGS: &str = r#"{"agentMode":"","toolPermission":"request-review","permissions":{"deny":["write_file(*)","command(*)"]}}"#;
+const AGY_SUPERVISED_SETTINGS: &str = r#"{"agentMode":"","toolPermission":"request-review"}"#;
 const END_OF_OPTIONS: &str = "--";
 
 impl PermissionMode {
@@ -376,13 +385,12 @@ impl PermissionMode {
         }
     }
 
-    fn gemini_approval_arguments(self) -> Vec<&'static str> {
+    fn gemini_arguments(self) -> Vec<&'static str> {
         match self {
-            Self::ReadOnly => vec!["--approval-mode", "plan"],
-            Self::Supervised => vec!["--approval-mode", "default"],
-            Self::AutoAcceptEdits => vec!["--approval-mode", "auto_edit"],
-            Self::WorkspaceAuto => vec!["--approval-mode", "auto_edit", "--skip-trust"],
-            Self::WorktreeAuto => vec!["--approval-mode", "yolo", "--skip-trust"],
+            Self::ReadOnly => vec!["--settings", AGY_READ_ONLY_SETTINGS],
+            Self::Supervised => vec!["--settings", AGY_SUPERVISED_SETTINGS],
+            Self::AutoAcceptEdits => vec!["--mode", "accept-edits"],
+            Self::WorkspaceAuto | Self::WorktreeAuto => vec!["--mode", "auto"],
         }
     }
 }
@@ -406,8 +414,8 @@ pub(crate) fn dispatch_arguments(provider: Provider, mode: PermissionMode) -> Ve
             "-",
         ],
         Provider::Gemini => {
-            let mut arguments = vec!["-o", "stream-json"];
-            arguments.extend(mode.gemini_approval_arguments());
+            let mut arguments = AGY_STREAM_ARGUMENTS.to_vec();
+            arguments.extend(mode.gemini_arguments());
             arguments
         }
     }
@@ -483,23 +491,27 @@ mod tests {
     }
 
     #[test]
-    fn gemini_argv_uses_approval_mode_and_skip_trust_safely() {
+    fn gemini_argv_for_every_mode_is_exact() {
+        let base =
+            "--input-format stream-json --output-format stream-json --disable-slash-commands";
         assert_eq!(
             joined(Provider::Gemini, PermissionMode::ReadOnly),
-            "-o stream-json --approval-mode plan"
+            format!("{base} --settings {AGY_READ_ONLY_SETTINGS}")
+        );
+        assert_eq!(
+            joined(Provider::Gemini, PermissionMode::Supervised),
+            format!("{base} --settings {AGY_SUPERVISED_SETTINGS}")
         );
         assert_eq!(
             joined(Provider::Gemini, PermissionMode::AutoAcceptEdits),
-            "-o stream-json --approval-mode auto_edit"
+            format!("{base} --mode accept-edits")
         );
-        assert_eq!(
-            joined(Provider::Gemini, PermissionMode::WorkspaceAuto),
-            "-o stream-json --approval-mode auto_edit --skip-trust"
-        );
-        assert_eq!(
-            joined(Provider::Gemini, PermissionMode::WorktreeAuto),
-            "-o stream-json --approval-mode yolo --skip-trust"
-        );
+        for mode in [PermissionMode::WorkspaceAuto, PermissionMode::WorktreeAuto] {
+            assert_eq!(
+                joined(Provider::Gemini, mode),
+                format!("{base} --mode auto")
+            );
+        }
     }
 
     #[test]
@@ -524,9 +536,18 @@ mod tests {
         assert_eq!(sandbox, "read-only");
         assert!(!codex.contains(&"workspace-write"));
         let gemini = dispatch_arguments(Provider::Gemini, PermissionMode::ReadOnly);
-        assert!(gemini
-            .windows(2)
-            .any(|pair| pair == ["--approval-mode", "plan"]));
+        let settings_raw = gemini
+            .iter()
+            .position(|argument| *argument == "--settings")
+            .map(|index| gemini[index + 1])
+            .unwrap();
+        let settings: Value = serde_json::from_str(settings_raw).unwrap();
+        assert_eq!(settings["agentMode"], "");
+        assert_eq!(settings["toolPermission"], "request-review");
+        let denied = settings["permissions"]["deny"].as_array().unwrap();
+        assert!(denied.contains(&json!("write_file(*)")));
+        assert!(denied.contains(&json!("command(*)")));
+        assert!(!gemini.contains(&"--mode"));
     }
 
     #[test]

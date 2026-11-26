@@ -1354,4 +1354,106 @@ mod tests {
         assert!(app.goal.is_none());
         assert_eq!(app.ledger.total(), 1);
     }
+
+    #[test]
+    fn gemini_live_quota_and_untouched_full_buckets_render_in_top_bar_and_left_panel() {
+        let root = scratch("gemini-live-quota");
+        let state_root = root.join("state");
+        let gemini_default =
+            auth::Profile::system_default(state_root.clone(), auth::Provider::Gemini);
+        let gemini_full = auth::Profile::new(state_root, auth::Provider::Gemini, "fresh").unwrap();
+
+        let mut live = Live::new(root.join("work"), vec![gemini_default, gemini_full], None);
+        live.allowances = vec![
+            Allowance {
+                five: Some(81.87),
+                week: Some(86.99),
+                reset_in: Some(75 * 60),
+                latched: false,
+                stale: false,
+            },
+            Allowance {
+                five: Some(100.0),
+                week: Some(100.0),
+                reset_in: None,
+                latched: false,
+                stale: false,
+            },
+        ];
+        live.signed_in = vec![true, true];
+        live.preferred = Some(0);
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        app.auth_detections = vec![auth::AuthDetection {
+            provider: auth::Provider::Gemini,
+            logged_in: true,
+            auth_method: Some("oauth-personal".into()),
+            account: None,
+            tier: Some("google".into()),
+            api_provider: None,
+            config_dir: None,
+            warning: None,
+        }];
+
+        let cards = app.usage_cards();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].1.primary_remaining, Some(81.87));
+        assert_eq!(cards[0].1.secondary_remaining, Some(86.99));
+        assert_eq!(cards[0].1.seconds_until_reset, Some(75 * 60));
+        assert_eq!(cards[1].1.primary_remaining, Some(100.0));
+        assert_eq!(cards[1].1.secondary_remaining, Some(100.0));
+        assert_eq!(cards[1].1.seconds_until_reset, None);
+
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("5h 81% 7d 86%"));
+        app.live.as_mut().unwrap().preferred = Some(1);
+        assert_eq!(
+            app.top_bar_quota_badge().as_deref(),
+            Some("5h 100% 7d 100%")
+        );
+        app.live.as_mut().unwrap().preferred = Some(0);
+
+        let buffer = render(&mut app, 140, 40);
+        let panel = text(&buffer, Rect::new(0, 0, 30, 40));
+        assert!(panel.contains("Gemini · default"), "{panel}");
+        assert!(panel.contains("81% left"), "{panel}");
+        assert!(panel.contains("7d 86%"), "{panel}");
+        assert!(panel.contains("↻ 1h 15m"), "{panel}");
+        assert!(panel.contains("Gemini · fresh"), "{panel}");
+        assert!(panel.contains("100% left"), "{panel}");
+        assert!(panel.contains("7d 100%"), "{panel}");
+        assert!(panel.contains("↻ -"), "{panel}");
+        assert!(!panel.contains("no CLI quota"), "{panel}");
+
+        let top_compact = render(&mut app, 100, 30);
+        let top_line = text(&top_compact, Rect::new(0, 0, 100, 1));
+        assert!(top_line.contains("5h 81% 7d 86%"), "{top_line}");
+        let _ = render(&mut app, 120, 40);
+        let _ = render(&mut app, 80, 24);
+
+        app.live.as_mut().unwrap().allowances[0].stale = true;
+        assert_eq!(
+            app.top_bar_quota_badge().as_deref(),
+            Some("5h 81% 7d 86% stale")
+        );
+        let stale_buf = render(&mut app, 140, 40);
+        let stale_panel = text(&stale_buf, Rect::new(0, 0, 30, 40));
+        assert!(stale_panel.contains("stale"), "{stale_panel}");
+
+        app.live.as_mut().unwrap().allowances[0] = Allowance {
+            five: Some(0.0),
+            week: Some(86.99),
+            reset_in: Some(3600),
+            latched: true,
+            stale: false,
+        };
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("latched"));
+        let latched_buf = render(&mut app, 140, 40);
+        let latched_panel = text(&latched_buf, Rect::new(0, 0, 30, 40));
+        assert!(latched_panel.contains("0% left"), "{latched_panel}");
+        assert!(latched_panel.contains("latched"), "{latched_panel}");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

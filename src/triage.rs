@@ -364,19 +364,20 @@ pub(crate) fn pipe_prompt(report: &str) -> String {
 }
 
 pub(crate) fn pipe_command(provider: Provider, report: &str) -> Command {
-    let mut command = Command::new(provider.binary());
+    let mut command = Command::new(provider.executable());
+    if provider == Provider::Gemini {
+        command.arg("-i");
+    }
     command.arg(pipe_prompt(report));
     command
 }
 
 fn pipe(provider: Provider, report: &str) -> io::Result<()> {
-    if !auth::program_on_path(provider.binary()) {
+    let executable = provider.executable();
+    if !auth::program_on_path(executable) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "{} is not on PATH; run triage without --pipe",
-                provider.binary()
-            ),
+            format!("{executable} is not on PATH; run triage without --pipe"),
         ));
     }
     let status = pipe_command(provider, report).status()?;
@@ -384,8 +385,7 @@ fn pipe(provider: Provider, report: &str) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "{} exited with {status}",
-            provider.binary()
+            "{executable} exited with {status}"
         )))
     }
 }
@@ -517,5 +517,14 @@ mod tests {
         assert!(prompt.starts_with("Help me troubleshoot Agent Command."));
         assert!(prompt.ends_with("{\"version\":\"0.2.0\"}"));
         assert_eq!(pipe_command(Provider::Codex, "x").get_program(), "codex");
+        let gemini = pipe_command(Provider::Gemini, "{\"version\":\"0.2.0\"}");
+        assert_eq!(gemini.get_program(), "agy");
+        let gemini_args: Vec<_> = gemini.get_args().collect();
+        assert_eq!(gemini_args.len(), 2);
+        assert_eq!(gemini_args[0], "-i");
+        assert!(gemini_args[1]
+            .to_str()
+            .unwrap()
+            .ends_with("{\"version\":\"0.2.0\"}"));
     }
 }
