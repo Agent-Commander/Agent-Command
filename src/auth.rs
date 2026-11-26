@@ -74,11 +74,19 @@ impl Provider {
         }
     }
 
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "agy",
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
-            Self::Gemini => "Gemini CLI",
+            Self::Gemini => "Antigravity CLI",
         }
     }
 
@@ -126,7 +134,22 @@ impl Provider {
         match self {
             Self::Claude => "CLAUDE_CONFIG_DIR",
             Self::Codex => "CODEX_HOME",
-            Self::Gemini => "GEMINI_CLI_HOME",
+            Self::Gemini if cfg!(windows) => "USERPROFILE",
+            Self::Gemini => "HOME",
+        }
+    }
+
+    pub(crate) fn apply_isolated_home(self, command: &mut Command, directory: &Path) {
+        match self {
+            Self::Claude | Self::Codex => {
+                command.env(self.home_variable(), directory);
+            }
+            Self::Gemini => {
+                command
+                    .env("HOME", directory)
+                    .env("USERPROFILE", directory)
+                    .env("GEMINI_CLI_HOME", directory);
+            }
         }
     }
 
@@ -298,11 +321,13 @@ impl fmt::Display for Profile {
     }
 }
 
-fn nested_session_guard(key: &str) -> bool {
-    matches!(
-        key.to_ascii_uppercase().as_str(),
-        "CLAUDECODE" | "CLAUDE_SESSION_ID" | "CLAUDE_CODE_ENTRYPOINT" | "CODEX_THREAD_ID"
-    )
+pub(crate) fn nested_session_guard(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.starts_with("ANTIGRAVITY_")
+        || matches!(
+            upper.as_str(),
+            "CLAUDECODE" | "CLAUDE_SESSION_ID" | "CLAUDE_CODE_ENTRYPOINT" | "CODEX_THREAD_ID"
+        )
 }
 
 fn inherited_provider_variable(key: &str) -> bool {
@@ -315,6 +340,8 @@ fn inherited_provider_variable(key: &str) -> bool {
         "CHATGPT_",
         "GEMINI_",
         "GOOGLE_GENAI_",
+        "ANTIGRAVITY_",
+        "AGY_",
     ]
     .iter()
     .any(|prefix| upper.starts_with(prefix))
@@ -605,7 +632,7 @@ impl Profile {
                         command.env_remove(key);
                     }
                 }
-                command.env(self.provider.home_variable(), directory);
+                self.provider.apply_isolated_home(&mut command, directory);
                 for (key, value) in env_overrides {
                     command.env(key, value);
                 }
@@ -1089,11 +1116,31 @@ fn gemini_account_identity(
     isolated_dir: Option<&Path>,
     env_map: &BTreeMap<String, String>,
 ) -> Option<String> {
+    if env_is_truthy(env_map, "AGY_ADC_AUTH") {
+        return None;
+    }
     let base_home = isolated_dir
         .map(Path::to_path_buf)
         .or_else(|| env_non_empty(env_map, "GEMINI_CLI_HOME").map(PathBuf::from))
         .or_else(|| home_dir.map(Path::to_path_buf))?;
     let config_dir = base_home.join(".gemini");
+    let agy_dir = config_dir.join("antigravity-cli");
+    if let Some(agy_settings) = read_json(&agy_dir.join("settings.json")) {
+        if agy_settings["modelProvider"]
+            .as_str()
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("gemini"))
+        {
+            return None;
+        }
+    }
+    let agy_method = read_json(&agy_dir.join("cache").join("acp-auth-state.json"))
+        .and_then(|state| first_text(&state, &["methodId"]));
+    if matches!(
+        agy_method.as_deref(),
+        Some("gemini-api-key" | "agent-platform")
+    ) {
+        return None;
+    }
     let settings = read_json(&config_dir.join("settings.json"));
     let selected_type = settings
         .as_ref()
@@ -1104,14 +1151,39 @@ fn gemini_account_identity(
         if !matches!(selected, "oauth-personal" | "login-with-google") {
             return None;
         }
-    } else if let Some(env_type) = gemini_auth_type_from_env(env_map) {
-        if env_type != "oauth-personal" {
-            return None;
+    } else if agy_method.is_none() {
+        if let Some(env_type) = gemini_auth_type_from_env(env_map) {
+            if env_type != "oauth-personal" {
+                return None;
+            }
         }
     }
-    let accounts = read_json(&config_dir.join("google_accounts.json"))?;
-    let active = first_text(&accounts, &["active"])?;
-    Some(format!("gemini:{}", active.to_ascii_lowercase()))
+    if let Some(accounts) = read_json(&config_dir.join("google_accounts.json")) {
+        if let Some(active) = first_text(&accounts, &["active"]) {
+            return Some(format!("gemini:{}", active.to_ascii_lowercase()));
+        }
+    }
+    let onboarding = read_json(&agy_dir.join("cache").join("onboarding.json"));
+    let onboarding_done = onboarding.as_ref().is_some_and(|data| {
+        data["onboardingComplete"] == true
+            || data["consumerOnboardingComplete"] == true
+            || data["enterpriseOnboardingComplete"] == true
+    });
+    if let Some(method) = agy_method {
+        return Some(format!("gemini:keyring:{}", method.to_ascii_lowercase()));
+    }
+    if onboarding_done {
+        let method = if onboarding
+            .as_ref()
+            .is_some_and(|data| data["enterpriseOnboardingComplete"] == true)
+        {
+            "oauth-business"
+        } else {
+            "oauth-personal"
+        };
+        return Some(format!("gemini:keyring:{method}"));
+    }
+    None
 }
 
 pub fn detect_codex_passive(
@@ -1196,6 +1268,116 @@ pub fn detect_gemini_passive(
         .or_else(|| env_non_empty(env_map, "GEMINI_CLI_HOME").map(PathBuf::from))
         .or_else(|| home_dir.map(Path::to_path_buf));
     let config_dir = base_home.as_ref().map(|base| base.join(".gemini"));
+    let agy_dir = config_dir.as_ref().map(|dir| dir.join("antigravity-cli"));
+
+    let active_email = config_dir
+        .as_ref()
+        .and_then(|dir| read_json(&dir.join("google_accounts.json")))
+        .and_then(|accounts| first_text(&accounts, &["active"]));
+
+    let agy_settings = agy_dir
+        .as_ref()
+        .and_then(|dir| read_json(&dir.join("settings.json")));
+    let agy_gcp_project = agy_settings
+        .as_ref()
+        .and_then(|settings| first_text(&settings["gcp"], &["project"]))
+        .or_else(|| env_non_empty(env_map, "GOOGLE_CLOUD_QUOTA_PROJECT").map(str::to_owned))
+        .or_else(|| env_non_empty(env_map, "GOOGLE_CLOUD_PROJECT").map(str::to_owned))
+        .or_else(|| env_non_empty(env_map, "GOOGLE_CLOUD_PROJECT_ID").map(str::to_owned));
+
+    if agy_settings.as_ref().is_some_and(|settings| {
+        settings["modelProvider"]
+            .as_str()
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("gemini"))
+    }) {
+        let has_key = env_non_empty(env_map, "GEMINI_API_KEY").is_some();
+        return AuthDetection {
+            provider: Provider::Gemini,
+            logged_in: has_key,
+            auth_method: Some("gemini-api-key".into()),
+            account: env_non_empty(env_map, "GOOGLE_GEMINI_BASE_URL").map(str::to_owned),
+            tier: has_key.then(|| "api".into()),
+            api_provider: Some("google".into()),
+            config_dir: agy_dir,
+            warning: (!has_key).then(|| {
+                "Antigravity CLI modelProvider is `gemini`, but GEMINI_API_KEY is not set.".into()
+            }),
+        };
+    }
+
+    if env_is_truthy(env_map, "AGY_ADC_AUTH") {
+        let has_adc = env_non_empty(env_map, "GOOGLE_APPLICATION_CREDENTIALS")
+            .is_some_and(|p| Path::new(p).is_file())
+            || default_gcloud_adc_exists(home_dir, env_map);
+        return AuthDetection {
+            provider: Provider::Gemini,
+            logged_in: has_adc,
+            auth_method: Some("vertex-ai".into()),
+            account: agy_gcp_project,
+            tier: has_adc.then(|| "vertex".into()),
+            api_provider: Some("google".into()),
+            config_dir: agy_dir,
+            warning: (!has_adc).then(|| {
+                "AGY_ADC_AUTH is enabled, but no Google Application Default Credentials file was found."
+                    .into()
+            }),
+        };
+    }
+
+    let agy_onboarding = agy_dir
+        .as_ref()
+        .and_then(|dir| read_json(&dir.join("cache").join("onboarding.json")));
+    let agy_acp_auth = agy_dir
+        .as_ref()
+        .and_then(|dir| read_json(&dir.join("cache").join("acp-auth-state.json")));
+    let onboarding_done = agy_onboarding.as_ref().is_some_and(|data| {
+        data["onboardingComplete"] == true
+            || data["consumerOnboardingComplete"] == true
+            || data["enterpriseOnboardingComplete"] == true
+    });
+    let acp_method = agy_acp_auth
+        .as_ref()
+        .and_then(|data| first_text(data, &["methodId"]));
+
+    if onboarding_done || acp_method.is_some() {
+        let auth_method = acp_method.unwrap_or_else(|| {
+            if agy_onboarding
+                .as_ref()
+                .is_some_and(|data| data["enterpriseOnboardingComplete"] == true)
+            {
+                "oauth-business".into()
+            } else {
+                "oauth-personal".into()
+            }
+        });
+        let (logged_in, tier) = match auth_method.as_str() {
+            "gemini-api-key" => (
+                env_non_empty(env_map, "GEMINI_API_KEY").is_some(),
+                Some("api".into()),
+            ),
+            "oauth-business" => (true, Some("enterprise".into())),
+            "agent-platform" => (true, Some("vertex".into())),
+            "oauth-personal" => (
+                true,
+                Some(if agy_gcp_project.is_some() {
+                    "workspace".into()
+                } else {
+                    "google".into()
+                }),
+            ),
+            _ => (true, Some("google".into())),
+        };
+        return AuthDetection {
+            provider: Provider::Gemini,
+            logged_in,
+            auth_method: Some(auth_method),
+            account: active_email.or(agy_gcp_project),
+            tier: logged_in.then_some(tier).flatten(),
+            api_provider: Some("google".into()),
+            config_dir: agy_dir,
+            warning: None,
+        };
+    }
 
     let mut effective_env = load_gemini_dotenv(workspace, config_dir.as_deref());
     for (key, value) in env_map {
@@ -1240,19 +1422,8 @@ pub fn detect_gemini_passive(
         .or_else(|| gemini_auth_type_from_env(&effective_env));
 
     let Some(auth_type) = auth_type else {
-        return AuthDetection::signed_out(Provider::Gemini, config_dir);
+        return AuthDetection::signed_out(Provider::Gemini, agy_dir.or(config_dir));
     };
-
-    let active_email = config_dir
-        .as_ref()
-        .and_then(|dir| read_json(&dir.join("google_accounts.json")))
-        .and_then(|accounts| {
-            accounts["active"]
-                .as_str()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        });
 
     let (logged_in, tier) = match auth_type.as_str() {
         "oauth-personal" | "login-with-google" => {
@@ -1486,11 +1657,11 @@ fn program(provider: Provider) -> OsString {
 }
 
 fn program_for(provider: Provider, resolved: Option<PathBuf>) -> OsString {
-    resolved.map_or_else(|| provider.binary().into(), PathBuf::into_os_string)
+    resolved.map_or_else(|| provider.executable().into(), PathBuf::into_os_string)
 }
 
 fn runnable(provider: Provider) -> Option<PathBuf> {
-    resolve(provider.binary()).or_else(|| documented(provider))
+    resolve(provider.executable()).or_else(|| documented(provider))
 }
 
 fn documented(provider: Provider) -> Option<PathBuf> {
@@ -1504,7 +1675,7 @@ pub(crate) fn found(provider: Provider) -> Option<Found> {
     if let Some(executable) = adopted(provider).filter(|path| path.is_file()) {
         return Some(Found::At(executable));
     }
-    resolve(provider.binary()).map(|_| Found::OnPath)
+    resolve(provider.executable()).map(|_| Found::OnPath)
 }
 
 pub(crate) fn program_on_path(binary: &str) -> bool {
@@ -1561,11 +1732,21 @@ pub(crate) fn sign_in(profile: &Profile) -> io::Result<ExitStatus> {
 }
 
 pub(crate) fn sign_out(profile: &Profile) -> io::Result<ExitStatus> {
+    if profile.provider.action("logout").is_empty() {
+        return Err(invalid(&format!(
+            "Sign out of {} by running /logout inside {}.",
+            profile.provider.title(),
+            profile.provider.executable()
+        )));
+    }
     session(profile, "logout", Stdio::inherit)
 }
 
-pub(crate) fn sign_out_quietly(profile: &Profile) -> io::Result<ExitStatus> {
-    session(profile, "logout", Stdio::null)
+pub(crate) fn sign_out_quietly(profile: &Profile) -> io::Result<()> {
+    if profile.provider.action("logout").is_empty() {
+        return Ok(());
+    }
+    session(profile, "logout", Stdio::null).map(|_| ())
 }
 
 pub(crate) fn disconnect(profile: &Profile) -> io::Result<()> {
@@ -1612,7 +1793,7 @@ pub(crate) fn succeeded(profile: &Profile, status: ExitStatus) -> io::Result<()>
     } else {
         Err(io::Error::other(format!(
             "{} exited with {status}",
-            profile.provider.binary()
+            profile.provider.executable()
         )))
     }
 }
@@ -2459,11 +2640,129 @@ mod tests {
     #[test]
     fn an_adopted_executable_replaces_the_bare_provider_name() {
         assert_eq!(program_for(Provider::Codex, None), "codex");
+        assert_eq!(program_for(Provider::Gemini, None), "agy");
+        assert_eq!(Provider::Gemini.binary(), "gemini");
+        assert_eq!(Provider::Gemini.executable(), "agy");
+        assert_eq!(Provider::named("gemini"), Some(Provider::Gemini));
         let executable = env::temp_dir().join("bin").join("claude");
         assert_eq!(
             program_for(Provider::Claude, Some(executable.clone())),
             executable.into_os_string()
         );
+    }
+
+    #[test]
+    fn agy_passive_detection_reads_antigravity_cli_cache_settings_and_adc_without_secrets() {
+        let scratch = Scratch::new("agy-passive");
+        let home = scratch.directory("home");
+        let agy_cache = home.join(".gemini").join("antigravity-cli").join("cache");
+        fs::create_dir_all(&agy_cache).unwrap();
+        fs::write(
+            agy_cache.join("onboarding.json"),
+            r#"{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            agy_cache.join("acp-auth-state.json"),
+            r#"{"methodId":"oauth-personal"}"#,
+        )
+        .unwrap();
+
+        let detected = detect_gemini_passive(Some(&home), None, None, &BTreeMap::new());
+        assert!(detected.logged_in);
+        assert_eq!(detected.auth_method.as_deref(), Some("oauth-personal"));
+        assert_eq!(detected.tier.as_deref(), Some("google"));
+        assert_eq!(
+            detected.config_dir.as_deref(),
+            Some(home.join(".gemini").join("antigravity-cli").as_path())
+        );
+
+        let default_profile = Profile {
+            system_home: Some(home.clone()),
+            ..Profile::system_default(scratch.0.join("state"), Provider::Gemini)
+        };
+        assert_eq!(
+            default_profile.account_identity().as_deref(),
+            Some("gemini:keyring:oauth-personal")
+        );
+
+        let agy_settings = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json");
+        fs::write(&agy_settings, r#"{"modelProvider":"gemini"}"#).unwrap();
+        let missing_key = detect_gemini_passive(Some(&home), None, None, &BTreeMap::new());
+        assert!(!missing_key.logged_in);
+        assert!(missing_key
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("GEMINI_API_KEY")));
+
+        let mut api_env = BTreeMap::new();
+        api_env.insert("GEMINI_API_KEY".into(), "test-key".into());
+        let with_key = detect_gemini_passive(Some(&home), None, None, &api_env);
+        assert!(with_key.logged_in);
+        assert_eq!(with_key.auth_method.as_deref(), Some("gemini-api-key"));
+        assert_eq!(with_key.tier.as_deref(), Some("api"));
+        assert_eq!(gemini_account_identity(Some(&home), None, &api_env), None);
+
+        fs::remove_file(&agy_settings).unwrap();
+        let adc_file = scratch.0.join("adc.json");
+        fs::write(&adc_file, "{}").unwrap();
+        let mut adc_env = BTreeMap::new();
+        adc_env.insert("AGY_ADC_AUTH".into(), "true".into());
+        adc_env.insert("GOOGLE_CLOUD_QUOTA_PROJECT".into(), "acme-proj".into());
+        adc_env.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".into(),
+            adc_file.display().to_string(),
+        );
+        let adc = detect_gemini_passive(Some(&home), None, None, &adc_env);
+        assert!(adc.logged_in);
+        assert_eq!(adc.auth_method.as_deref(), Some("vertex-ai"));
+        assert_eq!(adc.account.as_deref(), Some("acme-proj"));
+        assert_eq!(adc.tier.as_deref(), Some("vertex"));
+        assert_eq!(gemini_account_identity(Some(&home), None, &adc_env), None);
+    }
+
+    #[test]
+    fn command_strips_antigravity_env_vars_and_isolates_gemini_home_and_userprofile() {
+        assert!(nested_session_guard("ANTIGRAVITY_AGENT"));
+        assert!(nested_session_guard("ANTIGRAVITY_LS_ADDRESS"));
+        assert!(nested_session_guard("antigravity_csrf_token"));
+        assert!(inherited_provider_variable("ANTIGRAVITY_CONVERSATION_ID"));
+        assert!(inherited_provider_variable("AGY_ADC_AUTH"));
+        assert!(!nested_session_guard("AGY_ADC_AUTH"));
+
+        let scratch = Scratch::new("agy-env");
+        let isolated_dir = scratch.directory("iso");
+        let profile = Profile::new(scratch.0.join("profiles"), Provider::Gemini, "work").unwrap();
+        let cmd = profile.command(&isolated_dir);
+        let envs: BTreeMap<String, Option<OsString>> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(OsStr::to_os_string)))
+            .collect();
+        assert_eq!(
+            envs.get("HOME").and_then(|v| v.as_deref()),
+            Some(isolated_dir.as_os_str())
+        );
+        assert_eq!(
+            envs.get("USERPROFILE").and_then(|v| v.as_deref()),
+            Some(isolated_dir.as_os_str())
+        );
+    }
+
+    #[test]
+    fn disconnect_skips_logout_spawn_when_provider_has_no_logout_subcommand() {
+        let scratch = Scratch::new("gemini-disconnect");
+        let root = scratch.0.join("profiles");
+        let profile = Profile::new(root.clone(), Provider::Gemini, "work")
+            .unwrap()
+            .without_provider();
+        profile.prepare().unwrap();
+        assert!(sign_out_quietly(&profile).is_ok());
+        assert!(sign_out(&profile).is_err());
+        disconnect(&profile).unwrap();
+        assert!(!root.join("gemini").join("work").exists());
     }
 
     fn absent_provider(root: &Path, provider: Provider, name: &str) -> Profile {

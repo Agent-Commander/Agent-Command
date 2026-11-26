@@ -93,7 +93,7 @@ impl Configuration {
         };
         let mut arguments = Vec::new();
         match self.provider {
-            Provider::Claude => {
+            Provider::Claude | Provider::Gemini => {
                 if let Some(model) = self.native_model() {
                     arguments.extend(["--model".to_owned(), model.to_owned()]);
                 }
@@ -110,11 +110,6 @@ impl Configuration {
                         "-c".to_owned(),
                         format!("model_reasoning_effort={}", toml_value(effort)),
                     ]);
-                }
-            }
-            Provider::Gemini => {
-                if let Some(model) = self.native_model() {
-                    arguments.extend(["--model".to_owned(), model.to_owned()]);
                 }
             }
         }
@@ -1304,6 +1299,20 @@ exit 3
             ]
         );
         assert_eq!(codex[1].benchmark().unwrap().slug, "gpt-6-2-sol");
+        let gemini = configurations(
+            Provider::Gemini,
+            Some(&pin("gemini/work", "gemini-3.8-flash", Some("xhigh"))),
+        );
+        assert_eq!(gemini.len(), 2);
+        assert!(gemini[0].arguments().is_empty());
+        assert_eq!(
+            gemini[1].arguments(),
+            ["--model", "gemini-3.8-flash", "--effort", "xhigh"]
+        );
+        assert_eq!(
+            gemini[1].benchmark().unwrap().models_free_slug(),
+            "gemini-3-8-flash-xhigh"
+        );
         assert_eq!(
             configurations(
                 Provider::Codex,
@@ -1319,6 +1328,35 @@ exit 3
 #[cfg(test)]
 mod cross_platform_tests {
     use super::*;
+
+    #[test]
+    fn gemini_configurations_emit_model_and_effort_flags() {
+        let make_pin = |model: &str, effort: Option<&str>| Pin {
+            profile: "gemini/default".into(),
+            model: model.into(),
+            effort: effort.map(str::to_owned),
+        };
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let list = configurations(
+                Provider::Gemini,
+                Some(&make_pin("gemini-3.8-flash", Some(effort))),
+            );
+            assert_eq!(list.len(), 2);
+            assert!(list[0].arguments().is_empty());
+            assert_eq!(
+                list[1].arguments(),
+                ["--model", "gemini-3.8-flash", "--effort", effort]
+            );
+        }
+        let unset = configurations(Provider::Gemini, Some(&make_pin("gemini-3.8-flash", None)));
+        assert_eq!(unset.len(), 2);
+        assert_eq!(unset[1].arguments(), ["--model", "gemini-3.8-flash"]);
+        let refused = configurations(
+            Provider::Gemini,
+            Some(&make_pin("gemini-3.8-flash", Some("minimal"))),
+        );
+        assert_eq!(refused.len(), 1);
+    }
 
     fn test_candidate(
         profile: usize,

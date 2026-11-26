@@ -88,7 +88,13 @@ pub(crate) fn read_only_arguments(provider: Provider) -> &'static [&'static str]
             "read-only",
             "-",
         ],
-        Provider::Gemini => &["-o", "stream-json", "--approval-mode", "plan", "-p", ""],
+        Provider::Gemini => &[
+            "--output-format",
+            "stream-json",
+            "--disable-slash-commands",
+            "--settings",
+            crate::permissions::AGY_READ_ONLY_SETTINGS,
+        ],
     }
 }
 
@@ -187,7 +193,22 @@ mod tests {
         let gemini = read_only_arguments(Provider::Gemini);
         assert!(gemini
             .windows(2)
-            .any(|pair| pair == ["--approval-mode", "plan"]));
+            .any(|pair| pair == ["--output-format", "stream-json"]));
+        assert!(gemini.contains(&"--disable-slash-commands"));
+        assert!(!gemini.contains(&"-p"));
+        assert!(!gemini.contains(&"--approval-mode"));
+        assert!(!gemini.contains(&"--mode"));
+        let settings_raw = gemini
+            .iter()
+            .position(|argument| *argument == "--settings")
+            .map(|index| gemini[index + 1])
+            .unwrap();
+        let settings: Value = serde_json::from_str(settings_raw).unwrap();
+        assert_eq!(settings["agentMode"], "");
+        assert_eq!(settings["toolPermission"], "request-review");
+        let denied = settings["permissions"]["deny"].as_array().unwrap();
+        assert!(denied.contains(&serde_json::json!("write_file(*)")));
+        assert!(denied.contains(&serde_json::json!("command(*)")));
     }
 
     #[test]
@@ -202,8 +223,11 @@ mod tests {
             answer_lines(Provider::Codex, codex.as_bytes()).unwrap(),
             ["Codex says hi"]
         );
-        let gemini =
-            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Gemini says hi\"}\n";
+        let gemini = concat!(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":1,\"state\":\"ACTIVE\",\"step_type\":\"agent_response\",\"text_delta\":\"Gem\"}}\n",
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"ini says hi\\n\"}}\n",
+            "{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-1\",\"status\":\"SUCCESS\",\"response\":\"Gemini says hi\\n\"}}\n"
+        );
         assert_eq!(
             answer_lines(Provider::Gemini, gemini.as_bytes()).unwrap(),
             ["Gemini says hi"]

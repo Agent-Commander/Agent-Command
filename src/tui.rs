@@ -282,7 +282,7 @@ pub fn build_mention_candidates(workspace: &Path, crew: &[Member]) -> Vec<Autoco
         AutocompleteItem {
             value: "gemini".into(),
             label: "@gemini".into(),
-            detail: "Route turn to Gemini CLI".into(),
+            detail: "Route turn to Gemini (agy)".into(),
             kind: "model",
         },
         AutocompleteItem {

@@ -541,30 +541,36 @@ impl Live {
 
     pub(crate) fn refresh_usage(&mut self) {
         let now = usage::now();
-        if self.usage_checked_at == Some(now.elapsed / 1_000_000_000) {
+        let now_sec = now.elapsed / 1_000_000_000;
+        let worker_finished = self
+            .usage_worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        if worker_finished {
+            if let Some(worker) = self.usage_worker.take() {
+                let _ = worker.join();
+            }
+        } else if self.usage_checked_at == Some(now_sec) {
             return;
         }
-        self.usage_checked_at = Some(now.elapsed / 1_000_000_000);
+        self.usage_checked_at = Some(now_sec);
         self.read_allowances(now);
         let displayed = self.displayed_profile();
         self.usage = self
             .profiles
             .get(displayed)
             .and_then(|profile| usage::Usage::read(profile).ok());
-        if self.busy()
-            || self
-                .usage_worker
-                .as_ref()
-                .is_some_and(|worker| !worker.is_finished())
-        {
+        if self.busy() || self.usage_worker.is_some() {
             return;
         }
         let due: Vec<_> = self
             .profiles
             .iter()
             .filter(|profile| {
-                profile.provider == auth::Provider::Codex
-                    && usage::Usage::read(profile).is_ok_and(|usage| usage.codex_due(now))
+                matches!(
+                    profile.provider,
+                    auth::Provider::Codex | auth::Provider::Gemini
+                ) && usage::Usage::read(profile).is_ok_and(|usage| usage.poll_due(now))
             })
             .cloned()
             .collect();
@@ -573,7 +579,14 @@ impl Live {
             self.usage_worker = Some(std::thread::spawn(move || {
                 for profile in due {
                     let tick = usage::now();
-                    if usage::refresh_codex(&profile, tick).is_ok() {
+                    let refreshed = match profile.provider {
+                        auth::Provider::Codex => usage::refresh_codex(&profile, tick).is_ok(),
+                        auth::Provider::Gemini => {
+                            usage::refresh_gemini(&profile, tick).is_ok_and(|a| a.is_some())
+                        }
+                        auth::Provider::Claude => false,
+                    };
+                    if refreshed {
                         usage::Usage::sync_peer_accounts(&all_profiles, &profile, tick);
                     }
                 }
@@ -4177,6 +4190,44 @@ esac
         assert_eq!(app.top_bar_quota_badge().as_deref(), Some("7d 0%"));
         assert!(app.live.as_ref().unwrap().allowances[0].latched);
         assert!(!app.live.as_ref().unwrap().allowances[1].latched);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refresh_usage_polls_gemini_async_and_reloads_immediately_when_worker_completes() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-gemini-async-usage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let gemini = auth::Profile::new(root, auth::Provider::Gemini, "main")
+            .unwrap()
+            .without_provider();
+        gemini.prepare().unwrap();
+
+        let mut live = Live::new(workspace, vec![gemini.clone()], None);
+        live.refresh_usage();
+        assert!(live.usage_worker.is_some());
+        if let Some(worker) = live.usage_worker.take() {
+            let _ = worker.join();
+        }
+
+        let now = usage::now();
+        usage::Usage::record_gemini_limit(&gemini, Some(now.wall + 1800), now).unwrap();
+        let completed = std::thread::spawn(|| {});
+        while !completed.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        live.usage_checked_at = Some(usage::now().elapsed / 1_000_000_000);
+        live.usage_worker = Some(completed);
+        live.refresh_usage();
+
+        assert!(live.usage_worker.is_none());
+        assert!(live.allowances[0].latched);
+        assert!(live.allowances[0].reset_in.is_some());
 
         let _ = fs::remove_dir_all(&base);
     }

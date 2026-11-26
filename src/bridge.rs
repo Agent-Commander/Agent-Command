@@ -82,7 +82,10 @@ pub fn worker_mcp_diet_args(provider: BridgeProvider) -> Vec<String> {
             r#"{"mcpServers":{}}"#.into(),
         ],
         BridgeProvider::Codex => vec!["-c".into(), "mcp_servers={}".into()],
-        BridgeProvider::Gemini => vec!["--allowed-mcp-server-names".into(), "none".into()],
+        BridgeProvider::Gemini => vec![
+            "--settings".into(),
+            r#"{"permissions":{"deny":["mcp(*)"]}}"#.into(),
+        ],
     }
 }
 
@@ -766,7 +769,7 @@ impl LoopbackBridge {
         json!({
             "mcpServers": {
                 BRIDGE_SERVER_NAME: {
-                    "httpUrl": self.url(),
+                    "serverUrl": self.url(),
                     "headers": {
                         "Authorization": format!("Bearer ${{{BRIDGE_TOKEN_ENV}}}")
                     }
@@ -835,8 +838,13 @@ impl LoopbackBridge {
                 let path = self.write_temp_config("gemini", &config)?;
                 Ok(BridgeInjection {
                     args: vec![
-                        "--allowed-mcp-server-names".into(),
-                        BRIDGE_SERVER_NAME.into(),
+                        "--settings".into(),
+                        json!({
+                            "permissions": {
+                                "allow": [format!("mcp({BRIDGE_SERVER_NAME}:*)")]
+                            }
+                        })
+                        .to_string(),
                     ],
                     env: vec![(BRIDGE_TOKEN_ENV.into(), self.token.secret().to_owned())],
                     config_file: Some(path),
@@ -1121,10 +1129,27 @@ mod tests {
         let gemini = bridge.injection_for(BridgeProvider::Gemini).unwrap();
         let gemini_path = gemini.config_file.clone().unwrap();
         assert!(gemini_path.is_file());
+        assert!(!gemini.args.iter().any(|arg| arg.contains(bridge.token())));
+        assert!(!gemini
+            .args
+            .iter()
+            .any(|arg| arg == "--allowed-mcp-server-names"));
         assert_eq!(
             gemini.args,
-            vec!["--allowed-mcp-server-names", BRIDGE_SERVER_NAME]
+            vec![
+                "--settings",
+                r#"{"permissions":{"allow":["mcp(agent_command:*)"]}}"#
+            ]
         );
+        let gemini_json: Value =
+            serde_json::from_str(&fs::read_to_string(&gemini_path).unwrap()).unwrap();
+        assert_eq!(
+            gemini_json["mcpServers"][BRIDGE_SERVER_NAME]["serverUrl"],
+            bridge.url()
+        );
+        assert!(gemini_json["mcpServers"][BRIDGE_SERVER_NAME]
+            .get("httpUrl")
+            .is_none());
 
         drop(bridge);
         assert!(!claude_path.exists());
@@ -1147,7 +1172,7 @@ mod tests {
         );
         assert_eq!(
             worker_mcp_diet_args(BridgeProvider::Gemini),
-            vec!["--allowed-mcp-server-names", "none"]
+            vec!["--settings", r#"{"permissions":{"deny":["mcp(*)"]}}"#]
         );
     }
 

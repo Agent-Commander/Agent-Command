@@ -15,6 +15,8 @@ use std::{
 const SECOND: u64 = 1_000_000_000;
 const POLL_SECONDS: u64 = 300;
 const STALE_SECONDS: u64 = 900;
+const UNSCHEDULED_RESET: i64 = 0;
+const GEMINI_PROBE_TIMEOUT: Duration = Duration::from_secs(18);
 pub const SHORT_WINDOW_BUFFER_PCT: f64 = 15.0;
 pub const WEEKLY_WINDOW_BUFFER_PCT: f64 = 5.0;
 pub const RESET_TIE_HYSTERESIS_SECS: i64 = 600;
@@ -75,12 +77,12 @@ pub(crate) struct Window {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Allowance {
-    pub(crate) five: Option<f64>,
-    pub(crate) week: Option<f64>,
-    pub(crate) reset_in: Option<i64>,
-    pub(crate) latched: bool,
-    pub(crate) stale: bool,
+pub struct Allowance {
+    pub five: Option<f64>,
+    pub week: Option<f64>,
+    pub reset_in: Option<i64>,
+    pub latched: bool,
+    pub stale: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -119,7 +121,7 @@ impl Usage {
         [self.five, self.week]
             .into_iter()
             .flatten()
-            .filter(move |window| window.reset > now.wall)
+            .filter(move |window| window_is_open(*window, now))
     }
 
     pub(crate) fn remaining(self, now: Tick) -> Option<f64> {
@@ -130,6 +132,7 @@ impl Usage {
 
     pub(crate) fn headroom_rate(self, now: Tick) -> Option<f64> {
         self.open_windows(now)
+            .filter(|window| window.reset > now.wall)
             .map(|window| {
                 (100.0 - window.used).clamp(0.0, 100.0) / (window.reset - now.wall) as f64
             })
@@ -143,12 +146,16 @@ impl Usage {
                 let stale = self.unavailable
                     || self.needs_reading()
                     || age.is_none_or(|age| age >= STALE_SECONDS)
-                    || now.wall >= window.reset;
+                    || (window.reset != UNSCHEDULED_RESET && now.wall >= window.reset);
+                let reset_text = if window.reset == UNSCHEDULED_RESET {
+                    "-".into()
+                } else {
+                    duration(window.reset.saturating_sub(now.wall))
+                };
                 format!(
-                    "{name} {:.0}% used / {:.0}% left, reset {} · {}{}",
+                    "{name} {:.0}% used / {:.0}% left, reset {reset_text} · {}{}",
                     window.used.clamp(0.0, 100.0).ceil(),
                     (100.0 - window.used).clamp(0.0, 100.0).floor(),
-                    duration(window.reset.saturating_sub(now.wall)),
                     if stale { "stale " } else { "age " },
                     age.map_or_else(
                         || "age unknown".into(),
@@ -162,7 +169,7 @@ impl Usage {
     }
 
     pub(crate) fn allowance(self, now: Tick) -> Allowance {
-        let open = |window: Option<Window>| window.filter(|window| window.reset > now.wall);
+        let open = |window: Option<Window>| window.filter(|window| window_is_open(*window, now));
         let left = |window: Window| (100.0 - window.used).clamp(0.0, 100.0);
         let five_win = open(self.five);
         let week_win = open(self.week);
@@ -172,9 +179,9 @@ impl Usage {
         if let Some(latch_reset) = latch {
             let already_zero = [five, week].into_iter().flatten().any(|rem| rem <= 0.0);
             if !already_zero {
-                if week_win.is_some_and(|w| w.reset == latch_reset) {
+                if week_win.is_some_and(|w| w.reset > now.wall && w.reset == latch_reset) {
                     week = Some(0.0);
-                } else if five_win.is_some_and(|w| w.reset == latch_reset) {
+                } else if five_win.is_some_and(|w| w.reset > now.wall && w.reset == latch_reset) {
                     five = Some(0.0);
                 } else {
                     match (five, week) {
@@ -194,7 +201,9 @@ impl Usage {
         }
         let constraining = match (five_win, week_win) {
             (Some(f), Some(w)) => {
-                if left(w) < left(f) {
+                let wf = left(f);
+                let ww = left(w);
+                if ww < wf || (ww == wf && f.reset <= now.wall && w.reset > now.wall) {
                     Some(w)
                 } else {
                     Some(f)
@@ -206,7 +215,9 @@ impl Usage {
         };
         let reset = match latch {
             Some(reset) => Some(reset).filter(|reset| *reset != i64::MAX),
-            None => constraining.map(|window| window.reset),
+            None => constraining
+                .map(|window| window.reset)
+                .filter(|reset| *reset > now.wall),
         };
         let stale = if latch.is_some() {
             false
@@ -243,7 +254,7 @@ impl Usage {
         self.latch.is_some()
     }
 
-    pub(crate) fn codex_due(self, now: Tick) -> bool {
+    pub(crate) fn poll_due(self, now: Tick) -> bool {
         (!self.blocked(now) || self.latch == Some(i64::MAX))
             && self.probe.is_none_or(|probe| {
                 let start = if probe.started.epoch == now.epoch {
@@ -344,8 +355,8 @@ impl Usage {
             return;
         };
         let snap = PeerSnapshot {
-            five: source_usage.five.filter(|w| w.reset > now.wall),
-            week: source_usage.week.filter(|w| w.reset > now.wall),
+            five: source_usage.five.filter(|w| window_is_open(*w, now)),
+            week: source_usage.week.filter(|w| window_is_open(*w, now)),
             blocked: source_usage.blocked(now),
             known_reset: source_usage.known_reset(now),
             fresh: !source_usage.unavailable,
@@ -411,7 +422,7 @@ impl Usage {
                     }
                 }
                 if blocked || fresh {
-                    if let Some(w) = usage.five.filter(|w| w.reset > now.wall) {
+                    if let Some(w) = usage.five.filter(|w| window_is_open(*w, now)) {
                         if should_mirror_window(merged_five, w, now) {
                             merged_five = Some(w);
                         }
@@ -419,7 +430,7 @@ impl Usage {
                             any_fresh_window = true;
                         }
                     }
-                    if let Some(w) = usage.week.filter(|w| w.reset > now.wall) {
+                    if let Some(w) = usage.week.filter(|w| window_is_open(*w, now)) {
                         if should_mirror_window(merged_week, w, now) {
                             merged_week = Some(w);
                         }
@@ -541,6 +552,10 @@ fn observation_age(window: Window, now: Tick) -> Option<u64> {
         .map(|age| age / SECOND)
 }
 
+fn window_is_open(window: Window, now: Tick) -> bool {
+    window.reset > now.wall || (window.reset == UNSCHEDULED_RESET && window.used <= 0.0)
+}
+
 fn window(used: f64, reset: i64, now: Tick) -> Option<Window> {
     (used.is_finite() && used >= 0.0 && (now.wall..i64::MAX).contains(&reset)).then_some(Window {
         used,
@@ -611,7 +626,7 @@ fn window_is_fresh(window: Window, now: Tick) -> bool {
 }
 
 fn should_mirror_window(peer: Option<Window>, src: Window, now: Tick) -> bool {
-    match peer.filter(|w| w.reset > now.wall) {
+    match peer.filter(|w| window_is_open(*w, now)) {
         None => true,
         Some(existing) => {
             src.observed > existing.observed
@@ -794,11 +809,11 @@ impl Usage {
     pub(crate) fn within_safety_buffer(self, now: Tick) -> bool {
         let short_ok = self
             .five
-            .filter(|w| w.reset > now.wall)
+            .filter(|w| window_is_open(*w, now))
             .is_none_or(|w| (100.0 - w.used).clamp(0.0, 100.0) >= SHORT_WINDOW_BUFFER_PCT);
         let week_ok = self
             .week
-            .filter(|w| w.reset > now.wall)
+            .filter(|w| window_is_open(*w, now))
             .is_none_or(|w| (100.0 - w.used).clamp(0.0, 100.0) >= WEEKLY_WINDOW_BUFFER_PCT);
         short_ok && week_ok
     }
@@ -957,11 +972,11 @@ fn codex_windows(
 }
 
 pub(crate) fn refresh_codex(profile: &Profile, now: Tick) -> io::Result<()> {
-    if profile.provider != Provider::Codex || !Usage::read(profile)?.codex_due(now) {
+    if profile.provider != Provider::Codex || !Usage::read(profile)?.poll_due(now) {
         return Ok(());
     }
     let reserved = update(profile, |state| {
-        if !state.codex_due(now) {
+        if !state.poll_due(now) {
             return Ok(false);
         }
         state.probe = Some(Probe {
@@ -993,6 +1008,401 @@ pub(crate) fn refresh_codex(profile: &Profile, now: Tick) -> io::Result<()> {
         }
         Ok(())
     })
+}
+
+pub fn refresh_gemini(profile: &Profile, now: Tick) -> io::Result<Option<Allowance>> {
+    refresh_gemini_with(profile, now, gemini_readback)
+}
+
+fn refresh_gemini_with(
+    profile: &Profile,
+    now: Tick,
+    readback: impl FnOnce(&Profile) -> io::Result<String>,
+) -> io::Result<Option<Allowance>> {
+    if profile.provider != Provider::Gemini || !Usage::read(profile)?.poll_due(now) {
+        return Ok(None);
+    }
+    let reserved = update(profile, |state| {
+        if !state.poll_due(now) {
+            return Ok(false);
+        }
+        state.probe = Some(Probe {
+            id: uuid::Uuid::new_v4(),
+            started: now.into(),
+        });
+        state.next_poll = None;
+        Ok(true)
+    })?;
+    if !reserved {
+        return Ok(None);
+    }
+    let result = readback(profile);
+    update(profile, |state| match result {
+        Ok(output) => {
+            let (five, week, limit) = gemini_windows(&output, now);
+            state.five = five.or(state.five);
+            state.week = week.or(state.week);
+            state.unavailable = five.is_none() && week.is_none();
+            if let Some(reset) = limit {
+                state.record_limit(reset, now);
+            } else if (five.is_some() || week.is_some())
+                && (!state.blocked(now) || state.latch == Some(i64::MAX))
+            {
+                state.latch = None;
+            }
+            Ok((five.is_some() || week.is_some() || limit.is_some()).then(|| state.allowance(now)))
+        }
+        Err(_) => {
+            state.unavailable = true;
+            Ok(None)
+        }
+    })
+}
+
+fn gemini_readback(profile: &Profile) -> io::Result<String> {
+    let mut command = profile.authenticated_command()?;
+    command.args([
+        "-p",
+        "/usage",
+        "--output-format",
+        "json",
+        "--print-timeout",
+        "15s",
+    ]);
+    run_with_timeout(&mut command, GEMINI_PROBE_TIMEOUT)
+}
+
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read_result = io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes);
+        let _ = sender.send(read_result);
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if receiver.recv_timeout(Duration::from_millis(200)).is_ok() {
+                let _ = reader.join();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Gemini usage readback timed out",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(Duration::from_millis(25).min(remaining));
+    };
+    let bytes = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| io::Error::other("Gemini usage output unavailable"))??;
+    let _ = reader.join();
+    if !status.success() {
+        return Err(io::Error::other("Gemini usage readback failed"));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::other("Gemini usage readback was not valid UTF-8"))
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut value = 0u32;
+    for &byte in bytes {
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let m = u64::from(month);
+    let d = u64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+fn parse_rfc3339_utc(input: &str) -> Option<i64> {
+    let bytes = input.trim().as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = i64::from(parse_ascii_u32(&bytes[0..4])?);
+    let month = parse_ascii_u32(&bytes[5..7])?;
+    let day = parse_ascii_u32(&bytes[8..10])?;
+    let hour = parse_ascii_u32(&bytes[11..13])?;
+    let minute = parse_ascii_u32(&bytes[14..16])?;
+    let second = parse_ascii_u32(&bytes[17..19])?;
+
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut pos = 19;
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        let frac_start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos == frac_start {
+            return None;
+        }
+    }
+
+    let tz = &bytes[pos..];
+    let offset_secs: i64 = match tz {
+        [b'Z'] | [b'z'] => 0,
+        [sign @ (b'+' | b'-'), h0, h1, b':', m0, m1] => {
+            let off_h = parse_ascii_u32(&[*h0, *h1])?;
+            let off_m = parse_ascii_u32(&[*m0, *m1])?;
+            if off_h > 23 || off_m > 59 {
+                return None;
+            }
+            let total = i64::from(off_h) * 3600 + i64::from(off_m) * 60;
+            if *sign == b'+' {
+                total
+            } else {
+                -total
+            }
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let day_secs = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    days.checked_mul(86_400)?
+        .checked_add(day_secs)?
+        .checked_sub(offset_secs)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GeminiBucket {
+    FiveHour,
+    Weekly,
+}
+
+#[derive(Default)]
+struct GeminiParsed {
+    five: Option<Window>,
+    week: Option<Window>,
+    limited: bool,
+    exhausted_reset: Option<i64>,
+}
+
+impl GeminiParsed {
+    fn record(&mut self, bucket: GeminiBucket, used: f64, reset: Option<i64>, now: Tick) {
+        if !used.is_finite() {
+            return;
+        }
+        let clamped = used.clamp(0.0, 100.0);
+        if clamped >= 100.0 {
+            self.limited = true;
+            if let Some(valid) = reset.filter(|epoch| *epoch > now.wall && *epoch != i64::MAX) {
+                self.exhausted_reset =
+                    Some(self.exhausted_reset.map_or(valid, |cur| cur.max(valid)));
+            }
+        }
+        let parsed = gemini_window(clamped, reset, now);
+        match bucket {
+            GeminiBucket::FiveHour => self.five = tighter_window(self.five, parsed),
+            GeminiBucket::Weekly => self.week = tighter_window(self.week, parsed),
+        }
+    }
+
+    fn finish(self) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
+        (
+            self.five,
+            self.week,
+            self.limited.then_some(self.exhausted_reset),
+        )
+    }
+}
+
+fn gemini_window(used: f64, reset: Option<i64>, now: Tick) -> Option<Window> {
+    if !used.is_finite() || used < 0.0 {
+        return None;
+    }
+    let clamped = used.clamp(0.0, 100.0);
+    if let Some(epoch) = reset.filter(|epoch| (now.wall..i64::MAX).contains(epoch)) {
+        return window(clamped, epoch, now);
+    }
+    if clamped <= 0.0 && reset.is_none_or(|epoch| epoch <= UNSCHEDULED_RESET) {
+        return Some(Window {
+            used: 0.0,
+            reset: UNSCHEDULED_RESET,
+            observed: now.wall,
+            stamp: Some(now.into()),
+        });
+    }
+    None
+}
+
+fn classify_gemini_json_bucket(bucket: &Value) -> Option<GeminiBucket> {
+    let id = bucket["id"].as_str();
+    let window_kind = bucket["window"].as_str();
+    if id.is_some_and(|v| v.eq_ignore_ascii_case("gemini-5h"))
+        || window_kind.is_some_and(|v| v.eq_ignore_ascii_case("5h"))
+    {
+        Some(GeminiBucket::FiveHour)
+    } else if id.is_some_and(|v| v.eq_ignore_ascii_case("gemini-weekly"))
+        || window_kind
+            .is_some_and(|v| v.eq_ignore_ascii_case("weekly") || v.eq_ignore_ascii_case("7d"))
+    {
+        Some(GeminiBucket::Weekly)
+    } else {
+        None
+    }
+}
+
+fn classify_gemini_tsv_label(label: &str) -> Option<GeminiBucket> {
+    let lower = label.trim().to_ascii_lowercase();
+    if lower.contains("five hour") || lower.contains("5h") {
+        Some(GeminiBucket::FiveHour)
+    } else if lower.contains("weekly") || lower.contains("7d") {
+        Some(GeminiBucket::Weekly)
+    } else {
+        None
+    }
+}
+
+fn gemini_windows_from_groups(
+    groups: &[Value],
+    now: Tick,
+) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
+    let mut parsed = GeminiParsed::default();
+    for group in groups {
+        if !group["name"]
+            .as_str()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case("gemini models"))
+        {
+            continue;
+        }
+        let Some(buckets) = group["buckets"].as_array() else {
+            continue;
+        };
+        for bucket in buckets {
+            let Some(kind) = classify_gemini_json_bucket(bucket) else {
+                continue;
+            };
+            let Some(remaining_fraction) = bucket["remaining_fraction"]
+                .as_f64()
+                .filter(|frac| frac.is_finite())
+            else {
+                continue;
+            };
+            let used = ((1.0 - remaining_fraction) * 100.0).clamp(0.0, 100.0);
+            let reset = bucket["reset_time"].as_str().and_then(parse_rfc3339_utc);
+            parsed.record(kind, used, reset, now);
+        }
+    }
+    parsed.finish()
+}
+
+fn gemini_windows_from_tsv(
+    tsv: &str,
+    now: Tick,
+) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
+    let mut parsed = GeminiParsed::default();
+    for line in tsv.lines() {
+        let mut columns = line.split('\t');
+        let Some(group) = columns.next() else {
+            continue;
+        };
+        if !group.trim().eq_ignore_ascii_case("gemini models") {
+            continue;
+        }
+        let Some(label) = columns.next() else {
+            continue;
+        };
+        let Some(kind) = classify_gemini_tsv_label(label) else {
+            continue;
+        };
+        let Some(percent_raw) = columns.next() else {
+            continue;
+        };
+        let Some(remaining_pct) = percent_raw
+            .trim()
+            .strip_suffix('%')
+            .and_then(|digits| digits.trim().parse::<f64>().ok())
+            .filter(|pct| pct.is_finite() && *pct >= 0.0)
+        else {
+            continue;
+        };
+        let used = (100.0 - remaining_pct.clamp(0.0, 100.0)).clamp(0.0, 100.0);
+        let reset = columns
+            .next()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .and_then(parse_rfc3339_utc);
+        parsed.record(kind, used, reset, now);
+    }
+    parsed.finish()
+}
+
+fn gemini_windows(raw: &str, now: Tick) -> (Option<Window>, Option<Window>, Option<Option<i64>>) {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if value["status"]
+            .as_str()
+            .is_some_and(|status| !status.eq_ignore_ascii_case("SUCCESS"))
+        {
+            return (None, None, None);
+        }
+        if let Some(groups) = value["command"]["data"]["groups"].as_array() {
+            let structured = gemini_windows_from_groups(groups, now);
+            if structured.0.is_some() || structured.1.is_some() || structured.2.is_some() {
+                return structured;
+            }
+        }
+        if let Some(response) = value["response"].as_str() {
+            return gemini_windows_from_tsv(response, now);
+        }
+        return (None, None, None);
+    }
+    gemini_windows_from_tsv(raw, now)
 }
 
 fn codex_readback(profile: &Profile) -> io::Result<Value> {
@@ -1379,6 +1789,66 @@ done
             fs::read_to_string(directory.join("calls")).unwrap(),
             "probe\nprobe\n"
         );
+    }
+
+    #[test]
+    fn gemini_subprocess_probe_parses_json_and_enforces_monotonic_backoff() {
+        let log_path = std::env::temp_dir().join(format!(
+            "ac-gemini-probe-calls-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+test "$1" = "-p" || exit 2
+test "$2" = "/usage" || exit 3
+test "$3" = "--output-format" || exit 4
+test "$4" = "json" || exit 5
+test "$5" = "--print-timeout" || exit 6
+test "$6" = "15s" || exit 7
+printf 'probe\n' >> '{log}'
+printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","response":"","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.87,"reset_time":"2026-12-02T00:53:44Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":0.82,"reset_time":"2026-11-26T03:17:50Z"}}]}}]}}}}}}'
+"#,
+            log = log_path.display()
+        );
+        let fixture = Fixture::new("gemini-probe", &script);
+        let profile = fixture.profile(Provider::Gemini, "selected");
+        let (_, directory) = profile.isolated_command().unwrap();
+        let cache = directory
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(
+            cache.join("onboarding.json"),
+            r#"{"onboardingComplete":true}"#,
+        )
+        .unwrap();
+
+        let now_wall = parse_rfc3339_utc("2026-11-26T01:00:00Z").unwrap();
+        let first = refresh_gemini(&profile, tick(now_wall, 0))
+            .unwrap()
+            .expect("first gemini allowance");
+        assert!((first.five.unwrap() - 82.0).abs() < 1e-6);
+        assert!((first.week.unwrap() - 87.0).abs() < 1e-6);
+        assert!(!first.latched);
+        assert!(!first.stale);
+
+        let reopened = fixture.profile(Provider::Gemini, "selected");
+        assert!(
+            refresh_gemini(&reopened, tick(now_wall + 600, POLL_SECONDS - 1))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "probe\n");
+
+        assert!(
+            refresh_gemini(&reopened, tick(now_wall + 600, POLL_SECONDS))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "probe\nprobe\n");
+        let _ = fs::remove_file(log_path);
     }
 }
 
@@ -1842,5 +2312,397 @@ mod pool_tests {
         Usage::reconcile_peer_accounts(&codex_profiles, now);
         assert!(Usage::read(&unknown_latched).unwrap().blocked(now));
         assert!(Usage::read(&stale_unblocked).unwrap().blocked(now));
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_handles_epoch_leap_years_fractions_and_offsets() {
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_utc("2000-02-29T00:00:00Z"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2000-02-29T00:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2024-02-29T23:59:59Z"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2024-02-29T23:59:59Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-11-26T03:17:50Z"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-26T03:17:50Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-12-02T00:53:44.987654Z"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-12-02T00:53:44Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-11-26T05:17:50+02:00"),
+            parse_rfc3339_utc("2026-11-26T03:17:50Z")
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-11-25T21:47:50-05:30"),
+            parse_rfc3339_utc("2026-11-26T03:17:50Z")
+        );
+        for invalid in [
+            "",
+            "not-a-date",
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-11-26T24:00:00Z",
+            "2026-11-26T03:17:50",
+            "2026-11-26T03:17:50.Z",
+            "2026-11-26T03:17:50Zextra",
+        ] {
+            assert_eq!(parse_rfc3339_utc(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn gemini_windows_parses_structured_json_and_tsv_fallback() {
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 10);
+        let five_reset = parse_rfc3339_utc("2026-11-26T03:17:50Z").unwrap();
+        let week_reset = parse_rfc3339_utc("2026-12-02T00:53:44Z").unwrap();
+
+        let real_payload = serde_json::json!({
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "response": "Gemini Models\tWeekly Limit Remaining\t87%\t2026-12-02T00:53:44Z\nGemini Models\tFive Hour Limit Remaining\t82%\t2026-11-26T03:17:50Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t1970-01-01T00:00:00Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\n",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "id": "gemini-weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.8699474334716797,
+                                    "reset_time": "2026-12-02T00:53:44Z"
+                                },
+                                {
+                                    "id": "gemini-5h",
+                                    "window": "5h",
+                                    "remaining_fraction": 0.8187379240989685,
+                                    "reset_time": "2026-11-26T03:17:50Z"
+                                }
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {
+                                    "id": "3p-weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.1,
+                                    "reset_time": "2026-12-02T00:53:44Z"
+                                },
+                                {
+                                    "id": "3p-5h",
+                                    "window": "5h",
+                                    "remaining_fraction": 0.0,
+                                    "reset_time": "2026-11-26T03:17:50Z"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string();
+
+        let (five, week, limit) = gemini_windows(&real_payload, now);
+        assert!(limit.is_none());
+        let five = five.expect("5h window");
+        let week = week.expect("weekly window");
+        assert!((five.used - 18.12620759010315).abs() < 1e-6);
+        assert_eq!(five.reset, five_reset);
+        assert!((week.used - 13.005256652832031).abs() < 1e-6);
+        assert_eq!(week.reset, week_reset);
+
+        let usage = Usage {
+            five: Some(five),
+            week: Some(week),
+            ..Usage::default()
+        };
+        let allowance = usage.allowance(now);
+        assert!((allowance.five.unwrap() - 81.87379240989685).abs() < 1e-6);
+        assert!((allowance.week.unwrap() - 86.99474334716797).abs() < 1e-6);
+        assert_eq!(allowance.reset_in, Some(five_reset - now_wall));
+        assert!(!allowance.latched);
+        assert!(!allowance.stale);
+
+        let tsv_only_json = serde_json::json!({
+            "status": "SUCCESS",
+            "response": "Gemini Models\tWeekly Limit Remaining\t87%\t2026-12-02T00:53:44Z\r\nGemini Models\tFive Hour Limit Remaining\t82%\t2026-11-26T03:17:50Z\r\n"
+        })
+        .to_string();
+        let (tsv_five, tsv_week, tsv_limit) = gemini_windows(&tsv_only_json, now);
+        assert!(tsv_limit.is_none());
+        assert!((tsv_five.unwrap().used - 18.0).abs() < 1e-6);
+        assert!((tsv_week.unwrap().used - 13.0).abs() < 1e-6);
+
+        let raw_tsv = "Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-26T03:17:50Z\nGemini Models\tFive Hour Limit Remaining\t75%\t2026-11-26T03:17:50Z\n";
+        let (raw_five, raw_week, raw_limit) = gemini_windows(raw_tsv, now);
+        assert!(raw_limit.is_none());
+        assert!((raw_five.unwrap().used - 25.0).abs() < 1e-6);
+        assert!(raw_week.is_none());
+
+        let failed_json = serde_json::json!({
+            "status": "ERROR",
+            "response": "Gemini Models\tFive Hour Limit Remaining\t82%\t2026-11-26T03:17:50Z\n"
+        })
+        .to_string();
+        assert!(matches!(
+            gemini_windows(&failed_json, now),
+            (None, None, None)
+        ));
+    }
+
+    #[test]
+    fn gemini_untouched_full_bucket_with_epoch_zero_stays_open_without_reset() {
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 50);
+
+        let untouched_json = serde_json::json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [{
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 1,
+                                "reset_time": "1970-01-01T00:00:00Z"
+                            },
+                            {
+                                "id": "gemini-5h",
+                                "window": "5h",
+                                "remaining_fraction": 1.0,
+                                "reset_time": "1970-01-01T00:00:00Z"
+                            }
+                        ]
+                    }]
+                }
+            }
+        })
+        .to_string();
+
+        let (five, week, limit) = gemini_windows(&untouched_json, now);
+        assert!(limit.is_none());
+        let usage = Usage {
+            five,
+            week,
+            ..Usage::default()
+        };
+        let allowance = usage.allowance(now);
+        assert_eq!(allowance.five, Some(100.0));
+        assert_eq!(allowance.week, Some(100.0));
+        assert_eq!(allowance.reset_in, None);
+        assert!(!allowance.latched);
+        assert!(!allowance.stale);
+        assert_eq!(usage.remaining(now), Some(100.0));
+        assert_eq!(usage.headroom_rate(now), None);
+        assert_eq!(usage.longest_active_reset(now), None);
+        assert!(usage.within_safety_buffer(now));
+        let [five_row, week_row] = usage.rows(now);
+        assert!(
+            five_row.contains("0% used / 100% left, reset - · age 0s"),
+            "{five_row}"
+        );
+        assert!(
+            week_row.contains("0% used / 100% left, reset - · age 0s"),
+            "{week_row}"
+        );
+
+        let mixed_tsv = "Gemini Models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\nGemini Models\tWeekly Limit Remaining\t87%\t2026-12-02T00:53:44Z\n";
+        let (mixed_five, mixed_week, mixed_limit) = gemini_windows(mixed_tsv, now);
+        assert!(mixed_limit.is_none());
+        let mixed = Usage {
+            five: mixed_five,
+            week: mixed_week,
+            ..Usage::default()
+        };
+        let mixed_allowance = mixed.allowance(now);
+        assert_eq!(mixed_allowance.five, Some(100.0));
+        assert_eq!(mixed_allowance.week, Some(87.0));
+        assert_eq!(
+            mixed_allowance.reset_in,
+            Some(parse_rfc3339_utc("2026-12-02T00:53:44Z").unwrap() - now_wall)
+        );
+    }
+
+    #[test]
+    fn refresh_gemini_exhausted_bucket_latches_and_never_shortens_existing_latch() {
+        let temp = TempRoot::new("gemini-exhausted");
+        let profile = temp.profile(Provider::Gemini, "main");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+        let now = tick(now_wall, 0);
+        let reset_far = parse_rfc3339_utc("2026-11-26T07:00:00Z").unwrap();
+        let reset_near = parse_rfc3339_utc("2026-11-26T04:00:00Z").unwrap();
+
+        let exhausted_far = serde_json::json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [{
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "id": "gemini-5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.0,
+                                "reset_time": "2026-11-26T07:00:00Z"
+                            },
+                            {
+                                "id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.65,
+                                "reset_time": "2026-12-02T00:53:44Z"
+                            }
+                        ]
+                    }]
+                }
+            }
+        })
+        .to_string();
+
+        let allowance = refresh_gemini_with(&profile, now, |_| Ok(exhausted_far))
+            .unwrap()
+            .expect("exhausted allowance");
+        assert!(allowance.latched);
+        assert_eq!(allowance.five, Some(0.0));
+        assert!((allowance.week.unwrap() - 65.0).abs() < 1e-6);
+        assert_eq!(allowance.reset_in, Some(reset_far - now_wall));
+
+        let state = Usage::read(&profile).unwrap();
+        assert!(state.blocked(now));
+        assert_eq!(state.known_reset(now), Some(reset_far));
+        assert!(!state.poll_due(tick(now_wall + 600, POLL_SECONDS + 1)));
+
+        Usage::record_gemini_limit(&profile, Some(reset_near), now).unwrap();
+        assert_eq!(
+            Usage::read(&profile).unwrap().known_reset(now),
+            Some(reset_far)
+        );
+
+        let unknown_profile = temp.profile(Provider::Gemini, "unknown-exhausted");
+        let exhausted_unknown = serde_json::json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [{
+                        "name": "Gemini Models",
+                        "buckets": [{
+                            "id": "gemini-5h",
+                            "window": "5h",
+                            "remaining_fraction": 0.0,
+                            "reset_time": "1970-01-01T00:00:00Z"
+                        }]
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let unknown_allowance =
+            refresh_gemini_with(&unknown_profile, now, |_| Ok(exhausted_unknown))
+                .unwrap()
+                .expect("unknown reset latch allowance");
+        assert!(unknown_allowance.latched);
+        assert_eq!(unknown_allowance.reset_in, None);
+        assert_eq!(
+            Usage::read(&unknown_profile).unwrap().latch_label(now),
+            "Latched · reset unknown"
+        );
+    }
+
+    #[test]
+    fn refresh_gemini_enforces_five_minute_monotonic_floor_and_fails_closed_on_corrupt_state() {
+        let temp = TempRoot::new("gemini-floor");
+        let now_wall = parse_rfc3339_utc("2026-11-26T02:00:00Z").unwrap();
+
+        let claude = temp.profile(Provider::Claude, "skip");
+        let mut calls = 0usize;
+        assert!(refresh_gemini_with(&claude, tick(now_wall, 0), |_| {
+            calls += 1;
+            Ok(String::new())
+        })
+        .unwrap()
+        .is_none());
+        assert_eq!(calls, 0);
+
+        let corrupt = temp.profile(Provider::Gemini, "corrupt");
+        let corrupt_path = corrupt.usage_directory().unwrap().join("state.json");
+        fs::write(&corrupt_path, b"{ broken").unwrap();
+        assert!(refresh_gemini_with(&corrupt, tick(now_wall, 0), |_| {
+            calls += 1;
+            Ok(String::new())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        assert_eq!(fs::read(&corrupt_path).unwrap(), b"{ broken");
+
+        let profile = temp.profile(Provider::Gemini, "paced");
+        assert!(refresh_gemini_with(&profile, tick(now_wall, 0), |_| {
+            calls += 1;
+            Err(io::Error::other("offline"))
+        })
+        .unwrap()
+        .is_none());
+        assert_eq!(calls, 1);
+
+        assert!(
+            refresh_gemini_with(&profile, tick(now_wall + 1_000, POLL_SECONDS - 1), |_| {
+                calls += 1;
+                Ok(String::new())
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(calls, 1);
+
+        let mut reopened = tick(now_wall + 2_000, 999);
+        reopened.epoch = uuid::Uuid::new_v4();
+        assert!(refresh_gemini_with(&profile, reopened, |_| {
+            calls += 1;
+            Ok(String::new())
+        })
+        .unwrap()
+        .is_none());
+        assert_eq!(calls, 1);
+
+        reopened.elapsed += POLL_SECONDS * SECOND;
+        let healthy = "Gemini Models\tFive Hour Limit Remaining\t82%\t2026-11-26T03:17:50Z\n";
+        let recovered = refresh_gemini_with(&profile, reopened, |_| {
+            calls += 1;
+            Ok(healthy.to_owned())
+        })
+        .unwrap()
+        .expect("recovered after monotonic floor");
+        assert_eq!(calls, 2);
+        assert_eq!(recovered.five, Some(82.0));
+        assert!(!recovered.stale);
     }
 }

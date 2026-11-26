@@ -51,7 +51,9 @@ fn documented_in(home: &Path, provider: Provider) -> Option<PathBuf> {
 impl Host for FakeHost {
     fn found(&self, provider: Provider) -> Option<Found> {
         let mut script = self.0.borrow_mut();
-        script.checks.push(format!("found {}", provider.binary()));
+        script
+            .checks
+            .push(format!("found {}", provider.executable()));
         let slot = provider_slot(provider);
         if let Some(path) = script.adopted[slot].clone() {
             return Some(Found::At(path));
@@ -67,7 +69,7 @@ impl Host for FakeHost {
         let mut script = self.0.borrow_mut();
         script.calls.push(format!(
             "adopt {} {}",
-            provider.binary(),
+            provider.executable(),
             executable.display()
         ));
         script.adopted[provider_slot(provider)] = Some(executable.into());
@@ -1243,6 +1245,56 @@ fn an_installed_cli_that_is_still_missing_asks_for_a_new_terminal() {
         );
         let text = screen(&render(&mut app, width, height));
         assert!(text.contains("✗ claude not found"), "{text}");
+    }
+}
+
+#[test]
+fn gemini_install_uses_agy_executable_and_official_installer() {
+    for (index, (width, height)) in SIZES.into_iter().enumerate() {
+        let sandbox = Sandbox::new(&format!("gemini-agy-{width}"));
+        let home = sandbox.0.join("home");
+        let host = fake([true, true], &[]);
+        host.0.borrow_mut().home = Some(home.clone());
+        host.0.borrow_mut().installs = Some(if index == 0 {
+            Landing::OnPath
+        } else {
+            Landing::DocumentedDirectory
+        });
+        let mut app = preview(&host, LaunchConfig::default());
+        open(&mut app, false);
+        let before = screen(&render(&mut app, width, height));
+        assert!(before.contains("Antigravity CLI"), "{before}");
+        assert!(before.contains("✗ agy not found"), "{before}");
+        assert_inside(&app, width, height);
+
+        choose_install(&mut app, Provider::Gemini, index == 0, width, height);
+        let prompt = screen(&render(&mut app, width, height));
+        assert!(
+            prompt.contains("Install Antigravity CLI with its official installer:"),
+            "{prompt}"
+        );
+        assert!(prompt.contains(plan_for(Provider::Gemini).docs), "{prompt}");
+        assert_inside(&app, width, height);
+
+        host.0.borrow_mut().checks.clear();
+        confirm_install(&mut app, index == 0, width, height);
+        assert!(host.0.borrow().checks.contains(&"found agy".to_owned()));
+        let after = screen(&render(&mut app, width, height));
+        if index == 0 {
+            assert_eq!(status(&app), "Antigravity CLI installed: agy is on PATH.");
+            assert!(after.contains("✓ agy on PATH"), "{after}");
+        } else {
+            let executable = documented_in(&home, Provider::Gemini).unwrap();
+            assert_eq!(
+                status(&app),
+                format!(
+                    "Antigravity CLI installed. Using {} for agy in this session.",
+                    executable.display()
+                )
+            );
+            assert!(after.contains("✓ agy at "), "{after}");
+        }
+        assert!(!has_hit(&app, Action::Install(Provider::Gemini)), "{after}");
     }
 }
 

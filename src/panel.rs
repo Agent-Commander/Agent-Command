@@ -399,7 +399,7 @@ impl ConnectForm {
             let slot = provider_slot(provider);
             let mark = if self.chosen[slot] { "[x]" } else { "[ ]" };
             let mut row = vec![button(
-                format!("{mark} {:<11}", provider_title(provider)),
+                format!("{mark} {:<15}", provider_title(provider)),
                 Action::Toggle(provider),
             )];
             let connected = self.signed_in[slot];
@@ -407,7 +407,7 @@ impl ConnectForm {
             row.extend(availability(
                 provider,
                 self.clis.found(provider),
-                width.saturating_sub(19 + badge.chars().count()),
+                width.saturating_sub(23 + badge.chars().count()),
             ));
             if connected {
                 row.push(text(badge, Tone::Good));
@@ -451,15 +451,15 @@ impl ConnectForm {
 }
 
 fn availability(provider: Provider, found: Option<&Found>, width: usize) -> Vec<Segment> {
-    let binary = provider.binary();
+    let executable = provider.executable();
     match found {
-        Some(Found::OnPath) => vec![text(format!("  ✓ {binary} on PATH"), Tone::Good)],
+        Some(Found::OnPath) => vec![text(format!("  ✓ {executable} on PATH"), Tone::Good)],
         Some(Found::At(path)) => vec![text(
-            truncated(&format!("  ✓ {binary} at {}", path.display()), width),
+            truncated(&format!("  ✓ {executable} at {}", path.display()), width),
             Tone::Good,
         )],
         None => vec![
-            text(format!("  ✗ {binary} not found  "), Tone::Warn),
+            text(format!("  ✗ {executable} not found  "), Tone::Warn),
             button("Install", Action::Install(provider)),
         ],
     }
@@ -898,16 +898,16 @@ impl App {
 
     fn located_after_install(&self, provider: Provider) -> String {
         let title = provider_title(provider);
-        let binary = provider.binary();
+        let executable = provider.executable();
         let host = self.host.as_deref().expect("checked by install_blocker");
         match locate(host, provider) {
-            Some(Found::OnPath) => format!("{title} installed: {binary} is on PATH."),
+            Some(Found::OnPath) => format!("{title} installed: {executable} is on PATH."),
             Some(Found::At(path)) => format!(
-                "{title} installed. Using {} for {binary} in this session.",
+                "{title} installed. Using {} for {executable} in this session.",
                 path.display()
             ),
             None => format!(
-                "{title} installer finished, but {binary} was not found. Open a new terminal, then press R."
+                "{title} installer finished, but {executable} was not found. Open a new terminal, then press R."
             ),
         }
     }
@@ -931,7 +931,7 @@ impl App {
         } else {
             form.status = format!(
                 "{} is not installed. Choose Install, or install it yourself and press R.",
-                provider.binary()
+                provider.executable()
             );
         }
     }
@@ -1469,7 +1469,7 @@ impl App {
                 text(
                     format!(
                         "{:<width$}",
-                        format!("{} CLI", provider.binary()),
+                        format!("{} CLI", provider.executable()),
                         width = PROFILE_LABEL_WIDTH
                     ),
                     Tone::Plain,

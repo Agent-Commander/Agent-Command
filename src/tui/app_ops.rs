@@ -46,6 +46,7 @@ pub(crate) fn is_session_not_found_error(text: &str) -> bool {
                 || lower.contains("invalid session")
                 || lower.contains("does not exist")))
         || (lower.contains("thread") && lower.contains("not found"))
+        || (lower.contains("conversation") && lower.contains("not found"))
 }
 
 pub(crate) fn format_routing_notice(reason: &str) -> String {
@@ -332,21 +333,20 @@ impl App {
             .profiles
             .get(idx)
             .is_some_and(|profile| profile.provider == Provider::Gemini)
+            && allowance.latched
         {
-            return allowance.latched.then(|| {
-                if allowance.reset_in.is_none() {
-                    "reset unknown".to_owned()
-                } else {
-                    "latched".to_owned()
-                }
+            return Some(if allowance.reset_in.is_none() {
+                "reset unknown".to_owned()
+            } else {
+                "latched".to_owned()
             });
         }
         let mut parts = Vec::new();
-        if let Some(five) = allowance.five {
-            parts.push(format!("5h {:.0}%", five.clamp(0.0, 100.0).floor()));
+        if let Some(five) = crate::token_burn::clamp_percent(allowance.five) {
+            parts.push(format!("5h {:.0}%", five.floor()));
         }
-        if let Some(week) = allowance.week {
-            parts.push(format!("7d {:.0}%", week.clamp(0.0, 100.0).floor()));
+        if let Some(week) = crate::token_burn::clamp_percent(allowance.week) {
+            parts.push(format!("7d {:.0}%", week.floor()));
         }
         if parts.is_empty() {
             return allowance.latched.then(|| {
@@ -400,10 +400,11 @@ impl App {
             match raw.to_ascii_lowercase().as_str() {
                 "oauth_token" | "claude.ai" => "oauth",
                 "oauth-personal" => "google",
+                "oauth-business" => "enterprise",
                 "chatgpt" => "chatgpt",
                 "api_key" | "gemini-api-key" => "api",
                 "bedrock" => "bedrock",
-                "vertex" | "vertex-ai" => "vertex",
+                "vertex" | "vertex-ai" | "agent-platform" => "vertex",
                 "foundry" => "foundry",
                 _ => "ok",
             }
@@ -2843,5 +2844,62 @@ mod tests {
         assert_eq!(specialist_errors, vec!["specialist error"]);
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn connection_summary_maps_antigravity_auth_methods_and_mention_label_is_agy() {
+        for (method, expected) in [
+            ("oauth-personal", "default · google"),
+            ("oauth-business", "default · enterprise"),
+            ("agent-platform", "default · vertex"),
+            ("gemini-api-key", "default · api"),
+        ] {
+            let app = App {
+                auth_detections: vec![crate::auth::AuthDetection {
+                    provider: Provider::Gemini,
+                    logged_in: true,
+                    auth_method: Some(method.into()),
+                    account: None,
+                    tier: None,
+                    api_provider: None,
+                    config_dir: None,
+                    warning: None,
+                }],
+                ..App::default()
+            };
+            assert_eq!(
+                app.connection_summary(Provider::Gemini),
+                (true, expected.to_owned()),
+                "{method}"
+            );
+        }
+
+        let mentions = crate::tui::build_mention_candidates(std::path::Path::new("."), &[]);
+        let gemini_mention = mentions
+            .iter()
+            .find(|item| item.value == "gemini")
+            .expect("@gemini mention");
+        assert_eq!(gemini_mention.detail, "Route turn to Gemini (agy)");
+
+        let profile = crate::auth::Profile::system_default(
+            std::env::temp_dir().join("ac-nan-badge"),
+            Provider::Gemini,
+        );
+        let mut live = crate::Live::new(std::env::temp_dir(), vec![profile], None);
+        live.allowances = vec![usage::Allowance {
+            five: Some(f64::NAN),
+            week: Some(f64::INFINITY),
+            reset_in: None,
+            latched: false,
+            stale: false,
+        }];
+        let app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        assert_eq!(app.top_bar_quota_badge(), None);
+        assert!(is_session_not_found_error(
+            "warning: conversation \"184b62a6\" not found"
+        ));
     }
 }
