@@ -1,6 +1,7 @@
 pub mod app_ops;
 pub mod diff_modal;
 pub mod events;
+pub mod graphics;
 pub mod left_panel;
 pub mod render;
 pub mod tabs;

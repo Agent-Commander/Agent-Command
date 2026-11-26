@@ -8,10 +8,12 @@ pub mod clipboard;
 mod connect;
 mod control;
 mod daemon;
+pub mod delegation;
 pub mod editor;
 pub mod github;
 mod goal;
 mod http;
+pub mod inbox;
 mod install;
 pub mod ledger;
 pub mod markdown;
@@ -23,6 +25,7 @@ pub mod palette;
 mod panel;
 pub mod permissions;
 pub mod prodgate;
+pub mod recovery;
 mod review;
 pub mod routing;
 pub mod settings;
@@ -35,6 +38,7 @@ mod triage;
 pub mod tui;
 pub mod update;
 pub mod usage;
+pub mod vault;
 pub use cli::run_cli;
 pub use specialists::{
     format_goal_turn, format_help, help_entries, resolve_member_target, resolve_target,
