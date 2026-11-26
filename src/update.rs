@@ -95,11 +95,14 @@ pub fn watch(enabled: bool) -> Option<Receiver<String>> {
     Some(results)
 }
 
+pub(crate) fn check_latest() -> UpdateState {
+    evaluate_release_check(latest_tag(), CURRENT)
+}
+
 pub fn check_now() -> Receiver<UpdateState> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let state = evaluate_release_check(latest_tag(), CURRENT);
-        let _ = sender.send(state);
+        let _ = sender.send(check_latest());
     });
     receiver
 }
