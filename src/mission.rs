@@ -76,6 +76,7 @@ pub enum NormalizedEvent {
     SessionStarted {
         session_id: String,
         model: Option<String>,
+        profile: Option<String>,
     },
     TextDelta(String),
     ThinkingDelta(String),
@@ -126,6 +127,8 @@ pub enum NormalizedEvent {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LaunchOptions {
     pub resume_session: Option<String>,
+    pub resume_session_profile: Option<String>,
+    pub portable_handoff: Option<String>,
     pub mcp_config: Option<PathBuf>,
     pub extra_args: Vec<String>,
     pub policy: PermissionPolicy,
@@ -233,7 +236,7 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn single(prompt: &str, preferred: Option<String>) -> Self {
         Self {
             request: Request {
@@ -451,7 +454,7 @@ impl WarmSession {
         let policy = options.policy.clone();
         let profile_clone = profile.clone();
         thread::spawn(move || {
-            let mut parser = EventParser::new(Provider::Claude);
+            let mut parser = EventParser::with_profile(Provider::Claude, profile_clone.to_string());
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -892,6 +895,7 @@ enum ActiveStreamBlock {
 
 pub struct EventParser {
     provider: Provider,
+    profile: Option<String>,
     last_cumulative_cost_usd: f64,
     active_stream_message_id: Option<String>,
     streamed_text_in_message: bool,
@@ -907,8 +911,17 @@ pub struct EventParser {
 
 impl EventParser {
     pub fn new(provider: Provider) -> Self {
+        Self::create(provider, None)
+    }
+
+    pub fn with_profile(provider: Provider, profile: String) -> Self {
+        Self::create(provider, Some(profile))
+    }
+
+    fn create(provider: Provider, profile: Option<String>) -> Self {
         Self {
             provider,
+            profile,
             last_cumulative_cost_usd: 0.0,
             active_stream_message_id: None,
             streamed_text_in_message: false,
@@ -980,6 +993,7 @@ impl EventParser {
                     out.push(NormalizedEvent::SessionStarted {
                         session_id: session_id.to_owned(),
                         model: event["model"].as_str().map(str::to_owned),
+                        profile: self.profile.clone(),
                     });
                 }
             }
@@ -1284,12 +1298,41 @@ impl EventParser {
             Some("rate_limit_event") => {
                 let info = &event["rate_limit_info"];
                 let windows = &info["unifiedWindows"];
-                let five = windows["five_hour"]["utilization"]
-                    .as_f64()
-                    .map(|u| (u * 100.0) as f32);
-                let seven = windows["seven_day"]["utilization"]
-                    .as_f64()
-                    .map(|u| (u * 100.0) as f32);
+                let pct = |value: &Value| {
+                    value
+                        .as_f64()
+                        .filter(|u| u.is_finite())
+                        .map(|u| (u * 100.0).clamp(0.0, 100.0) as f32)
+                };
+                let mut five = pct(&windows["five_hour"]["utilization"]);
+                let mut seven = [
+                    "seven_day",
+                    "seven_day_opus",
+                    "seven_day_sonnet",
+                    "seven_day_overage_included",
+                    "overage",
+                ]
+                .into_iter()
+                .filter_map(|key| pct(&windows[key]["utilization"]))
+                .max_by(f32::total_cmp);
+                let rejected = info["status"] == "rejected";
+                let top_pct = pct(&info["utilization"]).or_else(|| rejected.then_some(100.0));
+                let merge =
+                    |existing: Option<f32>, candidate: Option<f32>| match (existing, candidate) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                match info["rateLimitType"].as_str() {
+                    Some("five_hour") => five = merge(five, top_pct),
+                    Some(
+                        "seven_day"
+                        | "seven_day_opus"
+                        | "seven_day_sonnet"
+                        | "seven_day_overage_included"
+                        | "overage",
+                    ) => seven = merge(seven, top_pct),
+                    _ => {}
+                }
                 let resets_at = info["resetsAt"]
                     .as_i64()
                     .map(|ts| ts.to_string())
@@ -1437,6 +1480,7 @@ impl EventParser {
                     out.push(NormalizedEvent::SessionStarted {
                         session_id: thread_id.to_owned(),
                         model: None,
+                        profile: self.profile.clone(),
                     });
                 }
             }
@@ -1641,6 +1685,7 @@ impl EventParser {
                     out.push(NormalizedEvent::SessionStarted {
                         session_id: session_id.to_owned(),
                         model: event["model"].as_str().map(str::to_owned),
+                        profile: self.profile.clone(),
                     });
                 }
             }
@@ -1778,13 +1823,14 @@ impl Execution {
         control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
     ) -> io::Result<()> {
         let now = (self.clock)();
-        let (candidates, exclusions) =
-            routing::candidates(&self.profiles, &route.catalog, &route.pins, now);
-        let ranked = restrict(
-            routing::rank(candidates, route.request.policy, route.request.difficulty),
-            route.target,
-        );
         if route.request.split {
+            Usage::reconcile_peer_accounts(&self.profiles, now);
+            let (candidates, exclusions) =
+                routing::candidates(&self.profiles, &route.catalog, &route.pins, now);
+            let ranked = restrict(
+                routing::rank(candidates, route.request.policy, route.request.difficulty),
+                route.target,
+            );
             return self.run_split(
                 &route.request.units,
                 ranked,
@@ -1795,6 +1841,27 @@ impl Execution {
                 control,
             );
         }
+        let choice = self.select_route(route, now)?;
+        self.dispatch(
+            &choice.candidate,
+            &route.request.units[0],
+            Some(choice.reason),
+            true,
+            sender,
+            norm_sender,
+            cancel,
+            control,
+        )
+    }
+
+    fn select_route(&self, route: &Route, now: usage::Tick) -> io::Result<routing::Choice> {
+        Usage::reconcile_peer_accounts(&self.profiles, now);
+        let (candidates, exclusions) =
+            routing::candidates(&self.profiles, &route.catalog, &route.pins, now);
+        let ranked = restrict(
+            routing::rank(candidates, route.request.policy, route.request.difficulty),
+            route.target,
+        );
         let preferred = route
             .preferred
             .as_deref()
@@ -1809,15 +1876,7 @@ impl Execution {
                 routing::describe(&choice.candidate)
             );
         }
-        self.dispatch(
-            &choice.candidate,
-            &route.request.units[0],
-            Some(choice.reason),
-            sender,
-            norm_sender,
-            cancel,
-            control,
-        )
+        Ok(choice)
     }
 
     fn rotation(&self, preferred: Option<&str>, now: usage::Tick) -> Vec<String> {
@@ -1828,8 +1887,7 @@ impl Execution {
         }) else {
             return Vec::new();
         };
-        usage::choices(&self.profiles, index, now)
-            .unwrap_or_default()
+        usage::alternates(&self.profiles, index, now)
             .into_iter()
             .map(|index| self.profiles[index].to_string())
             .collect()
@@ -1876,6 +1934,7 @@ impl Execution {
                 candidate,
                 unit,
                 Some(reason),
+                false,
                 sender,
                 norm_sender,
                 cancel,
@@ -1891,6 +1950,7 @@ impl Execution {
         candidate: &Candidate,
         prompt: &str,
         reason: Option<String>,
+        allow_resume: bool,
         sender: &SyncSender<Event>,
         norm_sender: &Sender<NormalizedEvent>,
         cancel: &AtomicBool,
@@ -1901,7 +1961,10 @@ impl Execution {
         let command = profile.authenticated_command().map_err(|error| {
             io::Error::other(format!("{profile} sign-in refused at dispatch: {error}"))
         })?;
-        let limit = run(
+        let (options, effective_prompt) =
+            prepare_launch_options(&self.options, profile, prompt, allow_resume);
+        let allow_stale_retry = options.resume_session.is_some();
+        let outcome = run(
             Launch {
                 command,
                 profile: profile.clone(),
@@ -1909,10 +1972,11 @@ impl Execution {
                 reason,
                 configuration: candidate.configuration.clone(),
                 mode: self.mode,
-                options: self.options.clone(),
+                options,
             },
             &self.workspace,
-            prompt.to_owned(),
+            effective_prompt,
+            &self.profiles,
             sender,
             norm_sender,
             cancel,
@@ -1920,10 +1984,81 @@ impl Execution {
             &self.active_pid,
             self.clock,
             None,
+            allow_stale_retry,
         )?;
-        let Some(progress) = limit else { return Ok(()) };
+        let outcome = match outcome {
+            RunOutcome::StaleSession => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let retry_command = profile.authenticated_command().map_err(|error| {
+                    io::Error::other(format!("{profile} sign-in refused at dispatch: {error}"))
+                })?;
+                let (retry_options, retry_prompt) =
+                    prepare_launch_options(&self.options, profile, prompt, false);
+                run(
+                    Launch {
+                        command: retry_command,
+                        profile: profile.clone(),
+                        index,
+                        reason: None,
+                        configuration: candidate.configuration.clone(),
+                        mode: self.mode,
+                        options: retry_options,
+                    },
+                    &self.workspace,
+                    retry_prompt,
+                    &self.profiles,
+                    sender,
+                    norm_sender,
+                    cancel,
+                    control,
+                    &self.active_pid,
+                    self.clock,
+                    None,
+                    false,
+                )?
+            }
+            other => other,
+        };
+        let progress = match outcome {
+            RunOutcome::Completed => return Ok(()),
+            RunOutcome::StaleSession => {
+                return Err(io::Error::other("Provider session could not be resumed"))
+            }
+            RunOutcome::RateLimited(progress) => progress,
+        };
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        Usage::sync_peer_accounts(&self.profiles, profile, (self.clock)());
+        if !crate::checkpoint::is_git_workspace(&self.workspace) {
+            if progress.completed_tool_events > 0 {
+                return Err(io::Error::other(
+                    "Usage limit reached after tool activity in a non-Git workspace; mission stopped without replay.",
+                ));
+            }
+            let Some((to, next, handoff)) = self.handoff_target(index) else {
+                return Err(io::Error::other(NO_ALTERNATE));
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let configuration = match handoff {
+                Handoff::CrossProvider => {
+                    Configuration::provider_default(self.profiles[to].provider)
+                }
+                Handoff::SameProvider | Handoff::AfterReset => candidate.configuration.clone(),
+            };
+            return self.continue_without_checkpoint(
+                (index, to, next),
+                &configuration,
+                prompt,
+                sender,
+                norm_sender,
+                cancel,
+                control,
+            );
         }
         let checkpoint = Checkpoint::save(profile, uuid::Uuid::new_v4(), &self.workspace, progress)
             .map_err(|error| {
@@ -2095,34 +2230,88 @@ impl Execution {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let mut options = self.options.clone();
-        options.resume_session = None;
-        if run(
-            Launch {
-                command,
-                profile: self.profiles[to].clone(),
-                index: to,
-                reason: None,
-                configuration: configuration.clone(),
-                mode: self.mode,
-                options,
-            },
-            &self.workspace,
-            prompt.to_owned(),
-            sender,
-            norm_sender,
-            cancel,
-            control,
-            &self.active_pid,
-            self.clock,
-            Some(Continuation {
-                claim,
-                from: index,
-                profile: &self.profiles[index],
-            }),
-        )?
-        .is_some()
-        {
+        let (options, effective_prompt) =
+            prepare_launch_options(&self.options, &self.profiles[to], prompt, false);
+        if matches!(
+            run(
+                Launch {
+                    command,
+                    profile: self.profiles[to].clone(),
+                    index: to,
+                    reason: None,
+                    configuration: configuration.clone(),
+                    mode: self.mode,
+                    options,
+                },
+                &self.workspace,
+                effective_prompt,
+                &self.profiles,
+                sender,
+                norm_sender,
+                cancel,
+                control,
+                &self.active_pid,
+                self.clock,
+                Some(Continuation::Checkpointed {
+                    claim,
+                    from: index,
+                    profile: &self.profiles[index],
+                }),
+                false,
+            )?,
+            RunOutcome::RateLimited(_)
+        ) {
+            Usage::sync_peer_accounts(&self.profiles, &self.profiles[to], (self.clock)());
+            return Err(io::Error::other(
+                "Continuation hit a usage limit; mission stopped without replay",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_without_checkpoint(
+        &self,
+        selection: (usize, usize, Command),
+        configuration: &Configuration,
+        prompt: &str,
+        sender: &SyncSender<Event>,
+        norm_sender: &Sender<NormalizedEvent>,
+        cancel: &AtomicBool,
+        control: &Arc<Mutex<Option<Sender<ControlMessage>>>>,
+    ) -> io::Result<()> {
+        let (index, to, command) = selection;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (options, effective_prompt) =
+            prepare_launch_options(&self.options, &self.profiles[to], prompt, false);
+        if matches!(
+            run(
+                Launch {
+                    command,
+                    profile: self.profiles[to].clone(),
+                    index: to,
+                    reason: None,
+                    configuration: configuration.clone(),
+                    mode: self.mode,
+                    options,
+                },
+                &self.workspace,
+                effective_prompt,
+                &self.profiles,
+                sender,
+                norm_sender,
+                cancel,
+                control,
+                &self.active_pid,
+                self.clock,
+                Some(Continuation::Uncheckpointed { from: index }),
+                false,
+            )?,
+            RunOutcome::RateLimited(_)
+        ) {
+            Usage::sync_peer_accounts(&self.profiles, &self.profiles[to], (self.clock)());
             return Err(io::Error::other(
                 "Continuation hit a usage limit; mission stopped without replay",
             ));
@@ -2144,6 +2333,43 @@ impl Execution {
     }
 }
 
+fn prepare_launch_options(
+    base: &LaunchOptions,
+    profile: &Profile,
+    prompt: &str,
+    allow_resume: bool,
+) -> (LaunchOptions, String) {
+    let mut options = base.clone();
+    let label = profile.to_string();
+    let resume_matches = allow_resume
+        && options.resume_session.is_some()
+        && options.resume_session_profile.as_deref() == Some(label.as_str());
+    if resume_matches {
+        options.portable_handoff = None;
+        (options, prompt.to_owned())
+    } else {
+        options.resume_session = None;
+        options.resume_session_profile = None;
+        let handoff = options.portable_handoff.take();
+        (options, inject_portable_handoff(prompt, handoff.as_deref()))
+    }
+}
+
+fn inject_portable_handoff(prompt: &str, handoff: Option<&str>) -> String {
+    let Some(handoff) = handoff.map(str::trim).filter(|text| !text.is_empty()) else {
+        return prompt.to_owned();
+    };
+    if prompt.contains(handoff) {
+        return prompt.to_owned();
+    }
+    if let Some(pos) = prompt.rfind("\n\nOperator: ") {
+        let (head, tail) = prompt.split_at(pos);
+        format!("{head}\n\n{handoff}{tail}")
+    } else {
+        format!("{handoff}\n\n{prompt}")
+    }
+}
+
 struct Launch {
     command: Command,
     profile: Profile,
@@ -2154,10 +2380,21 @@ struct Launch {
     options: LaunchOptions,
 }
 
-struct Continuation<'a> {
-    claim: &'a Claim,
-    from: usize,
-    profile: &'a Profile,
+enum Continuation<'a> {
+    Checkpointed {
+        claim: &'a Claim,
+        from: usize,
+        profile: &'a Profile,
+    },
+    Uncheckpointed {
+        from: usize,
+    },
+}
+
+enum RunOutcome {
+    Completed,
+    RateLimited(Progress),
+    StaleSession,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2165,6 +2402,7 @@ fn run(
     launch: Launch,
     workspace: &Path,
     prompt: String,
+    peers: &[Profile],
     sender: &SyncSender<Event>,
     norm_sender: &Sender<NormalizedEvent>,
     cancel: &AtomicBool,
@@ -2172,7 +2410,8 @@ fn run(
     active_pid: &AtomicU32,
     clock: fn() -> usage::Tick,
     continuation: Option<Continuation<'_>>,
-) -> io::Result<Option<Progress>> {
+    allow_stale_retry: bool,
+) -> io::Result<RunOutcome> {
     let Launch {
         mut command,
         profile,
@@ -2183,8 +2422,9 @@ fn run(
         options,
     } = launch;
     if cancel.load(Ordering::Acquire) {
-        return Ok(None);
+        return Ok(RunOutcome::Completed);
     }
+    let resuming = options.resume_session.is_some();
     command.args(configuration.arguments());
     command.args(build_provider_arguments(profile.provider, mode, &options));
     permissions::refuse_bypass(command.get_args()).map_err(io::Error::other)?;
@@ -2194,8 +2434,10 @@ fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let prompt = match &continuation {
-        Some(next) => next.claim.start(next.profile, workspace, &prompt)?,
-        None => prompt,
+        Some(Continuation::Checkpointed { claim, profile, .. }) => {
+            claim.start(profile, workspace, &prompt)?
+        }
+        Some(Continuation::Uncheckpointed { .. }) | None => prompt,
     };
     process_tree::own_group(&mut command);
     let mut child = command.spawn().inspect_err(|error| {
@@ -2210,10 +2452,10 @@ fn run(
     let child_pid = child.id();
     active_pid.store(child_pid, Ordering::Release);
     if let Some(next) = continuation {
-        let _ = sender.send(Event::Continuing {
-            from: next.from,
-            to: index,
-        });
+        let from = match next {
+            Continuation::Checkpointed { from, .. } | Continuation::Uncheckpointed { from } => from,
+        };
+        let _ = sender.send(Event::Continuing { from, to: index });
     }
     let stdout = child.stdout.take().expect("mission stdout is piped");
     let stderr = child.stderr.take().expect("mission stderr is piped");
@@ -2291,9 +2533,12 @@ fn run(
     };
 
     let reader_control = Arc::clone(control);
+    let reader_profile = profile.clone();
+    let reader_peers = peers.to_vec();
     let reader = thread::spawn(move || {
         read_output(
-            &profile,
+            &reader_profile,
+            &reader_peers,
             stdout,
             &stdout_sender,
             &stdout_norm,
@@ -2337,7 +2582,7 @@ fn run(
                 error_code: None,
                 final_text: String::new(),
             });
-            return Ok(None);
+            return Ok(RunOutcome::Completed);
         }
         if limited.load(Ordering::Acquire) {
             active_pid.store(0, Ordering::Release);
@@ -2360,13 +2605,34 @@ fn run(
         .map_err(|_| io::Error::other("Mission output reader stopped"))??;
     let _ = stderr_reader.join();
     if limited.load(Ordering::Acquire) {
-        return Ok((!completed).then_some(progress));
+        return Ok(if completed {
+            RunOutcome::Completed
+        } else {
+            RunOutcome::RateLimited(progress)
+        });
     }
     if !status.success() {
         let captured = stderr_lines
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        if allow_stale_retry
+            && resuming
+            && progress.completed_tool_events == 0
+            && is_stale_session_error(&captured)
+        {
+            return Ok(RunOutcome::StaleSession);
+        }
+        if profile.provider == Provider::Gemini && is_gemini_stderr_limit(&captured) {
+            let observed = clock();
+            Usage::record_gemini_limit(&profile, None, observed)?;
+            Usage::sync_peer_accounts(peers, &profile, observed);
+            return Ok(if completed {
+                RunOutcome::Completed
+            } else {
+                RunOutcome::RateLimited(progress)
+            });
+        }
         let code = classify_health(&captured, None);
         let detail = if captured.is_empty() {
             format!("Provider exited with {status}")
@@ -2384,7 +2650,7 @@ fn run(
     writer
         .join()
         .map_err(|_| io::Error::other("Mission input writer stopped"))??;
-    Ok(None)
+    Ok(RunOutcome::Completed)
 }
 
 pub(crate) fn restrict(
@@ -2427,6 +2693,7 @@ pub(crate) fn output_text(provider: Provider, event: &Value) -> Vec<&str> {
 #[allow(clippy::too_many_arguments)]
 fn read_output(
     profile: &Profile,
+    peers: &[Profile],
     stdout: impl io::Read,
     sender: &SyncSender<Event>,
     norm_sender: &Sender<NormalizedEvent>,
@@ -2438,7 +2705,8 @@ fn read_output(
 ) -> io::Result<(Progress, bool)> {
     let mut progress = Progress::default();
     let mut completed = false;
-    let mut parser = EventParser::new(profile.provider);
+    let mut parser = EventParser::with_profile(profile.provider, profile.to_string());
+    let mut fallback_claude_limit: Option<&'static str> = None;
     for line in BufReader::new(stdout).lines() {
         if cancel.load(Ordering::Acquire) {
             return Ok((progress, completed));
@@ -2461,18 +2729,75 @@ fn read_output(
             Provider::Codex => event["type"] == "turn.completed",
             Provider::Gemini => event["type"] == "result" && event["status"] == "success",
         };
+        let mut suppress_limit_noise = false;
         let limit = match profile.provider {
-            Provider::Claude => Usage::observe_claude(profile, &event, observed)?,
+            Provider::Claude => {
+                if event["type"] == "rate_limit_event" {
+                    let rejected = Usage::observe_claude(profile, &event, observed)?;
+                    Usage::sync_peer_accounts(peers, profile, observed);
+                    rejected
+                } else if let Some(limit_type) = claude_limit_fallback(&event) {
+                    suppress_limit_noise = true;
+                    if fallback_claude_limit.is_none_or(str::is_empty) {
+                        fallback_claude_limit = Some(limit_type);
+                    }
+                    if event["type"] == "result" && !limited.load(Ordering::Acquire) {
+                        record_synthetic_claude_limit(
+                            profile,
+                            peers,
+                            fallback_claude_limit.unwrap_or_default(),
+                            observed,
+                        )?;
+                        true
+                    } else {
+                        false
+                    }
+                } else if event["type"] == "result"
+                    && event["is_error"] == true
+                    && fallback_claude_limit.is_some()
+                {
+                    suppress_limit_noise = true;
+                    if !limited.load(Ordering::Acquire) {
+                        record_synthetic_claude_limit(
+                            profile,
+                            peers,
+                            fallback_claude_limit.unwrap_or_default(),
+                            observed,
+                        )?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
             Provider::Codex if codex_limit(&event) => {
                 Usage::record_codex_limit(profile, observed)?;
+                Usage::sync_peer_accounts(peers, profile, observed);
+                suppress_limit_noise = true;
                 true
             }
-            Provider::Codex | Provider::Gemini => false,
+            Provider::Gemini => {
+                if let Some(reset) = gemini_limit(&event) {
+                    Usage::record_gemini_limit(profile, reset, observed)?;
+                    Usage::sync_peer_accounts(peers, profile, observed);
+                    suppress_limit_noise = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            Provider::Codex => false,
         };
         if limit {
             limited.store(true, Ordering::Release);
         }
+        let is_limited = suppress_limit_noise || limited.load(Ordering::Acquire);
         for normalized in parser.parse_value(&event, false, Some(policy)) {
+            if is_limited && !matches!(normalized, NormalizedEvent::RateLimit { .. }) {
+                continue;
+            }
             if let (
                 NormalizedEvent::PermissionAsked {
                     ref req_id,
@@ -2519,6 +2844,9 @@ fn read_output(
                 ctrl.lock().unwrap_or_else(PoisonError::into_inner).take();
             }
         }
+        if is_limited {
+            continue;
+        }
         for text in output_text(profile.provider, &event) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
                 let safe = line
@@ -2532,12 +2860,41 @@ fn read_output(
             }
         }
     }
+    if !completed && !limited.load(Ordering::Acquire) {
+        if let Some(limit_type) = fallback_claude_limit {
+            record_synthetic_claude_limit(profile, peers, limit_type, clock())?;
+            limited.store(true, Ordering::Release);
+        }
+    }
     Ok((progress, completed))
+}
+
+fn record_synthetic_claude_limit(
+    profile: &Profile,
+    peers: &[Profile],
+    limit_type: &str,
+    observed: usage::Tick,
+) -> io::Result<()> {
+    let mut info = json!({ "status": "rejected" });
+    if !limit_type.is_empty() {
+        info["rateLimitType"] = json!(limit_type);
+    }
+    let synthetic = json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": info,
+    });
+    let _ = Usage::observe_claude(profile, &synthetic, observed)?;
+    Usage::sync_peer_accounts(peers, profile, observed);
+    Ok(())
 }
 
 fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
     match (provider, event["type"].as_str()) {
-        (Provider::Claude, Some("assistant")) => progress.assistant_messages += 1,
+        (Provider::Claude, Some("assistant")) => {
+            if claude_limit_fallback(event).is_none() {
+                progress.assistant_messages += 1;
+            }
+        }
         (Provider::Claude, Some("user")) => {
             let tools = event["message"]["content"]
                 .as_array()
@@ -2563,6 +2920,112 @@ fn record_progress(provider: Provider, event: &Value, progress: &mut Progress) {
         }
         _ => {}
     }
+}
+
+fn classify_claude_limit_window(text: &str) -> &'static str {
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("weekly") || lowered.contains("7-day") || lowered.contains("7d") {
+        "seven_day"
+    } else if lowered.contains("5-hour")
+        || lowered.contains("5h")
+        || lowered.contains("session limit")
+    {
+        "five_hour"
+    } else {
+        ""
+    }
+}
+
+fn is_claude_limit_text(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("you've hit your")
+        || lowered.contains("you\u{2019}ve hit your")
+        || lowered.contains("weekly limit")
+        || lowered.contains("usage limit reached")
+        || lowered.contains("usage limit exceeded")
+        || lowered.contains("rate limit reached")
+        || lowered.contains("rate limit exceeded")
+}
+
+fn claude_limit_fallback(event: &Value) -> Option<&'static str> {
+    match event["type"].as_str() {
+        Some("assistant") => {
+            let text = output_text(Provider::Claude, event).join("\n");
+            if event["error"] == "rate_limit" || (!text.is_empty() && is_claude_limit_text(&text)) {
+                Some(classify_claude_limit_window(&text))
+            } else {
+                None
+            }
+        }
+        Some("result") if event["is_error"] == true => {
+            let text = event["result"].as_str().unwrap_or_default();
+            is_claude_limit_text(text).then(|| classify_claude_limit_window(text))
+        }
+        _ => None,
+    }
+}
+
+fn gemini_limit(event: &Value) -> Option<Option<i64>> {
+    let is_error = event["type"] == "error"
+        || (event["type"] == "result" && event["status"].as_str().is_some_and(|s| s != "success"));
+    if !is_error {
+        return None;
+    }
+    let code_429 =
+        event["code"].as_i64() == Some(429) || event["error"]["code"].as_i64() == Some(429);
+    let combined = [
+        event["message"].as_str(),
+        event["status"].as_str(),
+        event["error"]["message"].as_str(),
+        event["error"]["status"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    let matched = code_429
+        || combined.contains("resource_exhausted")
+        || combined.contains("quota exceeded")
+        || combined.contains("rate limit")
+        || combined.contains("too many requests")
+        || combined.contains("usage limit")
+        || combined.contains("429");
+    if !matched {
+        return None;
+    }
+    let reset = event["resetsAt"]
+        .as_i64()
+        .or_else(|| event["resetAt"].as_i64())
+        .or_else(|| event["error"]["resetsAt"].as_i64())
+        .or_else(|| event["error"]["resetAt"].as_i64());
+    Some(reset)
+}
+
+fn is_gemini_stderr_limit(stderr_lines: &[String]) -> bool {
+    let joined = stderr_lines.join("\n").to_ascii_lowercase();
+    joined.contains("resource_exhausted")
+        || joined.contains("quota exceeded")
+        || joined.contains("rate limit")
+        || joined.contains("too many requests")
+        || joined.contains("status 429")
+        || joined.contains("http 429")
+}
+
+fn is_stale_session_error(stderr_lines: &[String]) -> bool {
+    let joined = stderr_lines.join("\n").to_ascii_lowercase();
+    const SIGNALS: [&str; 9] = [
+        "no conversation found with session id",
+        "session not found",
+        "no such session",
+        "conversation not found",
+        "thread not found",
+        "no such thread",
+        "unknown session",
+        "invalid session",
+        "cannot resume session",
+    ];
+    SIGNALS.iter().any(|signal| joined.contains(signal))
 }
 
 fn codex_limit(event: &Value) -> bool {
@@ -2593,6 +3056,7 @@ mod engine_tests {
             extra_args: vec![],
             policy: PermissionPolicy::for_mode(PermissionMode::WorkspaceAuto),
             persistent_stdio: true,
+            ..LaunchOptions::default()
         };
         let claude =
             build_provider_arguments(Provider::Claude, PermissionMode::WorkspaceAuto, &options);
@@ -2637,6 +3101,7 @@ mod engine_tests {
             vec![NormalizedEvent::SessionStarted {
                 session_id: "c-1".into(),
                 model: Some("claude-opus-4".into()),
+                profile: None,
             }]
         );
 
@@ -2692,6 +3157,7 @@ mod engine_tests {
             vec![NormalizedEvent::SessionStarted {
                 session_id: "t-42".into(),
                 model: None,
+                profile: None,
             }]
         );
         let changed = codex.parse_value(
@@ -2718,6 +3184,7 @@ mod engine_tests {
             vec![NormalizedEvent::SessionStarted {
                 session_id: "g-7".into(),
                 model: Some("gemini-2.5-pro".into()),
+                profile: None,
             }]
         );
         let g_msg = gemini.parse_value(
@@ -3011,6 +3478,512 @@ mod engine_tests {
                 kind: PatchKind::Add
             } if path == "game.html"
         )));
+    }
+
+    struct TempState {
+        parent: PathBuf,
+        root: PathBuf,
+    }
+
+    impl TempState {
+        fn new(label: &str) -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "agent-command-mission-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("state");
+            Self { parent, root }
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    #[test]
+    fn event_parser_with_profile_tags_session_started_for_all_providers() {
+        let mut claude = EventParser::with_profile(Provider::Claude, "claude/main".into());
+        assert_eq!(
+            claude.parse_value(
+                &json!({"type":"system","subtype":"init","session_id":"c-9","model":"claude-opus-4"}),
+                false,
+                None,
+            ),
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "c-9".into(),
+                model: Some("claude-opus-4".into()),
+                profile: Some("claude/main".into()),
+            }]
+        );
+
+        let mut codex = EventParser::with_profile(Provider::Codex, "codex/work".into());
+        assert_eq!(
+            codex.parse_value(
+                &json!({"type":"thread.started","thread_id":"t-9"}),
+                false,
+                None,
+            ),
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "t-9".into(),
+                model: None,
+                profile: Some("codex/work".into()),
+            }]
+        );
+
+        let mut gemini = EventParser::with_profile(Provider::Gemini, "gemini/default".into());
+        assert_eq!(
+            gemini.parse_value(
+                &json!({"type":"init","session_id":"g-9","model":"gemini-2.5-pro"}),
+                false,
+                None,
+            ),
+            vec![NormalizedEvent::SessionStarted {
+                session_id: "g-9".into(),
+                model: Some("gemini-2.5-pro".into()),
+                profile: Some("gemini/default".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn event_parser_claude_rate_limit_handles_top_level_rejected_and_unified_windows() {
+        let mut parser = EventParser::with_profile(Provider::Claude, "claude/main".into());
+
+        let rejected_top = parser.parse_value(
+            &json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day_opus",
+                    "resetsAt": 1_795_683_600
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            rejected_top,
+            vec![NormalizedEvent::RateLimit {
+                five_hour_pct: None,
+                seven_day_pct: Some(100.0),
+                resets_at: Some("1795683600".into()),
+            }]
+        );
+
+        let unified = parser.parse_value(
+            &json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day",
+                    "resetsAt": 1_795_683_600,
+                    "unifiedWindows": {
+                        "five_hour": { "utilization": 0.42 },
+                        "seven_day_overage_included": { "utilization": 0.99 }
+                    }
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            unified,
+            vec![NormalizedEvent::RateLimit {
+                five_hour_pct: Some(42.0),
+                seven_day_pct: Some(100.0),
+                resets_at: Some("1795683600".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn prepare_launch_options_guards_resume_by_profile_and_injects_portable_handoff() {
+        let temp = TempState::new("prepare-launch");
+        let claude_main = Profile::new(temp.root.clone(), Provider::Claude, "main").unwrap();
+        let claude_default = Profile::system_default(temp.root.clone(), Provider::Claude);
+        let codex_default = Profile::system_default(temp.root.clone(), Provider::Codex);
+        let gemini_default = Profile::system_default(temp.root.clone(), Provider::Gemini);
+        let prompt = "System context\n\nOperator: Populate my inbox";
+        let base = LaunchOptions {
+            resume_session: Some("f855ba63-1291-4822-bff2-07702cae2889".into()),
+            resume_session_profile: Some("claude/main".into()),
+            portable_handoff: Some("Recent conversation:\nUser: hi\nAssistant: hello".into()),
+            ..LaunchOptions::default()
+        };
+
+        let (kept, kept_prompt) = prepare_launch_options(&base, &claude_main, prompt, true);
+        assert_eq!(
+            kept.resume_session.as_deref(),
+            Some("f855ba63-1291-4822-bff2-07702cae2889")
+        );
+        assert_eq!(kept.portable_handoff, None);
+        assert_eq!(kept_prompt, prompt);
+
+        for other in [&claude_default, &codex_default, &gemini_default] {
+            let (rotated, rotated_prompt) = prepare_launch_options(&base, other, prompt, true);
+            assert_eq!(rotated.resume_session, None);
+            assert_eq!(rotated.resume_session_profile, None);
+            assert_eq!(
+                rotated_prompt,
+                "System context\n\nRecent conversation:\nUser: hi\nAssistant: hello\n\nOperator: Populate my inbox"
+            );
+        }
+
+        let (disallowed, disallowed_prompt) =
+            prepare_launch_options(&base, &claude_main, prompt, false);
+        assert_eq!(disallowed.resume_session, None);
+        assert!(disallowed_prompt.contains("Recent conversation:"));
+
+        let untagged = LaunchOptions {
+            resume_session: Some("legacy-id".into()),
+            resume_session_profile: None,
+            portable_handoff: Some("Summary".into()),
+            ..LaunchOptions::default()
+        };
+        let (safe, safe_prompt) = prepare_launch_options(&untagged, &claude_main, "plain", true);
+        assert_eq!(safe.resume_session, None);
+        assert_eq!(safe_prompt, "Summary\n\nplain");
+        assert_eq!(
+            inject_portable_handoff(&safe_prompt, Some("Summary")),
+            safe_prompt
+        );
+    }
+
+    #[test]
+    fn stale_session_and_limit_fallback_detectors_classify_provider_errors() {
+        assert!(is_stale_session_error(&[
+            "No conversation found with session ID: f855ba63-1291-4822-bff2-07702cae2889".into()
+        ]));
+        assert!(is_stale_session_error(&["Error: thread not found".into()]));
+        assert!(is_stale_session_error(&["no such thread".into()]));
+        assert!(is_stale_session_error(&["Session not found".into()]));
+        assert!(is_stale_session_error(&["no such session".into()]));
+        assert!(!is_stale_session_error(&["fatal: disk full".into()]));
+
+        let rate_msg = json!({
+            "type": "assistant",
+            "error": "rate_limit",
+            "message": {
+                "content": [{"type": "text", "text": "You've hit your weekly limit · resets 3am (America/Chicago)"}]
+            }
+        });
+        assert_eq!(claude_limit_fallback(&rate_msg), Some("seven_day"));
+        let mut progress = Progress::default();
+        record_progress(Provider::Claude, &rate_msg, &mut progress);
+        assert_eq!(progress.assistant_messages, 0);
+
+        let normal_msg = json!({
+            "type": "assistant",
+            "message": { "content": [{"type": "text", "text": "Done"}] }
+        });
+        assert_eq!(claude_limit_fallback(&normal_msg), None);
+        record_progress(Provider::Claude, &normal_msg, &mut progress);
+        assert_eq!(progress.assistant_messages, 1);
+
+        let tool_ok = json!({
+            "type": "user",
+            "message": { "content": [{"type": "tool_result", "is_error": false}] }
+        });
+        record_progress(Provider::Claude, &tool_ok, &mut progress);
+        assert_eq!(progress.completed_tool_events, 1);
+
+        assert_eq!(
+            gemini_limit(&json!({
+                "type": "error",
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "resetsAt": 12_345
+            })),
+            Some(Some(12_345))
+        );
+        assert_eq!(
+            gemini_limit(&json!({"type": "error", "message": "network timeout"})),
+            None
+        );
+        assert!(is_gemini_stderr_limit(&[
+            "API Error: 429 RESOURCE_EXHAUSTED quota exceeded".into()
+        ]));
+        assert!(!is_gemini_stderr_limit(&["invalid_grant".into()]));
+    }
+
+    #[test]
+    fn read_output_suppresses_limit_noise_and_records_claude_fallback_and_gemini_limits() {
+        let temp = TempState::new("read-output-limits");
+        let claude = Profile::new(temp.root.clone(), Provider::Claude, "main").unwrap();
+        let gemini = Profile::new(temp.root.clone(), Provider::Gemini, "main").unwrap();
+        claude.prepare().unwrap();
+        gemini.prepare().unwrap();
+        let peers = [claude.clone(), gemini.clone()];
+        let policy = PermissionPolicy::for_mode(PermissionMode::WorkspaceAuto);
+        let fixed_clock = || usage::tick(5_000, 0);
+
+        let claude_fallback_stream = [
+            json!({
+                "type": "assistant",
+                "error": "rate_limit",
+                "message": {"content": [{"type": "text", "text": "You've hit your weekly limit · resets 3am"}]}
+            }),
+            json!({
+                "type": "result",
+                "is_error": true,
+                "result": "You've hit your weekly limit · resets 3am"
+            }),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (ntx, nrx) = mpsc::channel();
+        let limited = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let (progress, completed) = read_output(
+            &claude,
+            &peers,
+            claude_fallback_stream.as_bytes(),
+            &tx,
+            &ntx,
+            &limited,
+            &cancel,
+            &policy,
+            None,
+            fixed_clock,
+        )
+        .unwrap();
+        assert!(limited.load(Ordering::Acquire));
+        assert!(!completed);
+        assert_eq!(progress.assistant_messages, 0);
+        assert!(rx.try_recv().is_err());
+        assert!(nrx.try_recv().is_err());
+        assert!(Usage::read(&claude).unwrap().blocked(fixed_clock()));
+
+        let claude_real = Profile::new(temp.root.clone(), Provider::Claude, "work").unwrap();
+        claude_real.prepare().unwrap();
+        let claude_ordered_stream = [
+            json!({
+                "type": "assistant",
+                "error": "rate_limit",
+                "message": {"content": [{"type": "text", "text": "You've hit your weekly limit"}]}
+            }),
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day",
+                    "resetsAt": 9_000
+                }
+            }),
+            json!({
+                "type": "result",
+                "is_error": true,
+                "result": "You've hit your weekly limit"
+            }),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let (tx2, rx2) = mpsc::sync_channel(16);
+        let (ntx2, nrx2) = mpsc::channel();
+        let limited2 = AtomicBool::new(false);
+        read_output(
+            &claude_real,
+            std::slice::from_ref(&claude_real),
+            claude_ordered_stream.as_bytes(),
+            &tx2,
+            &ntx2,
+            &limited2,
+            &cancel,
+            &policy,
+            None,
+            fixed_clock,
+        )
+        .unwrap();
+        assert!(limited2.load(Ordering::Acquire));
+        assert!(rx2.try_recv().is_err());
+        let norm_events: Vec<_> = nrx2.try_iter().collect();
+        assert_eq!(
+            norm_events,
+            vec![NormalizedEvent::RateLimit {
+                five_hour_pct: None,
+                seven_day_pct: Some(100.0),
+                resets_at: Some("9000".into()),
+            }]
+        );
+        assert_eq!(
+            Usage::read(&claude_real)
+                .unwrap()
+                .known_reset(fixed_clock()),
+            Some(9_000)
+        );
+
+        let gemini_stream = json!({
+            "type": "error",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "resetsAt": 8_500
+        })
+        .to_string();
+        let (tx3, _rx3) = mpsc::sync_channel(16);
+        let (ntx3, nrx3) = mpsc::channel();
+        let limited3 = AtomicBool::new(false);
+        read_output(
+            &gemini,
+            &peers,
+            gemini_stream.as_bytes(),
+            &tx3,
+            &ntx3,
+            &limited3,
+            &cancel,
+            &policy,
+            None,
+            fixed_clock,
+        )
+        .unwrap();
+        assert!(limited3.load(Ordering::Acquire));
+        assert!(nrx3.try_recv().is_err());
+        assert!(Usage::read(&gemini).unwrap().blocked(fixed_clock()));
+    }
+
+    #[test]
+    fn rotation_returns_same_provider_alternates_even_when_preferred_is_unlatched() {
+        let temp = TempState::new("rotation-unlatched");
+        let profiles = vec![
+            Profile::new(temp.root.clone(), Provider::Claude, "main").unwrap(),
+            Profile::system_default(temp.root.clone(), Provider::Claude),
+            Profile::system_default(temp.root.clone(), Provider::Codex),
+        ];
+        let execution = Execution {
+            profiles,
+            workspace: temp.parent.clone(),
+            clock: || usage::tick(1_000, 0),
+            limits: LimitPolicy::default(),
+            mode: PermissionMode::WorkspaceAuto,
+            options: LaunchOptions::default(),
+            active_pid: Arc::new(AtomicU32::new(0)),
+        };
+        assert_eq!(
+            execution.rotation(Some("claude/main"), usage::tick(1_000, 0)),
+            vec!["claude/default".to_owned()]
+        );
+    }
+
+    #[test]
+    fn select_route_reconciles_peer_accounts_before_routing_and_falls_back_to_gemini() {
+        let temp = TempState::new("reconcile-before-route");
+        let earlier = usage::tick(100_000, 0);
+        let later = usage::tick(157_600, 57_600);
+
+        let claude_main = Profile::new(temp.root.clone(), Provider::Claude, "main").unwrap();
+        let claude_backup = Profile::new(temp.root.clone(), Provider::Claude, "backup").unwrap();
+        let codex_main = Profile::new(temp.root.clone(), Provider::Codex, "main").unwrap();
+        let codex_backup = Profile::new(temp.root.clone(), Provider::Codex, "backup").unwrap();
+        let gemini_work = Profile::new(temp.root.clone(), Provider::Gemini, "work").unwrap();
+        for profile in [
+            &claude_main,
+            &claude_backup,
+            &codex_main,
+            &codex_backup,
+            &gemini_work,
+        ] {
+            profile.prepare().unwrap();
+        }
+
+        let shared_claude =
+            r#"{"oauthAccount":{"accountUuid":"acct-shared","organizationUuid":"org-1"}}"#;
+        std::fs::write(
+            temp.root.join("claude").join("main").join(".claude.json"),
+            shared_claude,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.root.join("claude").join("backup").join(".claude.json"),
+            shared_claude,
+        )
+        .unwrap();
+
+        let gemini_dir = temp.root.join("gemini").join("work").join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(
+            gemini_dir.join("settings.json"),
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            gemini_dir.join("oauth_creds.json"),
+            r#"{"access_token":"fixture-access-token"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            gemini_dir.join("google_accounts.json"),
+            r#"{"active":"fixture@example.invalid"}"#,
+        )
+        .unwrap();
+
+        Usage::observe_claude(
+            &claude_backup,
+            &json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "unifiedWindows": {
+                        "seven_day": {"utilization": 0.77, "resetsAt": later.wall + 32_000}
+                    }
+                }
+            }),
+            earlier,
+        )
+        .unwrap();
+        Usage::observe_claude(
+            &claude_main,
+            &json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day",
+                    "resetsAt": later.wall + 32_000
+                }
+            }),
+            later,
+        )
+        .unwrap();
+        Usage::record_codex_limit(&codex_main, later).unwrap();
+        Usage::record_codex_limit(&codex_backup, later).unwrap();
+
+        let execution = Execution {
+            profiles: vec![
+                claude_main.clone(),
+                claude_backup.clone(),
+                codex_main,
+                codex_backup,
+                gemini_work,
+            ],
+            workspace: temp.parent.clone(),
+            clock: || usage::tick(157_600, 57_600),
+            limits: LimitPolicy::default(),
+            mode: PermissionMode::WorkspaceAuto,
+            options: LaunchOptions::default(),
+            active_pid: Arc::new(AtomicU32::new(0)),
+        };
+
+        assert!(!Usage::read(&claude_backup).unwrap().blocked(later));
+        assert_eq!(
+            execution.rotation(Some("claude/main"), later),
+            vec!["claude/backup".to_owned()]
+        );
+
+        let route = Route::single("Populate my inbox", Some("claude/main".into()));
+        let choice = execution.select_route(&route, later).unwrap();
+
+        assert!(Usage::read(&claude_backup).unwrap().blocked(later));
+        assert!(execution.rotation(Some("claude/main"), later).is_empty());
+        assert_eq!(choice.candidate.label, "gemini/work");
+        assert!(
+            choice
+                .reason
+                .starts_with("Override claude/main skipped: latched · Auto → gemini/work"),
+            "unexpected routing reason: {}",
+            choice.reason
+        );
     }
 }
 

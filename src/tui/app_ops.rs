@@ -32,6 +32,21 @@ const MAX_SHELL_CONTEXT_SNIPPETS: usize = 4;
 const MAX_SHELL_SNIPPET_CHARS: usize = 2000;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+pub(crate) fn is_session_not_found_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no conversation found")
+        || lower.contains("session not found")
+        || lower.contains("no such session")
+        || lower.contains("thread not found")
+        || lower.contains("no such thread")
+        || lower.contains("conversation not found")
+        || (lower.contains("session")
+            && (lower.contains("not found")
+                || lower.contains("invalid session")
+                || lower.contains("does not exist")))
+        || (lower.contains("thread") && lower.contains("not found"))
+}
+
 pub(crate) fn format_routing_notice(reason: &str) -> String {
     let trimmed = reason.trim();
     if !(trimmed.starts_with("Override →")
@@ -46,10 +61,10 @@ pub(crate) fn format_routing_notice(reason: &str) -> String {
         .filter(|seg| !matches!(*seg, "unscored" | "speed n/a" | "headroom unknown"))
         .map(str::to_owned)
         .collect();
-    if unscored {
-        if let Some(first) = parts.first_mut() {
-            if let Some(stripped) = first.strip_suffix(" provider default") {
-                *first = stripped.to_owned();
+    for part in &mut parts {
+        if unscored || part.contains("→ ") {
+            if let Some(stripped) = part.strip_suffix(" provider default") {
+                *part = stripped.to_owned();
             }
         }
     }
@@ -254,28 +269,41 @@ impl App {
 
     pub fn top_bar_quota_badge(&self) -> Option<String> {
         let live = self.live.as_ref()?;
-        if let Some((five, week)) = live.live_quota {
-            let mut parts = Vec::new();
-            if let Some(f) = five {
-                parts.push(format!("5h {:.0}%", (100.0 - f).clamp(0.0, 100.0)));
-            }
-            if let Some(w) = week {
-                parts.push(format!("7d {:.0}%", (100.0 - w).clamp(0.0, 100.0)));
-            }
-            if !parts.is_empty() {
-                return Some(parts.join(" "));
-            }
-        }
         let idx = live.displayed_profile();
         let allowance = live.allowances.get(idx)?;
+        if live
+            .profiles
+            .get(idx)
+            .is_some_and(|profile| profile.provider == Provider::Gemini)
+        {
+            return allowance.latched.then(|| {
+                if allowance.reset_in.is_none() {
+                    "reset unknown".to_owned()
+                } else {
+                    "latched".to_owned()
+                }
+            });
+        }
         let mut parts = Vec::new();
         if let Some(five) = allowance.five {
-            parts.push(format!("5h {:.0}%", five.clamp(0.0, 100.0)));
+            parts.push(format!("5h {:.0}%", five.clamp(0.0, 100.0).floor()));
         }
         if let Some(week) = allowance.week {
-            parts.push(format!("7d {:.0}%", week.clamp(0.0, 100.0)));
+            parts.push(format!("7d {:.0}%", week.clamp(0.0, 100.0).floor()));
         }
-        (!parts.is_empty()).then(|| parts.join(" "))
+        if parts.is_empty() {
+            return allowance.latched.then(|| {
+                if allowance.reset_in.is_none() {
+                    "reset unknown".to_owned()
+                } else {
+                    "latched".to_owned()
+                }
+            });
+        }
+        if allowance.stale {
+            parts.push("stale".to_owned());
+        }
+        Some(parts.join(" "))
     }
 
     pub fn footer_mode_label(&self) -> String {
@@ -330,10 +358,15 @@ impl App {
                 .zip(&live.signed_in)
                 .find(|(p, signed)| **signed && p.provider == provider)
             {
-                let det = self
-                    .auth_detections
-                    .iter()
-                    .find(|d| d.provider == provider && d.logged_in);
+                let det = live
+                    .profile_detections
+                    .get(&profile.to_string())
+                    .filter(|d| d.logged_in)
+                    .or_else(|| {
+                        self.auth_detections
+                            .iter()
+                            .find(|d| d.provider == provider && d.logged_in)
+                    });
                 let suffix = det
                     .and_then(|d| d.auth_method.as_deref().or(d.tier.as_deref()))
                     .map(|m| format!(" · {}", short_method(m)))
@@ -444,11 +477,31 @@ impl App {
             AppEvent::AuthDetected {
                 detections,
                 profiles,
+                profile_detections,
             } => {
                 self.auth_detections = detections;
                 if let Some(live) = &mut self.live {
                     if !profiles.is_empty() {
                         live.reset_profiles(profiles);
+                    }
+                    for (label, det) in profile_detections {
+                        live.profile_detections.insert(label, det);
+                    }
+                    for profile in &live.profiles {
+                        let label = profile.to_string();
+                        if profile.is_system_default() {
+                            if let Some(det) = self
+                                .auth_detections
+                                .iter()
+                                .find(|d| d.provider == profile.provider)
+                            {
+                                live.profile_detections.insert(label, det.clone());
+                            }
+                        } else {
+                            live.profile_detections
+                                .entry(label)
+                                .or_insert_with(|| profile.detect_passive());
+                        }
                     }
                     live.signed_in = live
                         .profiles
@@ -457,7 +510,12 @@ impl App {
                             if let Some(host) = &self.host {
                                 host.signed_in(profile)
                             } else {
-                                profile.detect_passive().logged_in
+                                live.profile_detections
+                                    .get(&profile.to_string())
+                                    .map_or_else(
+                                        || profile.detect_passive().logged_in,
+                                        |det| det.logged_in,
+                                    )
                             }
                         })
                         .collect();
@@ -603,10 +661,19 @@ impl App {
     pub(crate) fn handle_normalized_event(&mut self, name: &str, event: NormalizedEvent) {
         let is_commander = name == specialists::COMMANDER;
         match event {
-            NormalizedEvent::SessionStarted { session_id, model } => {
+            NormalizedEvent::SessionStarted {
+                session_id,
+                model,
+                profile,
+            } => {
                 if is_commander {
                     if let Some(live) = &mut self.live {
+                        let running_label = live
+                            .running_profile
+                            .and_then(|idx| live.profiles.get(idx))
+                            .map(ToString::to_string);
                         live.commander_session_id = Some(session_id);
+                        live.commander_session_profile = profile.or(running_label);
                     }
                 }
                 if let Some(model_name) = model {
@@ -755,17 +822,20 @@ impl App {
                     }
                 }
             }
-            NormalizedEvent::RateLimit {
-                five_hour_pct,
-                seven_day_pct,
-                ..
-            } => {
+            NormalizedEvent::RateLimit { .. } => {
                 if let Some(live) = &mut self.live {
-                    live.live_quota = Some((five_hour_pct, seven_day_pct));
+                    live.refresh_usage_now();
                 }
             }
             NormalizedEvent::UsageDelta { .. } => {}
             NormalizedEvent::StderrLine(line) => {
+                if is_commander && is_session_not_found_error(&line) {
+                    if let Some(live) = &mut self.live {
+                        if let Some(pos) = live.run_position(name) {
+                            live.runs[pos].saw_session_not_found = true;
+                        }
+                    }
+                }
                 self.append_provider_stderr(name, &line);
             }
             NormalizedEvent::TurnFinished {
@@ -782,6 +852,13 @@ impl App {
                             text: "Turn interrupted.".into(),
                         });
                 } else if is_error {
+                    if is_commander && is_session_not_found_error(&final_text) {
+                        if let Some(live) = &mut self.live {
+                            if let Some(pos) = live.run_position(name) {
+                                live.runs[pos].saw_session_not_found = true;
+                            }
+                        }
+                    }
                     self.mark_provider_stderr_failed(name);
                     if error_code == Some(HealthCode::AgentAuth) {
                         self.transcript_for_mut(name)
@@ -1009,6 +1086,10 @@ impl App {
             self.log_times.clear();
             self.transcript.clear();
             self.scroll.jump_to_top();
+            if let Some(live) = &mut self.live {
+                live.clear_commander_session();
+                live.handoff_turns.clear();
+            }
             self.persist_commander_transcript();
         } else {
             self.crew[self.selected].history.clear();
@@ -1868,18 +1949,6 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("\n\n");
             sections.push(format!("Recent local shell output:\n{shell_block}"));
-        }
-        let switched_provider = live.commander_provider.is_some()
-            && live
-                .profiles
-                .get(live.displayed_profile())
-                .is_some_and(|p| Some(p.provider) != live.commander_provider);
-        if switched_provider && !live.handoff_turns.is_empty() {
-            let handoff = crate::soul::build_portable_handoff(
-                &live.handoff_turns,
-                crate::soul::DEFAULT_HANDOFF_TOKENS,
-            );
-            sections.push(handoff);
         }
         sections.push(format!("Operator: {unit}"));
         sections.join("\n\n")

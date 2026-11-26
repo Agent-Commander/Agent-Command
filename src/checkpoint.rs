@@ -80,6 +80,11 @@ struct Snapshot {
     manifest: Vec<ManifestEntry>,
 }
 
+pub fn is_git_workspace(workspace: &Path) -> bool {
+    git(workspace, &["rev-parse", "--is-inside-work-tree"])
+        .is_ok_and(|output| output.trim_ascii() == b"true")
+}
+
 impl Checkpoint {
     pub(crate) fn save(
         profile: &Profile,
@@ -87,6 +92,7 @@ impl Checkpoint {
         workspace: &Path,
         progress: Progress,
     ) -> io::Result<Self> {
+        git_workspace_root(workspace)?;
         let state = profile.checkpoint_directory()?.canonicalize()?;
         if state.starts_with(workspace.canonicalize()?) {
             return Err(io::Error::other(
@@ -345,13 +351,18 @@ fn add_field(hash: &mut Sha256, data: &[u8]) {
     hash.update(data);
 }
 
-fn snapshot(workspace: &Path) -> io::Result<Snapshot> {
+fn git_workspace_root(workspace: &Path) -> io::Result<()> {
     let relative = git(workspace, &["rev-parse", "--show-prefix"])?;
     if relative != b"\n" && relative != b"\r\n" {
         return Err(io::Error::other(
             "Continuation requires the root of the Git workspace",
         ));
     }
+    Ok(())
+}
+
+fn snapshot(workspace: &Path) -> io::Result<Snapshot> {
+    git_workspace_root(workspace)?;
     let mut hash = Sha256::new();
     add_field(
         &mut hash,
@@ -1086,6 +1097,80 @@ mod tests {
         assert!(
             reason.contains("Unsupported workspace entry") && reason.contains(name),
             "{reason}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cross_platform_tests {
+    use super::*;
+    use crate::auth::Provider;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "agent-command-checkpoint-{label}-{}",
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn is_git_workspace_distinguishes_plain_directories_from_repositories() {
+        let plain = TempDir::new("plain");
+        assert!(!is_git_workspace(&plain.0));
+
+        let repo = TempDir::new("repo");
+        git(&repo.0, &["init", "-q"]).unwrap();
+        assert!(is_git_workspace(&repo.0));
+
+        let nested = repo.0.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(is_git_workspace(&nested));
+    }
+
+    #[test]
+    fn checkpoint_save_checks_git_workspace_before_profile_state_location() {
+        let plain = TempDir::new("plain-nested-state");
+        let config_parent = plain.0.join(".config");
+        fs::create_dir_all(&config_parent).unwrap();
+        let state_root = config_parent.join("agent-command");
+        let profile = Profile::new(state_root, Provider::Claude, "main").unwrap();
+        profile.prepare().unwrap();
+        let err = Checkpoint::save(&profile, Uuid::new_v4(), &plain.0, Progress::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Continuation needs a Git workspace"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("Place isolated profile state outside the Git workspace"),
+            "misleading error on non-Git workspace: {err}"
+        );
+
+        let repo = TempDir::new("repo-nested-state");
+        git(&repo.0, &["init", "-q"]).unwrap();
+        let repo_state_root = repo.0.join("profiles");
+        let repo_profile = Profile::new(repo_state_root, Provider::Claude, "main").unwrap();
+        repo_profile.prepare().unwrap();
+        let repo_err =
+            Checkpoint::save(&repo_profile, Uuid::new_v4(), &repo.0, Progress::default())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            repo_err.contains("Place isolated profile state outside the Git workspace"),
+            "expected state-inside-repo refusal, got: {repo_err}"
         );
     }
 }

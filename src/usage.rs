@@ -36,7 +36,7 @@ pub fn now() -> Tick {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn tick(wall: i64, elapsed: u64) -> Tick {
     Tick {
         wall,
@@ -45,7 +45,7 @@ pub(crate) fn tick(wall: i64, elapsed: u64) -> Tick {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Stamp {
     elapsed: u64,
     epoch: uuid::Uuid,
@@ -80,6 +80,7 @@ pub(crate) struct Allowance {
     pub(crate) week: Option<f64>,
     pub(crate) reset_in: Option<i64>,
     pub(crate) latched: bool,
+    pub(crate) stale: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -145,8 +146,8 @@ impl Usage {
                     || now.wall >= window.reset;
                 format!(
                     "{name} {:.0}% used / {:.0}% left, reset {} · {}{}",
-                    window.used,
-                    (100.0 - window.used).max(0.0),
+                    window.used.clamp(0.0, 100.0).ceil(),
+                    (100.0 - window.used).clamp(0.0, 100.0).floor(),
                     duration(window.reset.saturating_sub(now.wall)),
                     if stale { "stale " } else { "age " },
                     age.map_or_else(
@@ -163,18 +164,69 @@ impl Usage {
     pub(crate) fn allowance(self, now: Tick) -> Allowance {
         let open = |window: Option<Window>| window.filter(|window| window.reset > now.wall);
         let left = |window: Window| (100.0 - window.used).clamp(0.0, 100.0);
+        let five_win = open(self.five);
+        let week_win = open(self.week);
+        let mut five = five_win.map(left);
+        let mut week = week_win.map(left);
         let latch = self.latch.filter(|reset| *reset > now.wall);
+        if let Some(latch_reset) = latch {
+            let already_zero = [five, week].into_iter().flatten().any(|rem| rem <= 0.0);
+            if !already_zero {
+                if week_win.is_some_and(|w| w.reset == latch_reset) {
+                    week = Some(0.0);
+                } else if five_win.is_some_and(|w| w.reset == latch_reset) {
+                    five = Some(0.0);
+                } else {
+                    match (five, week) {
+                        (Some(f), Some(w)) => {
+                            if w < f {
+                                week = Some(0.0);
+                            } else {
+                                five = Some(0.0);
+                            }
+                        }
+                        (Some(_), None) => five = Some(0.0),
+                        (None, Some(_)) => week = Some(0.0),
+                        (None, None) => five = Some(0.0),
+                    }
+                }
+            }
+        }
+        let constraining = match (five_win, week_win) {
+            (Some(f), Some(w)) => {
+                if left(w) < left(f) {
+                    Some(w)
+                } else {
+                    Some(f)
+                }
+            }
+            (Some(f), None) => Some(f),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        };
         let reset = match latch {
             Some(reset) => Some(reset).filter(|reset| *reset != i64::MAX),
-            None => open(self.five)
-                .or(open(self.week))
-                .map(|window| window.reset),
+            None => constraining.map(|window| window.reset),
+        };
+        let stale = if latch.is_some() {
+            false
+        } else {
+            match constraining {
+                Some(window) => {
+                    self.unavailable
+                        || self.needs_reading()
+                        || now.wall < window.observed
+                        || (now.wall - window.observed) as u64 >= STALE_SECONDS
+                }
+                None => false,
+            }
         };
         Allowance {
-            five: open(self.five).map(left),
-            week: open(self.week).map(left),
+            five,
+            week,
             reset_in: reset.map(|reset| reset - now.wall),
             latched: latch.is_some(),
+            stale,
         }
     }
 
@@ -218,20 +270,62 @@ impl Usage {
         }
         let info = &event["rate_limit_info"];
         let limited = info["status"] == "rejected";
+        let kind = info["rateLimitType"].as_str();
+        let top_reset = info["resetsAt"].as_i64();
         update(profile, |state| {
             let windows = &info["unifiedWindows"];
             let mut five = claude_window(&windows["five_hour"], now);
-            let mut week = claude_window(&windows["seven_day"], now);
-            match info["rateLimitType"].as_str() {
-                Some("five_hour") => five = five.or_else(|| claude_window(info, now)),
-                Some("seven_day") => week = week.or_else(|| claude_window(info, now)),
+            let mut week = [
+                "seven_day",
+                "seven_day_opus",
+                "seven_day_sonnet",
+                "seven_day_overage_included",
+                "overage",
+            ]
+            .into_iter()
+            .fold(None, |acc, key| {
+                tighter_window(acc, claude_window(&windows[key], now))
+            });
+            match kind {
+                Some("five_hour") => five = tighter_window(five, claude_window(info, now)),
+                Some(k) if is_claude_weekly_type(k) => {
+                    week = tighter_window(week, claude_window(info, now));
+                }
                 _ => {}
+            }
+            if limited {
+                let fallback_five_reset = top_reset
+                    .or_else(|| five.map(|w| w.reset))
+                    .or_else(|| state.five.filter(|w| w.reset > now.wall).map(|w| w.reset));
+                let fallback_week_reset = top_reset
+                    .or_else(|| week.map(|w| w.reset))
+                    .or_else(|| state.week.filter(|w| w.reset > now.wall).map(|w| w.reset));
+                match kind {
+                    Some("five_hour") => {
+                        if let Some(reset) = fallback_five_reset {
+                            five = tighter_window(five, window(100.0, reset, now));
+                        }
+                    }
+                    Some(k) if is_claude_weekly_type(k) => {
+                        if let Some(reset) = fallback_week_reset {
+                            week = tighter_window(week, window(100.0, reset, now));
+                        }
+                    }
+                    _ => {}
+                }
             }
             state.five = five.or(state.five);
             state.week = week.or(state.week);
             state.unavailable = five.is_none() && week.is_none();
             if limited {
-                state.record_limit(info["resetsAt"].as_i64(), now);
+                let latch_reset = top_reset.or_else(|| match kind {
+                    Some("five_hour") => state.five.filter(|w| w.reset > now.wall).map(|w| w.reset),
+                    Some(k) if is_claude_weekly_type(k) => {
+                        state.week.filter(|w| w.reset > now.wall).map(|w| w.reset)
+                    }
+                    _ => None,
+                });
+                state.record_limit(latch_reset, now);
             } else if (five.is_some() || week.is_some())
                 && (!state.blocked(now) || state.latch == Some(i64::MAX))
             {
@@ -242,15 +336,176 @@ impl Usage {
         Ok(limited)
     }
 
+    pub fn sync_peer_accounts(profiles: &[Profile], source: &Profile, now: Tick) {
+        let Some(source_id) = source.account_identity() else {
+            return;
+        };
+        let Ok(source_usage) = Self::read(source) else {
+            return;
+        };
+        let snap = PeerSnapshot {
+            five: source_usage.five.filter(|w| w.reset > now.wall),
+            week: source_usage.week.filter(|w| w.reset > now.wall),
+            blocked: source_usage.blocked(now),
+            known_reset: source_usage.known_reset(now),
+            fresh: !source_usage.unavailable,
+        };
+        if !snap.blocked && (!snap.fresh || (snap.five.is_none() && snap.week.is_none())) {
+            return;
+        }
+        let source_name = source.to_string();
+        for peer in profiles {
+            if peer.provider != source.provider || peer.to_string() == source_name {
+                continue;
+            }
+            if peer.account_identity().as_deref() != Some(source_id.as_str()) {
+                continue;
+            }
+            let Ok(mut preview) = Self::read(peer) else {
+                continue;
+            };
+            if !apply_peer_snapshot(&mut preview, snap, now, true) {
+                continue;
+            }
+            let _ = update_if_changed(peer, |state| {
+                Ok(apply_peer_snapshot(state, snap, now, true))
+            });
+        }
+    }
+
+    pub fn reconcile_peer_accounts(profiles: &[Profile], now: Tick) {
+        let mut groups: HashMap<(Provider, String), Vec<usize>> = HashMap::new();
+        for (index, profile) in profiles.iter().enumerate() {
+            if let Some(id) = profile.account_identity() {
+                groups
+                    .entry((profile.provider, id))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for indices in groups.into_values() {
+            if indices.len() < 2 {
+                continue;
+            }
+            let mut snapshots = Vec::new();
+            for index in indices {
+                if let Ok(usage) = Self::read(&profiles[index]) {
+                    snapshots.push((index, usage));
+                }
+            }
+            if snapshots.len() < 2 {
+                continue;
+            }
+            let mut merged_five: Option<Window> = None;
+            let mut merged_week: Option<Window> = None;
+            let mut any_blocked = false;
+            let mut merged_reset: Option<i64> = None;
+            let mut any_fresh_window = false;
+            for (_, usage) in &snapshots {
+                let blocked = usage.blocked(now);
+                let fresh = !usage.unavailable;
+                if blocked {
+                    any_blocked = true;
+                    if let Some(reset) = usage.known_reset(now) {
+                        merged_reset = Some(merged_reset.map_or(reset, |cur| cur.max(reset)));
+                    }
+                }
+                if blocked || fresh {
+                    if let Some(w) = usage.five.filter(|w| w.reset > now.wall) {
+                        if should_mirror_window(merged_five, w, now) {
+                            merged_five = Some(w);
+                        }
+                        if fresh {
+                            any_fresh_window = true;
+                        }
+                    }
+                    if let Some(w) = usage.week.filter(|w| w.reset > now.wall) {
+                        if should_mirror_window(merged_week, w, now) {
+                            merged_week = Some(w);
+                        }
+                        if fresh {
+                            any_fresh_window = true;
+                        }
+                    }
+                }
+            }
+            let snap = PeerSnapshot {
+                five: merged_five,
+                week: merged_week,
+                blocked: any_blocked,
+                known_reset: merged_reset,
+                fresh: any_fresh_window && !any_blocked,
+            };
+            if !snap.blocked && (!snap.fresh || (snap.five.is_none() && snap.week.is_none())) {
+                continue;
+            }
+            for (index, current) in snapshots {
+                let mut preview = current;
+                if !apply_peer_snapshot(&mut preview, snap, now, false) {
+                    continue;
+                }
+                let _ = update_if_changed(&profiles[index], |state| {
+                    Ok(apply_peer_snapshot(state, snap, now, false))
+                });
+            }
+        }
+    }
+
     pub(crate) fn record_codex_limit(profile: &Profile, now: Tick) -> io::Result<()> {
         update(profile, |state| {
-            let reset = [state.five, state.week]
+            let exhausted_reset = [state.five, state.week]
                 .into_iter()
                 .flatten()
                 .filter(|window| window.used >= 100.0 && window.reset > now.wall)
                 .map(|window| window.reset)
                 .max();
+            let reset = if exhausted_reset.is_some() {
+                exhausted_reset
+            } else {
+                let target = match (
+                    state.five.filter(|w| w.reset > now.wall),
+                    state.week.filter(|w| w.reset > now.wall),
+                ) {
+                    (Some(f), Some(w)) => {
+                        if w.used > f.used || (w.used == f.used && w.reset < f.reset) {
+                            Some(true)
+                        } else {
+                            Some(false)
+                        }
+                    }
+                    (Some(_), None) => Some(false),
+                    (None, Some(_)) => Some(true),
+                    (None, None) => None,
+                };
+                match target {
+                    Some(false) => {
+                        if let Some(w) = state.five {
+                            state.five = window(100.0, w.reset, now).or(state.five);
+                            Some(w.reset)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(true) => {
+                        if let Some(w) = state.week {
+                            state.week = window(100.0, w.reset, now).or(state.week);
+                            Some(w.reset)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            };
             state.record_limit(reset, now);
+            Ok(())
+        })
+    }
+
+    pub fn record_gemini_limit(profile: &Profile, reset: Option<i64>, now: Tick) -> io::Result<()> {
+        update(profile, |state| {
+            let valid_reset = reset.filter(|epoch| *epoch > now.wall && *epoch != i64::MAX);
+            state.record_limit(valid_reset, now);
             Ok(())
         })
     }
@@ -303,6 +558,137 @@ fn claude_window(raw: &Value, now: Tick) -> Option<Window> {
     )
 }
 
+fn is_claude_weekly_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "seven_day"
+            | "seven_day_opus"
+            | "seven_day_sonnet"
+            | "seven_day_overage_included"
+            | "overage"
+    )
+}
+
+fn tighter_window(a: Option<Window>, b: Option<Window>) -> Option<Window> {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            if y.used > x.used || (y.used == x.used && y.reset > x.reset) {
+                Some(y)
+            } else {
+                Some(x)
+            }
+        }
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PeerSnapshot {
+    five: Option<Window>,
+    week: Option<Window>,
+    blocked: bool,
+    known_reset: Option<i64>,
+    fresh: bool,
+}
+
+fn same_window(a: Option<Window>, b: Option<Window>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x.used.to_bits() == y.used.to_bits()
+                && x.reset == y.reset
+                && x.observed == y.observed
+                && x.stamp == y.stamp
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn window_is_fresh(window: Window, now: Tick) -> bool {
+    now.wall >= window.observed && ((now.wall - window.observed) as u64) < STALE_SECONDS
+}
+
+fn should_mirror_window(peer: Option<Window>, src: Window, now: Tick) -> bool {
+    match peer.filter(|w| w.reset > now.wall) {
+        None => true,
+        Some(existing) => {
+            src.observed > existing.observed
+                || (src.observed == existing.observed
+                    && (src.used > existing.used || src.reset > existing.reset))
+        }
+    }
+}
+
+fn apply_peer_snapshot(
+    state: &mut Usage,
+    snap: PeerSnapshot,
+    now: Tick,
+    allow_clear_unknown_latch: bool,
+) -> bool {
+    let prev_five = state.five;
+    let prev_week = state.week;
+    let prev_latch = state.latch;
+    let prev_unavailable = state.unavailable;
+    let prev_latest_observed = [state.five, state.week]
+        .into_iter()
+        .flatten()
+        .map(|w| w.observed)
+        .max();
+
+    let mut mirrored_window = false;
+    let mut mirrored_fresh_newer = false;
+    let mut latest_mirrored: Option<i64> = None;
+
+    if let Some(src) = snap.five {
+        if should_mirror_window(state.five, src, now) {
+            state.five = Some(src);
+            mirrored_window = true;
+            latest_mirrored =
+                Some(latest_mirrored.map_or(src.observed, |cur| cur.max(src.observed)));
+            if window_is_fresh(src, now)
+                && prev_latest_observed.is_none_or(|obs| src.observed > obs)
+            {
+                mirrored_fresh_newer = true;
+            }
+        }
+    }
+    if let Some(src) = snap.week {
+        if should_mirror_window(state.week, src, now) {
+            state.week = Some(src);
+            mirrored_window = true;
+            latest_mirrored =
+                Some(latest_mirrored.map_or(src.observed, |cur| cur.max(src.observed)));
+            if window_is_fresh(src, now)
+                && prev_latest_observed.is_none_or(|obs| src.observed > obs)
+            {
+                mirrored_fresh_newer = true;
+            }
+        }
+    }
+
+    if snap.blocked {
+        state.record_limit(snap.known_reset, now);
+    } else if mirrored_window && snap.fresh {
+        let can_clear_latch = match state.latch {
+            None => true,
+            Some(i64::MAX) => allow_clear_unknown_latch && mirrored_fresh_newer,
+            Some(reset) if reset > now.wall => false,
+            Some(expired) => latest_mirrored.is_some_and(|obs| obs >= expired),
+        };
+        if can_clear_latch {
+            state.latch = None;
+            state.unavailable = false;
+        }
+    }
+
+    !same_window(prev_five, state.five)
+        || !same_window(prev_week, state.week)
+        || prev_latch != state.latch
+        || prev_unavailable != state.unavailable
+}
+
 fn read_state(directory: &Path) -> io::Result<Usage> {
     match fs::read(directory.join("state.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
@@ -331,6 +717,32 @@ fn update<T>(profile: &Profile, edit: impl FnOnce(&mut Usage) -> io::Result<T>) 
     Ok(outcome)
 }
 
+fn update_if_changed(
+    profile: &Profile,
+    edit: impl FnOnce(&mut Usage) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let directory = profile.usage_directory()?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("lock"))?;
+    lock.lock()?;
+    let mut state = read_state(&directory)?;
+    let changed = edit(&mut state)?;
+    if changed {
+        let temporary = directory.join("state.next");
+        let mut file = File::create(&temporary)?;
+        serde_json::to_writer(&mut file, &state)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(temporary, directory.join("state.json"))?;
+    }
+    Ok(changed)
+}
+
+#[cfg(all(test, unix))]
 pub(crate) fn choices(profiles: &[Profile], preferred: usize, now: Tick) -> io::Result<Vec<usize>> {
     let selected = &profiles[preferred];
     if !Usage::read(selected)?.blocked(now) {
@@ -346,13 +758,15 @@ pub(crate) fn alternates(profiles: &[Profile], preferred: usize, now: Tick) -> V
         .filter(|(index, profile)| {
             *index != preferred && profile.provider == profiles[preferred].provider
         })
-        .filter(|(_, profile)| {
-            Usage::read(profile).is_ok_and(|usage| usage.eligible_alternate(now))
+        .filter_map(|(index, profile)| {
+            let usage = Usage::read(profile).ok()?;
+            usage
+                .eligible_alternate(now)
+                .then(|| (!usage.within_safety_buffer(now), profile.to_string(), index))
         })
-        .map(|(index, profile)| (profile.to_string(), index))
         .collect();
     alternates.sort_unstable();
-    alternates.into_iter().map(|(_, index)| index).collect()
+    alternates.into_iter().map(|(_, _, index)| index).collect()
 }
 
 pub(crate) fn cross_provider_fallback(
@@ -506,12 +920,26 @@ fn codex_windows(
         .get("codex")
         .unwrap_or(&result["rateLimits"]);
     let buckets = [&limits["primary"], &limits["secondary"]];
-    let by_duration = |minutes| {
-        let raw = buckets
-            .into_iter()
-            .find(|raw| raw["windowDurationMins"].as_i64() == Some(minutes))?;
-        window(raw["usedPercent"].as_f64()?, raw["resetsAt"].as_i64()?, now)
+    let parsed_bucket = |raw: &Value| {
+        let mins = raw["windowDurationMins"].as_i64()?;
+        let win = window(raw["usedPercent"].as_f64()?, raw["resetsAt"].as_i64()?, now)?;
+        Some((mins, win))
     };
+    let pick_bucket = |exact: i64, predicate: fn(i64) -> bool| {
+        buckets
+            .into_iter()
+            .filter_map(parsed_bucket)
+            .filter(|(mins, _)| predicate(*mins))
+            .max_by(|(mins_a, win_a), (mins_b, win_b)| {
+                (*mins_a == exact)
+                    .cmp(&(*mins_b == exact))
+                    .then_with(|| win_a.used.total_cmp(&win_b.used))
+                    .then_with(|| win_a.reset.cmp(&win_b.reset))
+            })
+            .map(|(_, win)| win)
+    };
+    let five = pick_bucket(300, |mins| mins > 0 && mins <= 1440);
+    let week = pick_bucket(10080, |mins| mins > 1440);
     let exhausted = buckets
         .into_iter()
         .filter(|raw| {
@@ -525,11 +953,7 @@ fn codex_windows(
         .filter_map(|raw| raw["resetsAt"].as_i64())
         .max();
     let limited = !exhausted.is_empty() || !limits["rateLimitReachedType"].is_null();
-    (
-        by_duration(300),
-        by_duration(10080),
-        limited.then_some(reset),
-    )
+    (five, week, limited.then_some(reset))
 }
 
 pub(crate) fn refresh_codex(profile: &Profile, now: Tick) -> io::Result<()> {
@@ -1011,5 +1435,412 @@ mod pool_tests {
             select_pool_account_from_usages(&[(0, tighter), (1, looser)], None, now).unwrap();
         assert_eq!(fallback.index, 1);
         assert!(fallback.inside_buffer);
+    }
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ac-usage-{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn profile(&self, provider: Provider, name: &str) -> Profile {
+            let profile = Profile::new(self.0.join("profiles"), provider, name).unwrap();
+            profile.prepare().unwrap();
+            profile
+        }
+
+        fn profile_dir(&self, profile: &Profile) -> std::path::PathBuf {
+            self.0
+                .join("profiles")
+                .join(profile.provider.binary())
+                .join(profile.name())
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn observe_claude_handles_model_weekly_buckets_and_utilizationless_rejections() {
+        let temp = TempRoot::new("claude-weekly");
+        let now = tick(10_000, 0);
+
+        for kind in [
+            "seven_day",
+            "seven_day_opus",
+            "seven_day_sonnet",
+            "seven_day_overage_included",
+            "overage",
+        ] {
+            let profile = temp.profile(Provider::Claude, &kind.replace('_', "-"));
+            let rejected = serde_json::json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": kind,
+                    "resetsAt": now.wall + 32_000
+                }
+            });
+            assert!(Usage::observe_claude(&profile, &rejected, now).unwrap());
+            let state = Usage::read(&profile).unwrap();
+            assert!(state.blocked(now), "{kind}");
+            let allowance = state.allowance(now);
+            assert_eq!(allowance.week, Some(0.0), "{kind}");
+            assert_eq!(allowance.reset_in, Some(32_000), "{kind}");
+            assert!(allowance.latched, "{kind}");
+            assert!(!allowance.stale, "{kind}");
+        }
+
+        let unified = temp.profile(Provider::Claude, "unified");
+        let mixed = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.20, "resetsAt": now.wall + 3600},
+                    "seven_day": {"utilization": 0.40, "resetsAt": now.wall + 86_400},
+                    "seven_day_overage_included": {"utilization": 0.92, "resetsAt": now.wall + 90_000}
+                }
+            }
+        });
+        assert!(!Usage::observe_claude(&unified, &mixed, now).unwrap());
+        let allowance = Usage::read(&unified).unwrap().allowance(now);
+        assert_eq!(allowance.five, Some(80.0));
+        assert!((allowance.week.unwrap() - 8.0).abs() < 1e-6);
+        assert_eq!(allowance.reset_in, Some(90_000));
+        assert!(!allowance.stale);
+    }
+
+    #[test]
+    fn allowance_uses_constraining_reset_wall_clock_staleness_and_floors_rows() {
+        let now = tick(20_000, 100);
+        let usage = Usage {
+            five: window(20.0, now.wall + 3600, now),
+            week: window(99.4, now.wall + 86_400, now),
+            ..Usage::default()
+        };
+        let fresh = usage.allowance(now);
+        assert_eq!(fresh.reset_in, Some(86_400));
+        assert!(!fresh.stale);
+        let [_, week_row] = usage.rows(now);
+        assert!(week_row.contains("100% used / 0% left"), "{week_row}");
+
+        let mut after_restart = tick(now.wall + STALE_SECONDS as i64, 5);
+        after_restart.epoch = uuid::Uuid::new_v4();
+        let stale = usage.allowance(after_restart);
+        assert!(stale.stale);
+
+        let latched = Usage {
+            five: window(25.0, now.wall + 7200, now),
+            week: window(60.0, now.wall + 86_400, now),
+            latch: Some(now.wall + 7200),
+            unavailable: true,
+            ..Usage::default()
+        };
+        let latched_allowance = latched.allowance(now);
+        assert!(latched_allowance.latched);
+        assert!(!latched_allowance.stale);
+        assert_eq!(latched_allowance.five, Some(0.0));
+        assert_eq!(latched_allowance.week, Some(40.0));
+        assert_eq!(latched_allowance.reset_in, Some(7200));
+
+        let expired_latch = latched.allowance(tick(now.wall + 7200, 7300));
+        assert!(!expired_latch.latched);
+        assert!(expired_latch.stale);
+    }
+
+    #[test]
+    fn sync_peer_accounts_mirrors_shared_accounts_and_preserves_latches_and_corrupt_peers() {
+        let temp = TempRoot::new("sync-peers");
+        let now = tick(30_000, 0);
+        let later = tick(30_120, 120);
+
+        let a = temp.profile(Provider::Claude, "alpha");
+        let b = temp.profile(Provider::Claude, "bravo");
+        let other = temp.profile(Provider::Claude, "other");
+        let corrupt = temp.profile(Provider::Claude, "corrupt");
+
+        for (profile, acct) in [
+            (&a, "acct-shared"),
+            (&b, "acct-shared"),
+            (&other, "acct-separate"),
+            (&corrupt, "acct-shared"),
+        ] {
+            profile.prepare().unwrap();
+            let dir = temp.profile_dir(profile);
+            fs::write(
+                dir.join(".claude.json"),
+                format!(
+                    r#"{{"oauthAccount":{{"accountUuid":"{acct}","organizationUuid":"org-1"}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let corrupt_path = corrupt.usage_directory().unwrap().join("state.json");
+        fs::write(&corrupt_path, b"not json").unwrap();
+
+        let profiles = [a.clone(), b.clone(), other.clone(), corrupt.clone()];
+
+        let stale_ok = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "unifiedWindows": {
+                    "seven_day": {"utilization": 0.77, "resetsAt": now.wall + 50_000}
+                }
+            }
+        });
+        Usage::observe_claude(&a, &stale_ok, now).unwrap();
+
+        let rejected = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "seven_day",
+                "resetsAt": later.wall + 32_000
+            }
+        });
+        Usage::observe_claude(&b, &rejected, later).unwrap();
+
+        Usage::sync_peer_accounts(&profiles, &b, later);
+
+        let mirrored_a = Usage::read(&a).unwrap();
+        assert!(mirrored_a.blocked(later));
+        assert_eq!(mirrored_a.allowance(later).week, Some(0.0));
+        assert_eq!(mirrored_a.known_reset(later), Some(later.wall + 32_000));
+
+        let untouched_other = Usage::read(&other).unwrap();
+        assert!(!untouched_other.blocked(later));
+        assert_eq!(untouched_other.allowance(later).week, None);
+        assert_eq!(fs::read(&corrupt_path).unwrap(), b"not json");
+
+        let shorter = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "seven_day",
+                "resetsAt": later.wall + 10_000
+            }
+        });
+        let c = temp.profile(Provider::Claude, "charlie");
+        c.prepare().unwrap();
+        let c_dir = temp.profile_dir(&c);
+        fs::write(
+            c_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"acct-shared","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        Usage::observe_claude(&c, &shorter, later).unwrap();
+        Usage::sync_peer_accounts(&[a.clone(), c.clone()], &c, later);
+        assert_eq!(
+            Usage::read(&a).unwrap().known_reset(later),
+            Some(later.wall + 32_000)
+        );
+    }
+
+    #[test]
+    fn record_codex_limit_uses_constraining_open_window_and_codex_windows_maps_durations() {
+        let temp = TempRoot::new("codex-limit");
+        let now = tick(40_000, 0);
+
+        let non_standard = serde_json::json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 45.0, "resetsAt": now.wall + 7_200, "windowDurationMins": 1440},
+                "secondary": {"usedPercent": 80.0, "resetsAt": now.wall + 200_000, "windowDurationMins": 20160}
+            }
+        });
+        let (five, week, limit) = codex_windows(&non_standard, now);
+        assert_eq!(five.unwrap().used, 45.0);
+        assert_eq!(week.unwrap().used, 80.0);
+        assert!(limit.is_none());
+
+        let profile = temp.profile(Provider::Codex, "cached");
+        update(&profile, |state| {
+            state.five = window(30.0, now.wall + 3_600, now);
+            state.week = window(96.0, now.wall + 60_000, now);
+            Ok(())
+        })
+        .unwrap();
+        Usage::record_codex_limit(&profile, now).unwrap();
+        let state = Usage::read(&profile).unwrap();
+        assert!(state.blocked(now));
+        assert_eq!(state.known_reset(now), Some(now.wall + 60_000));
+        assert_eq!(state.allowance(now).week, Some(0.0));
+        assert_eq!(state.allowance(now).five, Some(70.0));
+
+        let empty = temp.profile(Provider::Codex, "empty");
+        Usage::record_codex_limit(&empty, now).unwrap();
+        let empty_state = Usage::read(&empty).unwrap();
+        assert!(empty_state.blocked(now));
+        assert_eq!(empty_state.known_reset(now), None);
+    }
+
+    #[test]
+    fn record_gemini_limit_latches_with_known_or_unknown_reset() {
+        let temp = TempRoot::new("gemini-limit");
+        let now = tick(50_000, 0);
+
+        let known = temp.profile(Provider::Gemini, "known");
+        Usage::record_gemini_limit(&known, Some(now.wall + 1_800), now).unwrap();
+        let state = Usage::read(&known).unwrap();
+        assert!(state.blocked(now));
+        assert_eq!(state.known_reset(now), Some(now.wall + 1_800));
+        let allowance = state.allowance(now);
+        assert!(allowance.latched);
+        assert_eq!(allowance.five, Some(0.0));
+        assert_eq!(allowance.reset_in, Some(1_800));
+
+        Usage::record_gemini_limit(&known, Some(now.wall + 600), now).unwrap();
+        assert_eq!(
+            Usage::read(&known).unwrap().known_reset(now),
+            Some(now.wall + 1_800)
+        );
+
+        let unknown = temp.profile(Provider::Gemini, "unknown");
+        Usage::record_gemini_limit(&unknown, None, now).unwrap();
+        let unknown_state = Usage::read(&unknown).unwrap();
+        assert!(unknown_state.blocked(now));
+        assert_eq!(unknown_state.known_reset(now), None);
+        assert_eq!(unknown_state.latch_label(now), "Latched · reset unknown");
+    }
+
+    #[test]
+    fn alternates_ranks_safe_profiles_ahead_of_critically_low_with_alphabetical_ties() {
+        let temp = TempRoot::new("alternates-rank");
+        let now = tick(60_000, 0);
+        let selected = temp.profile(Provider::Claude, "selected");
+        let alpha_low = temp.profile(Provider::Claude, "alpha");
+        let zebra_safe = temp.profile(Provider::Claude, "zebra");
+        let bravo_safe = temp.profile(Provider::Claude, "bravo");
+        let delta_low = temp.profile(Provider::Claude, "delta");
+
+        for (profile, five_used, week_used) in [
+            (&alpha_low, 10.0, 97.0),
+            (&zebra_safe, 20.0, 40.0),
+            (&bravo_safe, 30.0, 50.0),
+            (&delta_low, 90.0, 10.0),
+        ] {
+            update(profile, |state| {
+                state.five = window(five_used, now.wall + 3_600, now);
+                state.week = window(week_used, now.wall + 86_400, now);
+                Ok(())
+            })
+            .unwrap();
+        }
+        let profiles = [selected, alpha_low, zebra_safe, bravo_safe, delta_low];
+        assert_eq!(alternates(&profiles, 0, now), vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn reconcile_peer_accounts_syncs_latched_main_into_stale_default_skips_noops_and_preserves_unknown_latch(
+    ) {
+        let temp = TempRoot::new("reconcile-peers");
+        let stale_time = tick(100_000, 0);
+        let now = tick(100_000 + 16 * 3600, 16 * 3600);
+
+        let default_like = temp.profile(Provider::Claude, "default-like");
+        let main = temp.profile(Provider::Claude, "main");
+        let separate = temp.profile(Provider::Claude, "separate");
+
+        for (profile, acct) in [
+            (&default_like, "acct-shared"),
+            (&main, "acct-shared"),
+            (&separate, "acct-other"),
+        ] {
+            let dir = temp.profile_dir(profile);
+            fs::write(
+                dir.join(".claude.json"),
+                format!(
+                    r#"{{"oauthAccount":{{"accountUuid":"{acct}","organizationUuid":"org-1"}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let stale_ok = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "unifiedWindows": {
+                    "seven_day": {"utilization": 0.77, "resetsAt": now.wall + 100_000}
+                }
+            }
+        });
+        Usage::observe_claude(&default_like, &stale_ok, stale_time).unwrap();
+
+        let latched_main = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "seven_day",
+                "resetsAt": now.wall + 32_000
+            }
+        });
+        Usage::observe_claude(&main, &latched_main, now).unwrap();
+
+        let profiles = [default_like.clone(), main.clone(), separate.clone()];
+        Usage::reconcile_peer_accounts(&profiles, now);
+
+        let synced_default = Usage::read(&default_like).unwrap();
+        assert!(synced_default.blocked(now));
+        assert_eq!(synced_default.allowance(now).week, Some(0.0));
+        assert_eq!(synced_default.known_reset(now), Some(now.wall + 32_000));
+        assert!(!Usage::read(&separate).unwrap().blocked(now));
+
+        let default_path = default_like.usage_directory().unwrap().join("state.json");
+        let main_path = main.usage_directory().unwrap().join("state.json");
+        let pretty_default = serde_json::to_vec_pretty(&synced_default).unwrap();
+        let pretty_main = serde_json::to_vec_pretty(&Usage::read(&main).unwrap()).unwrap();
+        fs::write(&default_path, &pretty_default).unwrap();
+        fs::write(&main_path, &pretty_main).unwrap();
+
+        Usage::reconcile_peer_accounts(&profiles, now);
+        Usage::sync_peer_accounts(&profiles, &main, now);
+        assert_eq!(fs::read(&default_path).unwrap(), pretty_default);
+        assert_eq!(fs::read(&main_path).unwrap(), pretty_main);
+
+        let unknown_latched = temp.profile(Provider::Codex, "unknown-latched");
+        let stale_unblocked = temp.profile(Provider::Codex, "stale-unblocked");
+        for profile in [&unknown_latched, &stale_unblocked] {
+            let dir = temp.profile_dir(profile);
+            fs::write(
+                dir.join("auth.json"),
+                r#"{"tokens":{"access_token":"tok","account_id":"codex-shared"}}"#,
+            )
+            .unwrap();
+        }
+        update(&stale_unblocked, |state| {
+            state.five = window(20.0, now.wall + 7_200, stale_time);
+            state.unavailable = false;
+            Ok(())
+        })
+        .unwrap();
+        Usage::record_codex_limit(&unknown_latched, now).unwrap();
+        assert_eq!(
+            Usage::read(&unknown_latched).unwrap().latch_label(now),
+            "Latched · reset unknown"
+        );
+
+        let codex_profiles = [unknown_latched.clone(), stale_unblocked.clone()];
+        Usage::sync_peer_accounts(&codex_profiles, &stale_unblocked, now);
+        assert!(Usage::read(&unknown_latched).unwrap().blocked(now));
+        assert_eq!(
+            Usage::read(&unknown_latched).unwrap().latch_label(now),
+            "Latched · reset unknown"
+        );
+
+        Usage::reconcile_peer_accounts(&codex_profiles, now);
+        assert!(Usage::read(&unknown_latched).unwrap().blocked(now));
+        assert!(Usage::read(&stale_unblocked).unwrap().blocked(now));
     }
 }

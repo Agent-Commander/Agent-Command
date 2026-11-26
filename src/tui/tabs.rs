@@ -642,34 +642,33 @@ impl App {
         let Some(live) = &self.live else {
             return Vec::new();
         };
-        let displayed = live.displayed_profile();
         live.profiles
             .iter()
             .enumerate()
             .map(|(index, profile)| {
                 let allowance = live.allowances.get(index).copied().unwrap_or_default();
-                let (mut primary, mut secondary) = (allowance.five, allowance.week);
-                if let (true, Some((five_used, week_used))) = (index == displayed, live.live_quota)
-                {
-                    let left = |used: f32| (100.0 - f64::from(used)).clamp(0.0, 100.0);
-                    primary = five_used.map(left).or(primary);
-                    secondary = week_used.map(left).or(secondary);
-                }
-                let tier = profile
-                    .is_system_default()
-                    .then(|| {
-                        self.auth_detections
-                            .iter()
-                            .find(|detection| detection.provider == profile.provider)
-                            .and_then(|detection| detection.tier.as_deref())
-                    })
-                    .flatten();
+                let label = profile.to_string();
+                let tier = if profile.is_system_default() {
+                    self.auth_detections
+                        .iter()
+                        .find(|detection| detection.provider == profile.provider)
+                        .and_then(|detection| detection.tier.as_deref())
+                        .or_else(|| {
+                            live.profile_detections
+                                .get(&label)
+                                .and_then(|detection| detection.tier.as_deref())
+                        })
+                } else {
+                    live.profile_detections
+                        .get(&label)
+                        .and_then(|detection| detection.tier.as_deref())
+                };
                 let card = AccountCard {
                     provider: provider_short_name(profile.provider).to_owned(),
                     profile: profile.name().to_owned(),
                     tier: normalize_tier(tier),
-                    primary_remaining: primary,
-                    secondary_remaining: secondary,
+                    primary_remaining: allowance.five,
+                    secondary_remaining: allowance.week,
                     seconds_until_reset: allowance.reset_in,
                     route_model: None,
                     route_metric: None,
@@ -893,6 +892,7 @@ mod tests {
                 week: Some(12.0),
                 reset_in: Some(2 * 3600 + 26 * 60),
                 latched: false,
+                stale: false,
             },
             Allowance::default(),
         ];
@@ -929,7 +929,7 @@ mod tests {
         let panel = text(&buffer, Rect::new(0, 0, 30, 40));
         assert!(panel.contains("Claude · default"), "{panel}");
         assert!(
-            panel.contains("64% left") && panel.contains(" MAX "),
+            panel.contains("12% left") && panel.contains(" MAX "),
             "{panel}"
         );
         assert!(
@@ -946,8 +946,8 @@ mod tests {
             .count();
         assert!(braille_cells >= 30, "{braille_cells}\n{panel}");
         let deck = app.deck_palette;
-        let (x, y) = find(&buffer, "64% left").unwrap();
-        assert_eq!(buffer[(x, y)].fg, deck.healthy);
+        let (x, y) = find(&buffer, "12% left").unwrap();
+        assert_eq!(buffer[(x, y)].fg, deck.depleted);
         let (x, y) = find_left_of(&buffer, "7d 12%", 30).unwrap();
         assert_eq!(buffer[(x, y)].fg, deck.depleted);
         let (x, y) = find(&buffer, "-- left").unwrap();
@@ -965,10 +965,242 @@ mod tests {
         let mut app = live_app(&root);
         let buffer = render(&mut app, 100, 30);
         let top = text(&buffer, Rect::new(0, 0, 100, 1));
+        assert!(top.contains("○"), "{top}");
+        let (x, y) = find(&buffer, "○").unwrap();
+        assert_eq!(buffer[(x, y)].fg, app.deck_palette.depleted);
+
+        app.live.as_mut().unwrap().allowances[0].week = Some(80.0);
+        let buffer = render(&mut app, 100, 30);
+        let top = text(&buffer, Rect::new(0, 0, 100, 1));
         assert!(top.contains("◑") || top.contains("◕"), "{top}");
         let (x, y) = find(&buffer, "◕").or_else(|| find(&buffer, "◑")).unwrap();
         assert_eq!(buffer[(x, y)].fg, app.deck_palette.healthy);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_profiles_show_plan_tier_badges_and_gemini_and_stale_render_cleanly() {
+        let root = scratch("isolated-tiers");
+        let state_root = root.join("state");
+        let claude_main =
+            auth::Profile::new(state_root.clone(), auth::Provider::Claude, "main").unwrap();
+        let codex_main =
+            auth::Profile::new(state_root.clone(), auth::Provider::Codex, "main").unwrap();
+        let gemini_default =
+            auth::Profile::system_default(state_root.clone(), auth::Provider::Gemini);
+
+        let claude_dir = state_root.join("claude").join("main");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok","subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}"#,
+        )
+        .unwrap();
+
+        let codex_dir = state_root.join("codex").join("main");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "promax",
+                "chatgpt_account_id": "acct-1"
+            }
+        });
+        let encoded_payload = base64_url_no_pad(&payload.to_string());
+        let fake_jwt = format!("eyJhbGciOiJub25lIn0.{encoded_payload}.sig");
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "tok",
+                    "id_token": fake_jwt
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut live = Live::new(root.join("work"), Vec::new(), None);
+        live.reset_profiles(vec![claude_main, codex_main, gemini_default]);
+        live.allowances = vec![
+            Allowance {
+                five: None,
+                week: Some(23.9),
+                reset_in: Some(3600),
+                latched: false,
+                stale: true,
+            },
+            Allowance {
+                five: Some(0.0),
+                week: Some(0.0),
+                reset_in: Some(15 * 3600),
+                latched: true,
+                stale: false,
+            },
+            Allowance::default(),
+        ];
+        live.signed_in = vec![true, true, true];
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        app.auth_detections = vec![auth::AuthDetection {
+            provider: auth::Provider::Gemini,
+            logged_in: true,
+            auth_method: Some("oauth-personal".into()),
+            account: None,
+            tier: Some("google".into()),
+            api_provider: None,
+            config_dir: None,
+            warning: None,
+        }];
+
+        let cards = app.usage_cards();
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0].1.tier, "max");
+        assert_eq!(cards[1].1.tier, "max");
+        assert_eq!(cards[2].1.tier, "google");
+
+        let buffer = render(&mut app, 140, 40);
+        let panel = text(&buffer, Rect::new(0, 0, 30, 40));
+        assert!(panel.contains("Claude · main"), "{panel}");
+        assert!(panel.contains("Codex · main"), "{panel}");
+        assert!(panel.contains("Gemini · default"), "{panel}");
+        assert_eq!(panel.matches(" MAX ").count(), 2, "{panel}");
+        assert!(panel.contains(" GOOGLE "), "{panel}");
+        assert!(panel.contains("7d · stale"), "{panel}");
+        assert!(panel.contains("no CLI quota"), "{panel}");
+
+        let _ = render(&mut app, 80, 24);
+        let _ = render(&mut app, 120, 40);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reset_profiles_reconciles_peer_accounts_and_latched_gemini_labels_cleanly() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-tabs-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = base.join("profiles");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let claude_main =
+            auth::Profile::new(state_root.clone(), auth::Provider::Claude, "main").unwrap();
+        let claude_peer =
+            auth::Profile::new(state_root.clone(), auth::Provider::Claude, "peer").unwrap();
+        let gemini_main =
+            auth::Profile::new(state_root.clone(), auth::Provider::Gemini, "main").unwrap();
+        let gemini_unknown =
+            auth::Profile::new(state_root, auth::Provider::Gemini, "unknown").unwrap();
+        claude_main.prepare().unwrap();
+        claude_peer.prepare().unwrap();
+        gemini_main.prepare().unwrap();
+        gemini_unknown.prepare().unwrap();
+
+        let shared_claude = serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "acct-shared",
+                "organizationUuid": "org-shared",
+                "organizationRateLimitTier": "default_claude_max_20x"
+            }
+        })
+        .to_string();
+        for name in ["main", "peer"] {
+            let dir = base.join("profiles").join("claude").join(name);
+            std::fs::write(dir.join(".claude.json"), &shared_claude).unwrap();
+        }
+
+        let now = crate::usage::now();
+        let stale_tick = crate::usage::tick(now.wall - 16 * 3600, 0);
+        crate::usage::Usage::observe_claude(
+            &claude_peer,
+            &serde_json::json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "rateLimitType": "seven_day",
+                    "utilization": 0.77,
+                    "resetsAt": now.wall + 24 * 3600
+                }
+            }),
+            stale_tick,
+        )
+        .unwrap();
+        crate::usage::Usage::observe_claude(
+            &claude_main,
+            &serde_json::json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day",
+                    "resetsAt": now.wall + 8 * 3600
+                }
+            }),
+            now,
+        )
+        .unwrap();
+        crate::usage::Usage::record_gemini_limit(&gemini_main, Some(now.wall + 3600), now).unwrap();
+        crate::usage::Usage::record_gemini_limit(&gemini_unknown, None, now).unwrap();
+
+        let mut live = Live::new(work, Vec::new(), None);
+        live.reset_profiles(vec![claude_main, claude_peer, gemini_main, gemini_unknown]);
+        live.signed_in = vec![true, true, true, true];
+        assert!(live.allowances[0].latched);
+        assert!(live.allowances[1].latched);
+        assert_eq!(live.allowances[1].week, Some(0.0));
+
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        app.live.as_mut().unwrap().preferred = Some(2);
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("latched"));
+        app.live.as_mut().unwrap().preferred = Some(3);
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("reset unknown"));
+
+        let buffer = render(&mut app, 140, 40);
+        let panel = text(&buffer, Rect::new(0, 0, 30, 40));
+        assert!(panel.contains("Gemini · main"), "{panel}");
+        assert!(panel.contains("latched"), "{panel}");
+        assert!(panel.contains("reset unknown"), "{panel}");
+        assert!(!panel.contains("5h window"), "{panel}");
+
+        let live = app.live.as_mut().unwrap();
+        live.allowances[0] = Allowance {
+            five: Some(0.0),
+            week: Some(40.0),
+            reset_in: None,
+            latched: true,
+            stale: false,
+        };
+        let buffer = render(&mut app, 140, 40);
+        let panel = text(&buffer, Rect::new(0, 0, 30, 40));
+        assert!(panel.contains("↻ - · reset"), "{panel}");
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn base64_url_no_pad(input: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let bytes = input.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = chunk.get(1).copied().map(u32::from).unwrap_or(0);
+            let b2 = chunk.get(2).copied().map(u32::from).unwrap_or(0);
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                out.push(TABLE[(triple & 0x3f) as usize] as char);
+            }
+        }
+        out
     }
 
     #[test]

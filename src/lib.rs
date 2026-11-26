@@ -199,7 +199,7 @@ pub(crate) struct Live {
     last_routed: Option<usize>,
     pub(crate) profile_area: Rect,
     usage: Option<usage::Usage>,
-    usage_checked_at: Option<u64>,
+    pub(crate) usage_checked_at: Option<u64>,
     usage_worker: Option<std::thread::JoinHandle<()>>,
     running_profile: Option<usize>,
     pub(crate) pending: Option<(usize, checkpoint::Claim)>,
@@ -212,13 +212,13 @@ pub(crate) struct Live {
     routes: Vec<ProfileRoute>,
     pub(crate) allowances: Vec<usage::Allowance>,
     pub(crate) signed_in: Vec<bool>,
+    pub(crate) profile_detections: HashMap<String, auth::AuthDetection>,
     pub(crate) bridge: Option<bridge::LoopbackBridge>,
     pub(crate) commander_session_id: Option<String>,
-    pub(crate) commander_provider: Option<auth::Provider>,
+    pub(crate) commander_session_profile: Option<String>,
     pub(crate) soul_store: Option<soul::SoulStore>,
     pub(crate) recent_shell_context: VecDeque<String>,
     pub(crate) handoff_turns: Vec<soul::HandoffTurn>,
-    pub(crate) live_quota: Option<(Option<f32>, Option<f32>)>,
     pub(crate) pending_prod_gates: HashMap<String, String>,
     pub(crate) ask_user: Option<bridge::AskUserBroker>,
 }
@@ -249,6 +249,7 @@ pub(crate) struct Run {
     pub(crate) thinking_started_at: Option<Instant>,
     pub(crate) tool_started_at: HashMap<String, Instant>,
     pub(crate) saw_normalized_text: bool,
+    pub(crate) saw_session_not_found: bool,
 }
 
 impl Run {
@@ -264,6 +265,7 @@ impl Run {
             thinking_started_at: None,
             tool_started_at: HashMap::new(),
             saw_normalized_text: false,
+            saw_session_not_found: false,
         }
     }
 
@@ -314,16 +316,34 @@ impl Live {
             routes: Vec::new(),
             allowances: Vec::new(),
             signed_in: Vec::new(),
+            profile_detections: HashMap::new(),
             bridge: None,
             commander_session_id: None,
-            commander_provider: None,
+            commander_session_profile: None,
             soul_store: soul::SoulStore::from_env(),
             recent_shell_context: VecDeque::new(),
             handoff_turns: Vec::new(),
-            live_quota: None,
             pending_prod_gates: HashMap::new(),
             ask_user: None,
         }
+    }
+
+    pub(crate) fn clear_commander_session(&mut self) {
+        self.commander_session_id = None;
+        self.commander_session_profile = None;
+    }
+
+    pub(crate) fn refresh_profile_detections(&mut self) {
+        self.profile_detections = self
+            .profiles
+            .iter()
+            .map(|profile| (profile.to_string(), profile.detect_passive()))
+            .collect();
+    }
+
+    pub(crate) fn refresh_usage_now(&mut self) {
+        self.usage_checked_at = None;
+        self.refresh_usage();
     }
 
     fn busy(&self) -> bool {
@@ -360,14 +380,18 @@ impl Live {
         self.preferred = None;
         self.last_routed = None;
         self.running_profile = None;
+        self.clear_commander_session();
         self.usage = None;
         self.usage_checked_at = None;
         self.load_override();
         self.pending = checkpoint::Claim::pending(&self.profiles, &self.workspace)
             .ok()
             .flatten();
+        let now = usage::now();
+        usage::Usage::reconcile_peer_accounts(&self.profiles, now);
+        self.refresh_profile_detections();
         self.refresh_routes();
-        self.read_allowances(usage::now());
+        self.read_allowances(now);
     }
 
     fn refresh_routes(&mut self) {
@@ -545,9 +569,13 @@ impl Live {
             .cloned()
             .collect();
         if !due.is_empty() {
+            let all_profiles = self.profiles.clone();
             self.usage_worker = Some(std::thread::spawn(move || {
                 for profile in due {
-                    let _ = usage::refresh_codex(&profile, usage::now());
+                    let tick = usage::now();
+                    if usage::refresh_codex(&profile, tick).is_ok() {
+                        usage::Usage::sync_peer_accounts(&all_profiles, &profile, tick);
+                    }
                 }
             }));
         }
@@ -774,8 +802,10 @@ impl App {
             notice = format!("Cannot read continuation state: {error}");
             None
         });
+        usage::Usage::reconcile_peer_accounts(&profiles, usage::now());
         let mut live = Live::new(workspace, profiles, root.ok());
         live.pending = pending;
+        live.refresh_profile_detections();
         if let Some(message) = live.load_pins() {
             notice = message;
         }
@@ -896,8 +926,7 @@ impl App {
             Some(index) if index + 1 < live.profiles.len() => Some(index + 1),
             Some(_) => None,
         };
-        live.usage_checked_at = None;
-        live.refresh_usage();
+        live.refresh_usage_now();
         live.refresh_routes();
         self.notice = match live.save_override() {
             Ok(()) => match live.preferred {
@@ -916,6 +945,40 @@ impl App {
         self.refresh_usage_and_sync();
         self.poll_side();
 
+        for _ in 0..EVENTS_PER_POLL {
+            let events = self.next_events();
+            if events.is_empty() {
+                break;
+            }
+            for (name, event) in events {
+                if matches!(
+                    event,
+                    mission::Event::Output(_) | mission::Event::Finished(_)
+                ) {
+                    self.drain_run_normalized(&name);
+                }
+                self.handle_event(&name, event);
+            }
+        }
+
+        self.drain_all_normalized();
+    }
+
+    fn drain_run_normalized(&mut self, name: &str) {
+        let batch = self
+            .live
+            .as_ref()
+            .and_then(|live| {
+                let pos = live.run_position(name)?;
+                Some(live.runs[pos].drain_normalized())
+            })
+            .unwrap_or_default();
+        for ev in batch {
+            self.handle_normalized_event(name, ev);
+        }
+    }
+
+    fn drain_all_normalized(&mut self) {
         let normalized_batch: Vec<(String, mission::NormalizedEvent)> = self
             .live
             .as_ref()
@@ -933,16 +996,6 @@ impl App {
             .unwrap_or_default();
         for (name, ev) in normalized_batch {
             self.handle_normalized_event(&name, ev);
-        }
-
-        for _ in 0..EVENTS_PER_POLL {
-            let events = self.next_events();
-            if events.is_empty() {
-                return;
-            }
-            for (name, event) in events {
-                self.handle_event(&name, event);
-            }
         }
     }
 
@@ -980,8 +1033,7 @@ impl App {
                 }
                 live.running_profile = Some(profile);
                 live.last_routed = Some(profile);
-                live.usage_checked_at = None;
-                live.refresh_usage();
+                live.refresh_usage_now();
                 self.touch(index);
                 if let Some(reason) = reason {
                     let concise = tui::app_ops::format_routing_notice(&reason);
@@ -995,6 +1047,9 @@ impl App {
                 if name == COMMANDER {
                     live.pending = None;
                 }
+                live.running_profile = Some(to);
+                live.last_routed = Some(to);
+                live.refresh_usage_now();
                 self.snoozes.retain(|snooze| snooze.thread != name);
                 self.crew[index].status = Status::Running;
                 self.notice = link.clone();
@@ -1049,8 +1104,7 @@ impl App {
         if !live.busy() {
             live.running_profile = None;
         }
-        live.usage_checked_at = None;
-        live.refresh_usage();
+        live.refresh_usage_now();
     }
 
     fn finish_mission(&mut self, index: usize, run: Run, result: io::Result<()>) {
@@ -1079,18 +1133,40 @@ impl App {
         } else {
             Status::Error
         };
+        let fallback_reply = (run.reply.trim().is_empty() && run.saw_normalized_text)
+            .then(|| self.transcript.latest_assistant_text().map(str::to_owned))
+            .flatten();
+        let session_not_found = matches!(
+            &result,
+            Err(error)
+                if run.saw_session_not_found
+                    || tui::app_ops::is_session_not_found_error(&error.to_string())
+        );
         if let Some(live) = &mut self.live {
+            if session_not_found {
+                live.clear_commander_session();
+            }
             let seq = (live.handoff_turns.len() + 1) as u64;
-            if !run.reply.trim().is_empty() {
+            let reply_text = if !run.reply.trim().is_empty() {
+                Some(run.reply.trim().to_owned())
+            } else {
+                fallback_reply
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+            };
+            if let Some(content) = reply_text {
                 live.handoff_turns.push(soul::HandoffTurn {
                     seq,
                     role: soul::TurnRole::Assistant,
-                    content: run.reply.trim().to_owned(),
+                    content,
                     command_outcome: None,
                 });
             }
             live.pending_prod_gates
                 .retain(|_, run_name| run_name != COMMANDER);
+            live.refresh_usage_now();
         }
         self.notice = match &result {
             Ok(()) => run.continuation.map_or_else(
@@ -2025,7 +2101,7 @@ impl App {
             }
         };
         live.refresh_routes();
-        live.usage_checked_at = None;
+        live.refresh_usage_now();
         self.notice = match live.save_override() {
             Ok(()) => format!("Entry model: {}", live.entry_label()),
             Err(error) => format!("Entry override not saved: {error}"),
@@ -2116,26 +2192,27 @@ impl App {
         };
         let request = framed(parsed, |unit| self.build_commander_prompt_text(unit));
         let mcp_config = self.ensure_loopback_bridge();
-        let active_provider = self.live.as_ref().and_then(|live| {
-            live.profiles
-                .get(live.displayed_profile())
-                .map(|p| p.provider)
-        });
-        let resume_session = if let Some(live) = &mut self.live {
-            if live.commander_provider != active_provider {
-                live.commander_session_id = None;
-                live.commander_provider = active_provider;
-            }
-            live.commander_session_id.clone()
-        } else {
-            None
-        };
+        let (resume_session, resume_session_profile, portable_handoff) =
+            if let Some(live) = &self.live {
+                let handoff = (!live.handoff_turns.is_empty()).then(|| {
+                    soul::build_portable_handoff(&live.handoff_turns, soul::DEFAULT_HANDOFF_TOKENS)
+                });
+                (
+                    live.commander_session_id.clone(),
+                    live.commander_session_profile.clone(),
+                    handoff,
+                )
+            } else {
+                (None, None, None)
+            };
         let mut policy = permissions::PermissionPolicy::for_mode(commander_mode);
         if !prod_gate_enabled {
             policy.restrictions.clear();
         }
         let options = mission::LaunchOptions {
             resume_session,
+            resume_session_profile,
+            portable_handoff,
             mcp_config,
             extra_args: Vec::new(),
             policy,
@@ -2526,7 +2603,7 @@ while test ! -f release-mission; do sleep 0.01; done
             assert!(changed.contains("Commander [Claude · aaaa"), "{changed}");
             let allowance = &app.live.as_ref().unwrap().allowances[1];
             assert!(allowance.latched);
-            assert_eq!((allowance.five, allowance.week), (Some(75.0), Some(40.0)));
+            assert_eq!((allowance.five, allowance.week), (Some(0.0), Some(40.0)));
         }
     }
 
@@ -3813,6 +3890,18 @@ esac
         );
         assert_eq!(
             tui::app_ops::format_routing_notice(
+                "Override claude/main skipped: latched · rotated → claude/default provider default · unscored · speed n/a · 23% left"
+            ),
+            "Override claude/main skipped: latched · rotated → claude/default · 23% left"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
+                "Override claude/main skipped: latched · Auto → codex/default provider default · unscored · speed n/a · 50% left"
+            ),
+            "Override claude/main skipped: latched · Auto → codex/default · 50% left"
+        );
+        assert_eq!(
+            tui::app_ops::format_routing_notice(
                 "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · speed n/a · 100% left"
             ),
             "Auto → claude/a claude-opus-5-5 high · AA intelligence index 55.0 · 100% left"
@@ -3823,6 +3912,260 @@ esac
             ),
             "Override → claude/alpha claude-opus-5-5 high · AA intelligence index 63.0 · 52 tok/s"
         );
+    }
+
+    #[test]
+    fn commander_session_profile_tracks_ownership_and_clears_on_failure_reset_and_clear() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-session-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let main = auth::Profile::new(root.clone(), auth::Provider::Claude, "main").unwrap();
+        let backup = auth::Profile::new(root.clone(), auth::Provider::Claude, "backup").unwrap();
+        let mut live = Live::new(workspace, vec![main.clone(), backup.clone()], None);
+        live.running_profile = Some(0);
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::SessionStarted {
+                session_id: "sess-main".into(),
+                model: Some("claude-sonnet".into()),
+                profile: None,
+            },
+        );
+        assert_eq!(
+            app.live.as_ref().unwrap().commander_session_id.as_deref(),
+            Some("sess-main")
+        );
+        assert_eq!(
+            app.live
+                .as_ref()
+                .unwrap()
+                .commander_session_profile
+                .as_deref(),
+            Some("claude/main")
+        );
+
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::SessionStarted {
+                session_id: "sess-backup".into(),
+                model: None,
+                profile: Some("claude/backup".into()),
+            },
+        );
+        assert_eq!(
+            app.live.as_ref().unwrap().commander_session_id.as_deref(),
+            Some("sess-backup")
+        );
+        assert_eq!(
+            app.live
+                .as_ref()
+                .unwrap()
+                .commander_session_profile
+                .as_deref(),
+            Some("claude/backup")
+        );
+
+        let (mission, _tx) = mission::Mission::held();
+        app.finish_commander(
+            Run::new(COMMANDER, mission, false),
+            Err(io::Error::other(
+                "No conversation found with session ID: sess-backup",
+            )),
+        );
+        assert_eq!(app.live.as_ref().unwrap().commander_session_id, None);
+        assert_eq!(app.live.as_ref().unwrap().commander_session_profile, None);
+
+        app.live.as_mut().unwrap().commander_session_id = Some("sess-2".into());
+        app.live.as_mut().unwrap().commander_session_profile = Some("claude/main".into());
+        app.live
+            .as_mut()
+            .unwrap()
+            .reset_profiles(vec![main.clone(), backup]);
+        assert_eq!(app.live.as_ref().unwrap().commander_session_id, None);
+        assert_eq!(app.live.as_ref().unwrap().commander_session_profile, None);
+
+        let live = app.live.as_mut().unwrap();
+        live.commander_session_id = Some("sess-3".into());
+        live.commander_session_profile = Some("claude/main".into());
+        live.handoff_turns.push(soul::HandoffTurn {
+            seq: 1,
+            role: soul::TurnRole::User,
+            content: "Prior question".into(),
+            command_outcome: None,
+        });
+        app.clear_active_transcript();
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(live.commander_session_id, None);
+        assert_eq!(live.commander_session_profile, None);
+        assert!(live.handoff_turns.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn poll_mission_processes_running_event_before_normalized_session_and_text() {
+        let base =
+            std::env::temp_dir().join(format!("agent-command-poll-order-{}", uuid::Uuid::new_v4()));
+        let root = base.join("profiles");
+        let workspace = base.join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let alpha = auth::Profile::new(root.clone(), auth::Provider::Claude, "alpha").unwrap();
+        let beta = auth::Profile::new(root, auth::Provider::Claude, "beta").unwrap();
+        let (mut mission, event_tx) = mission::Mission::held();
+        let (norm_tx, norm_rx) = std::sync::mpsc::channel();
+        mission.normalized = norm_rx;
+
+        let mut live = Live::new(workspace, vec![alpha, beta], None);
+        live.preferred = Some(0);
+        live.runs.push(Run::new(COMMANDER, mission, false));
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+
+        event_tx
+            .send(mission::Event::Running {
+                profile: 1,
+                reason: Some(
+                    "Override claude/alpha skipped: latched · rotated → claude/beta provider default · unscored · speed n/a · 23% left"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        norm_tx
+            .send(mission::NormalizedEvent::SessionStarted {
+                session_id: "sess-beta".into(),
+                model: None,
+                profile: None,
+            })
+            .unwrap();
+        norm_tx
+            .send(mission::NormalizedEvent::TextDelta(
+                "Hello from beta".into(),
+            ))
+            .unwrap();
+        event_tx
+            .send(mission::Event::Output("Hello from beta".into()))
+            .unwrap();
+        norm_tx
+            .send(mission::NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: false,
+                error_code: None,
+                final_text: "Hello from beta".into(),
+            })
+            .unwrap();
+        event_tx.send(mission::Event::Finished(Ok(()))).unwrap();
+
+        app.poll_mission();
+
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(live.commander_session_id.as_deref(), Some("sess-beta"));
+        assert_eq!(
+            live.commander_session_profile.as_deref(),
+            Some("claude/beta")
+        );
+        assert_eq!(live.last_routed, Some(1));
+        assert_eq!(app.crew[0].status, Status::Done);
+        let assistant_entries: Vec<(&str, &str)> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                markdown::TranscriptEntry::AssistantMarkdown {
+                    speaker, markdown, ..
+                } => Some((speaker.as_str(), markdown.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_entries,
+            vec![("Commander · Claude (beta)", "Hello from beta")]
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn top_bar_quota_badge_floors_percentages_respects_stale_and_refreshes_per_profile_state() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-quota-badge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let main = auth::Profile::new(root.clone(), auth::Provider::Claude, "main").unwrap();
+        let backup = auth::Profile::new(root, auth::Provider::Claude, "backup").unwrap();
+        main.prepare().unwrap();
+        backup.prepare().unwrap();
+
+        let mut live = Live::new(workspace, vec![main.clone(), backup], None);
+        live.allowances = vec![
+            usage::Allowance {
+                five: Some(0.9),
+                week: Some(23.8),
+                reset_in: Some(3600),
+                latched: false,
+                stale: true,
+            },
+            usage::Allowance {
+                five: Some(64.9),
+                week: Some(88.7),
+                reset_in: Some(7200),
+                latched: false,
+                stale: false,
+            },
+        ];
+        live.preferred = Some(0);
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        assert_eq!(
+            app.top_bar_quota_badge().as_deref(),
+            Some("5h 0% 7d 23% stale")
+        );
+
+        app.live.as_mut().unwrap().preferred = Some(1);
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("5h 64% 7d 88%"));
+
+        let now = usage::now();
+        usage::Usage::observe_claude(
+            &main,
+            &serde_json::json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "seven_day",
+                    "resetsAt": now.wall + 3600
+                }
+            }),
+            now,
+        )
+        .unwrap();
+        app.live.as_mut().unwrap().preferred = Some(0);
+        app.handle_normalized_event(
+            COMMANDER,
+            mission::NormalizedEvent::RateLimit {
+                five_hour_pct: None,
+                seven_day_pct: Some(100.0),
+                resets_at: None,
+            },
+        );
+        assert_eq!(app.top_bar_quota_badge().as_deref(), Some("7d 0%"));
+        assert!(app.live.as_ref().unwrap().allowances[0].latched);
+        assert!(!app.live.as_ref().unwrap().allowances[1].latched);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -3982,7 +4325,10 @@ esac
             known_row.contains("64%") && known_row.contains("12%"),
             "{known_row}"
         );
-        assert!(known_row.contains("↻ 2h") || known_row.contains("↻ 1h 59m"));
+        assert!(
+            known_row.contains("↻ 1d 0h") || known_row.contains("↻ 23h 59m"),
+            "{known_row}"
+        );
         assert!(fresh_row.contains("claude · fresh") && fresh_row.contains("--"));
         assert!(fresh_row.contains("↻ -"), "{fresh_row}");
         assert!(held_row.contains("claude · held") && held_row.contains("0%"));
@@ -4029,7 +4375,7 @@ esac
 
         let top = row(&screen(&mut app, 120, 40), 0);
         assert!(
-            top.contains("Commander [Claude · known] · ◕ 5h 64% 7d 12%"),
+            top.contains("Commander [Claude · known] · ○ 5h 64% 7d 12%"),
             "{top}"
         );
     }

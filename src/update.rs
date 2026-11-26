@@ -1,14 +1,20 @@
 use sha2::{Digest, Sha256};
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const LATEST: &str = "https://github.com/Agent-Commander/Agent-Command/releases/latest";
@@ -146,6 +152,38 @@ pub fn old_binary_path(executable: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+fn unique_old_binary_path(executable: &Path) -> PathBuf {
+    let epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let pid = std::process::id();
+    let seq = BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = OsString::from(executable.as_os_str());
+    name.push(format!(".{pid}-{epoch_ms}-{seq}.old"));
+    PathBuf::from(name)
+}
+
+fn is_stale_backup_name(base_name: &OsStr, candidate: &OsStr) -> bool {
+    let base = base_name.as_encoded_bytes();
+    let cand = candidate.as_encoded_bytes();
+    let suffix = b".old";
+    if cand.len() < base.len() + suffix.len() {
+        return false;
+    }
+    let (head, rest) = cand.split_at(base.len());
+    let tail = &rest[rest.len() - suffix.len()..];
+    let matches = |left: &[u8], right: &[u8]| {
+        if cfg!(any(windows, target_os = "macos")) {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
+        }
+    };
+    matches(head, base)
+        && matches(tail, suffix)
+        && (rest.len() == suffix.len() || rest.starts_with(b"."))
+}
+
 pub fn cleanup_stale_old_binary() {
     if let Ok(current) = env::current_exe() {
         let _ = cleanup_old_at(&current);
@@ -153,12 +191,32 @@ pub fn cleanup_stale_old_binary() {
 }
 
 pub fn cleanup_old_at(executable: &Path) -> io::Result<bool> {
-    let stale = old_binary_path(executable);
-    match fs::remove_file(&stale) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+    let (Some(parent), Some(base_name)) = (executable.parent(), executable.file_name()) else {
+        return Ok(false);
+    };
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        if !is_stale_backup_name(base_name, &entry.file_name()) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if fs::remove_file(entry.path()).is_ok() {
+            removed_any = true;
+        }
     }
+    Ok(removed_any)
 }
 
 pub fn parse_sha256_manifest(manifest: &str) -> Option<String> {
@@ -184,9 +242,22 @@ pub fn verify_sha256_bytes(bytes: &[u8], expected_hex: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn move_to_backup(current_exe: &Path) -> io::Result<PathBuf> {
+    let primary = old_binary_path(current_exe);
+    let primary_ready = match fs::remove_file(&primary) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
+    if primary_ready && fs::rename(current_exe, &primary).is_ok() {
+        return Ok(primary);
+    }
+    let fallback = unique_old_binary_path(current_exe);
+    fs::rename(current_exe, &fallback)?;
+    Ok(fallback)
+}
+
 pub fn swap_executable_in_place(current_exe: &Path, staged_exe: &Path) -> io::Result<PathBuf> {
-    let backup = old_binary_path(current_exe);
-    let _ = fs::remove_file(&backup);
     let parent = current_exe.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -201,10 +272,13 @@ pub fn swap_executable_in_place(current_exe: &Path, staged_exe: &Path) -> io::Re
     file.sync_all()?;
     drop(file);
 
-    if let Err(error) = fs::rename(current_exe, &backup) {
-        let _ = fs::remove_file(&temp_target);
-        return Err(error);
-    }
+    let backup = match move_to_backup(current_exe) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_target);
+            return Err(error);
+        }
+    };
     if let Err(error) = fs::rename(&temp_target, current_exe) {
         let _ = fs::rename(&backup, current_exe);
         let _ = fs::remove_file(&temp_target);
@@ -590,6 +664,100 @@ mod tests {
         assert!(cleanup_old_at(&current).unwrap());
         assert!(!backup.exists());
         assert!(!cleanup_old_at(&current).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_falls_back_to_unique_backup_when_primary_old_is_blocked_and_cleanup_sweeps_all() {
+        let dir = env::temp_dir().join(format!("ac-swap-fallback-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("agent-command.exe");
+        let staged_v2 = dir.join("staged-v2.exe");
+        let staged_v3 = dir.join("staged-v3.exe");
+        let primary_old = old_binary_path(&current);
+        let unrelated_old = dir.join("agent-command-helper.exe.old");
+        let unrelated_file = dir.join("other.old");
+
+        fs::create_dir_all(primary_old.join("blocker")).unwrap();
+        fs::write(&current, b"MZ_v1").unwrap();
+        fs::write(&staged_v2, b"MZ_v2").unwrap();
+        fs::write(&staged_v3, b"MZ_v3").unwrap();
+        fs::write(&unrelated_old, b"keep-helper").unwrap();
+        fs::write(&unrelated_file, b"keep-other").unwrap();
+
+        let backup1 = swap_executable_in_place(&current, &staged_v2).unwrap();
+        assert_ne!(backup1, primary_old);
+        assert_eq!(backup1.parent(), Some(dir.as_path()));
+        let backup1_name = backup1.file_name().unwrap().to_string_lossy();
+        assert!(backup1_name.starts_with("agent-command.exe."));
+        assert!(backup1_name.ends_with(".old"));
+        assert_eq!(fs::read(&current).unwrap(), b"MZ_v2");
+        assert_eq!(fs::read(&backup1).unwrap(), b"MZ_v1");
+
+        let backup2 = swap_executable_in_place(&current, &staged_v3).unwrap();
+        assert_ne!(backup2, primary_old);
+        assert_ne!(backup2, backup1);
+        assert_eq!(fs::read(&current).unwrap(), b"MZ_v3");
+        assert_eq!(fs::read(&backup2).unwrap(), b"MZ_v2");
+
+        assert!(cleanup_old_at(&current).unwrap());
+        assert!(!backup1.exists());
+        assert!(!backup2.exists());
+        assert!(primary_old.is_dir());
+        assert!(unrelated_old.exists());
+        assert!(unrelated_file.exists());
+        assert_eq!(fs::read(&current).unwrap(), b"MZ_v3");
+        assert!(!cleanup_old_at(&current).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn swap_succeeds_and_cleanup_is_best_effort_while_primary_old_is_locked_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = env::temp_dir().join(format!("ac-swap-winlock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("agent-command.exe");
+        let staged_v2 = dir.join("staged-v2.exe");
+        let staged_v3 = dir.join("staged-v3.exe");
+        let primary_old = old_binary_path(&current);
+
+        fs::write(&primary_old, b"MZ_v0_locked").unwrap();
+        fs::write(&current, b"MZ_v1").unwrap();
+        fs::write(&staged_v2, b"MZ_v2").unwrap();
+        fs::write(&staged_v3, b"MZ_v3").unwrap();
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&primary_old)
+            .unwrap();
+
+        let backup1 = swap_executable_in_place(&current, &staged_v2).unwrap();
+        assert_ne!(backup1, primary_old);
+        assert_eq!(fs::read(&current).unwrap(), b"MZ_v2");
+        assert_eq!(fs::read(&backup1).unwrap(), b"MZ_v1");
+
+        let backup2 = swap_executable_in_place(&current, &staged_v3).unwrap();
+        assert_ne!(backup2, primary_old);
+        assert_ne!(backup2, backup1);
+        assert_eq!(fs::read(&current).unwrap(), b"MZ_v3");
+        assert_eq!(fs::read(&backup2).unwrap(), b"MZ_v2");
+
+        assert!(cleanup_old_at(&current).unwrap());
+        assert!(!backup1.exists());
+        assert!(!backup2.exists());
+        assert!(primary_old.exists());
+        assert!(!cleanup_old_at(&current).unwrap());
+
+        drop(lock);
+        assert!(cleanup_old_at(&current).unwrap());
+        assert!(!primary_old.exists());
+        assert!(!cleanup_old_at(&current).unwrap());
+
         let _ = fs::remove_dir_all(&dir);
     }
 

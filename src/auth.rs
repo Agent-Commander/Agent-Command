@@ -447,6 +447,20 @@ impl Profile {
         }
     }
 
+    pub fn account_identity(&self) -> Option<String> {
+        let env_map = current_env_map(self.env_overrides());
+        match &self.source {
+            ProfileSource::SystemDefault => {
+                let home_dir = self.effective_home();
+                account_identity_passive(self.provider, home_dir.as_deref(), None, &env_map)
+            }
+            ProfileSource::Isolated { .. } => {
+                let dir = self.root.join(self.provider.binary()).join(&self.name);
+                account_identity_passive(self.provider, Some(&dir), Some(&dir), &env_map)
+            }
+        }
+    }
+
     pub fn signed_in(&self) -> bool {
         self.authenticated_command().is_ok()
     }
@@ -943,13 +957,16 @@ fn extract_claude_tier(value: &Value) -> Option<String> {
         &[
             "subscriptionType",
             "rateLimitTier",
-            "billingType",
-            "organizationRole",
+            "organizationRateLimitTier",
+            "organizationType",
+            "planDisplayName",
         ],
     )?;
     let lower = raw.to_ascii_lowercase();
     if lower.contains("max") {
         Some("max".into())
+    } else if lower.contains("ultra") {
+        Some("ultra".into())
     } else if lower.contains("enterprise") {
         Some("enterprise".into())
     } else if lower.contains("team") {
@@ -959,6 +976,142 @@ fn extract_claude_tier(value: &Value) -> Option<String> {
     } else {
         Some(raw)
     }
+}
+
+fn account_identity_passive(
+    provider: Provider,
+    home_dir: Option<&Path>,
+    isolated_dir: Option<&Path>,
+    env_map: &BTreeMap<String, String>,
+) -> Option<String> {
+    match provider {
+        Provider::Claude => claude_account_identity(home_dir, isolated_dir, env_map),
+        Provider::Codex => codex_account_identity(home_dir, isolated_dir, env_map),
+        Provider::Gemini => gemini_account_identity(home_dir, isolated_dir, env_map),
+    }
+}
+
+fn claude_account_identity(
+    home_dir: Option<&Path>,
+    isolated_dir: Option<&Path>,
+    env_map: &BTreeMap<String, String>,
+) -> Option<String> {
+    if env_is_truthy(env_map, "CLAUDE_CODE_USE_BEDROCK")
+        || env_is_truthy(env_map, "CLAUDE_CODE_USE_VERTEX")
+        || env_is_truthy(env_map, "CLAUDE_CODE_USE_FOUNDRY")
+        || env_non_empty(env_map, "ANTHROPIC_API_KEY").is_some()
+        || env_non_empty(env_map, "ANTHROPIC_AUTH_TOKEN").is_some()
+    {
+        return None;
+    }
+    let config_dir = isolated_dir
+        .map(Path::to_path_buf)
+        .or_else(|| env_non_empty(env_map, "CLAUDE_CONFIG_DIR").map(PathBuf::from))
+        .or_else(|| home_dir.map(|h| h.join(".claude")));
+
+    let mut account_uuid: Option<String> = None;
+    let mut org_uuid: Option<String> = None;
+
+    if let Some(dir) = &config_dir {
+        if let Some(creds) = read_json(&dir.join(".credentials.json")) {
+            let oauth = &creds["claudeAiOauth"];
+            account_uuid = account_uuid.or_else(|| first_text(oauth, &["accountUuid"]));
+            org_uuid = org_uuid.or_else(|| first_text(oauth, &["organizationUuid"]));
+        }
+    }
+
+    let mut state_candidates = Vec::new();
+    if let Some(dir) = &config_dir {
+        state_candidates.push(dir.join(".claude.json"));
+    }
+    if isolated_dir.is_none() {
+        if let Some(home) = home_dir {
+            state_candidates.push(home.join(".claude.json"));
+        }
+    }
+    for path in state_candidates {
+        let Some(state) = read_json(&path) else {
+            continue;
+        };
+        let oauth_account = &state["oauthAccount"];
+        if oauth_account.is_object() {
+            account_uuid = account_uuid.or_else(|| first_text(oauth_account, &["accountUuid"]));
+            org_uuid = org_uuid.or_else(|| first_text(oauth_account, &["organizationUuid"]));
+        }
+        if account_uuid.is_some() && org_uuid.is_some() {
+            break;
+        }
+    }
+
+    match (account_uuid, org_uuid) {
+        (Some(account), Some(org)) => Some(format!("claude:{account}:{org}")),
+        (Some(account), None) => Some(format!("claude:{account}")),
+        (None, Some(org)) => Some(format!("claude:org:{org}")),
+        (None, None) => None,
+    }
+}
+
+fn codex_account_identity(
+    home_dir: Option<&Path>,
+    isolated_dir: Option<&Path>,
+    env_map: &BTreeMap<String, String>,
+) -> Option<String> {
+    let codex_home = isolated_dir
+        .map(Path::to_path_buf)
+        .or_else(|| env_non_empty(env_map, "CODEX_HOME").map(PathBuf::from))
+        .or_else(|| home_dir.map(|h| h.join(".codex")))?;
+    let bytes = fs::read(codex_home.join(CODEX_AUTH_FILE)).ok()?;
+    let auth: Value = serde_json::from_slice(&bytes).ok()?;
+    let has_oauth = auth["tokens"]["access_token"]
+        .as_str()
+        .is_some_and(|v| !v.trim().is_empty())
+        || auth["tokens"]["refresh_token"]
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty())
+        || auth["tokens"]["id_token"]
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty());
+    if !has_oauth {
+        return None;
+    }
+    let account_id = first_text(&auth["tokens"], &["account_id"]).or_else(|| {
+        let claims = codex_id_claims(&bytes)?;
+        first_text(
+            &claims["https://api.openai.com/auth"],
+            &["chatgpt_account_id"],
+        )
+    })?;
+    Some(format!("codex:{account_id}"))
+}
+
+fn gemini_account_identity(
+    home_dir: Option<&Path>,
+    isolated_dir: Option<&Path>,
+    env_map: &BTreeMap<String, String>,
+) -> Option<String> {
+    let base_home = isolated_dir
+        .map(Path::to_path_buf)
+        .or_else(|| env_non_empty(env_map, "GEMINI_CLI_HOME").map(PathBuf::from))
+        .or_else(|| home_dir.map(Path::to_path_buf))?;
+    let config_dir = base_home.join(".gemini");
+    let settings = read_json(&config_dir.join("settings.json"));
+    let selected_type = settings
+        .as_ref()
+        .and_then(|s| s["security"]["auth"]["selectedType"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(selected) = selected_type {
+        if !matches!(selected, "oauth-personal" | "login-with-google") {
+            return None;
+        }
+    } else if let Some(env_type) = gemini_auth_type_from_env(env_map) {
+        if env_type != "oauth-personal" {
+            return None;
+        }
+    }
+    let accounts = read_json(&config_dir.join("google_accounts.json"))?;
+    let active = first_text(&accounts, &["active"])?;
+    Some(format!("gemini:{}", active.to_ascii_lowercase()))
 }
 
 pub fn detect_codex_passive(
@@ -1882,6 +2035,150 @@ mod tests {
             "loggedIn": false,
             "authMethod": "oauth_token"
         })));
+    }
+
+    #[test]
+    fn claude_tier_reads_org_fields_and_ignores_billing_or_role() {
+        let org_tier = serde_json::json!({
+            "organizationRateLimitTier": "default_claude_max_20x",
+            "organizationType": "claude_max",
+            "planDisplayName": "Ultra",
+            "billingType": "stripe_subscription",
+            "organizationRole": "admin"
+        });
+        assert_eq!(extract_claude_tier(&org_tier).as_deref(), Some("max"));
+
+        let ultra_only = serde_json::json!({
+            "planDisplayName": "Ultra",
+            "billingType": "stripe_subscription",
+            "organizationRole": "admin"
+        });
+        assert_eq!(extract_claude_tier(&ultra_only).as_deref(), Some("ultra"));
+
+        let billing_only = serde_json::json!({
+            "billingType": "stripe_subscription",
+            "organizationRole": "admin"
+        });
+        assert_eq!(extract_claude_tier(&billing_only), None);
+
+        let scratch = Scratch::new("claude-org-tier");
+        let isolated = scratch.directory("isolated");
+        fs::write(
+            isolated.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"dev@acme.test","accountUuid":"acct-1","organizationUuid":"org-1","organizationType":"claude_max","billingType":"stripe_subscription","organizationRole":"admin"}}"#,
+        )
+        .unwrap();
+        let detected = detect_claude_passive(Some(&isolated), Some(&isolated), &BTreeMap::new());
+        assert!(detected.logged_in);
+        assert_eq!(detected.tier.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn profile_account_identity_matches_shared_claude_codex_and_gemini_accounts_without_secrets() {
+        let scratch = Scratch::new("account-identity");
+        let root = scratch.directory("profiles");
+        let home = scratch.directory("home");
+
+        let claude_home = home.join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"acct-111","organizationUuid":"org-222"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            claude_home.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"secret-claude-token"}}"#,
+        )
+        .unwrap();
+
+        let claude_main_dir = root.join("claude").join("main");
+        fs::create_dir_all(&claude_main_dir).unwrap();
+        fs::write(
+            claude_main_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"secret-claude-token-2","accountUuid":"acct-111","organizationUuid":"org-222"}}"#,
+        )
+        .unwrap();
+        let claude_other_dir = root.join("claude").join("other");
+        fs::create_dir_all(&claude_other_dir).unwrap();
+        fs::write(
+            claude_other_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"acct-999","organizationUuid":"org-222"}}"#,
+        )
+        .unwrap();
+
+        let claude_default = Profile {
+            system_home: Some(home.clone()),
+            ..Profile::system_default(root.clone(), Provider::Claude)
+        };
+        let claude_main = Profile::new(root.clone(), Provider::Claude, "main").unwrap();
+        let claude_other = Profile::new(root.clone(), Provider::Claude, "other").unwrap();
+        let id_default = claude_default.account_identity().unwrap();
+        assert_eq!(id_default, "claude:acct-111:org-222");
+        assert_eq!(
+            claude_main.account_identity().as_deref(),
+            Some(id_default.as_str())
+        );
+        assert_ne!(
+            claude_other.account_identity().as_deref(),
+            Some(id_default.as_str())
+        );
+        assert!(!id_default.contains("secret"));
+
+        let codex_home = home.join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let claims = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1jb2RleC0xIn19";
+        fs::write(
+            codex_home.join("auth.json"),
+            format!(r#"{{"tokens":{{"access_token":"secret-codex","id_token":"h.{claims}.s"}}}}"#),
+        )
+        .unwrap();
+        let codex_main_dir = root.join("codex").join("main");
+        fs::create_dir_all(&codex_main_dir).unwrap();
+        fs::write(
+            codex_main_dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"secret-codex-2","account_id":"acct-codex-1"}}"#,
+        )
+        .unwrap();
+        let codex_api_dir = root.join("codex").join("apikey");
+        fs::create_dir_all(&codex_api_dir).unwrap();
+        fs::write(
+            codex_api_dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-secret"}"#,
+        )
+        .unwrap();
+
+        let codex_default = Profile {
+            system_home: Some(home.clone()),
+            ..Profile::system_default(root.clone(), Provider::Codex)
+        };
+        let codex_main = Profile::new(root.clone(), Provider::Codex, "main").unwrap();
+        let codex_api = Profile::new(root.clone(), Provider::Codex, "apikey").unwrap();
+        assert_eq!(
+            codex_default.account_identity().as_deref(),
+            Some("codex:acct-codex-1")
+        );
+        assert_eq!(
+            codex_main.account_identity().as_deref(),
+            Some("codex:acct-codex-1")
+        );
+        assert_eq!(codex_api.account_identity(), None);
+
+        let gemini_dir = home.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+        fs::write(
+            gemini_dir.join("google_accounts.json"),
+            r#"{"active":"Pilot@Example.Test"}"#,
+        )
+        .unwrap();
+        let gemini_default = Profile {
+            system_home: Some(home),
+            ..Profile::system_default(root, Provider::Gemini)
+        };
+        assert_eq!(
+            gemini_default.account_identity().as_deref(),
+            Some("gemini:pilot@example.test")
+        );
     }
 
     #[test]

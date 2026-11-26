@@ -283,6 +283,7 @@ pub(crate) fn save_override(state: &Path, profile: Option<&str>) -> io::Result<(
 pub(crate) struct Headroom {
     pub(crate) rate: Option<f64>,
     pub(crate) remaining: Option<f64>,
+    pub(crate) low_buffer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +343,7 @@ pub(crate) fn candidates(
         let headroom = Headroom {
             rate: usage.headroom_rate(now),
             remaining: usage.remaining(now),
+            low_buffer: !usage.within_safety_buffer(now),
         };
         for configuration in configurations(profile.provider, pins.get(&label)) {
             candidates.push(Candidate {
@@ -389,13 +391,27 @@ fn compare_speed(left: &Candidate, right: &Candidate) -> Ordering {
     }
 }
 
-fn compare_headroom(left: &Candidate, right: &Candidate) -> Ordering {
-    match (left.headroom.rate, right.headroom.rate) {
-        (Some(left), Some(right)) => right.total_cmp(&left),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
+fn headroom_tier(headroom: Headroom) -> u8 {
+    match headroom.rate {
+        Some(_) if !headroom.low_buffer => 0,
+        None => 1,
+        Some(_) => 2,
     }
+}
+
+fn compare_headroom(left: &Candidate, right: &Candidate) -> Ordering {
+    headroom_tier(left.headroom)
+        .cmp(&headroom_tier(right.headroom))
+        .then_with(|| match (left.headroom.rate, right.headroom.rate) {
+            (Some(left_rate), Some(right_rate)) if left.headroom.low_buffer => right
+                .headroom
+                .remaining
+                .unwrap_or(0.0)
+                .total_cmp(&left.headroom.remaining.unwrap_or(0.0))
+                .then_with(|| right_rate.total_cmp(&left_rate)),
+            (Some(left_rate), Some(right_rate)) => right_rate.total_cmp(&left_rate),
+            _ => Ordering::Equal,
+        })
 }
 
 fn compare_identity(left: &Candidate, right: &Candidate) -> Ordering {
@@ -479,7 +495,7 @@ pub(crate) fn describe(candidate: &Candidate) -> String {
     );
     let headroom = candidate.headroom.remaining.map_or_else(
         || "headroom unknown".to_owned(),
-        |remaining| format!("{remaining:.0}% left"),
+        |remaining| format!("{:.0}% left", remaining.max(0.0).floor()),
     );
     format!(
         "{} {} · {} · {speed} · {headroom}",
@@ -680,6 +696,7 @@ exit 3
             headroom: Headroom {
                 rate,
                 remaining: rate.map(|rate| rate * 100.0),
+                low_buffer: false,
             },
         }
     }
@@ -1296,5 +1313,92 @@ exit 3
             1
         );
         assert_eq!(configurations(Provider::Claude, None).len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod cross_platform_tests {
+    use super::*;
+
+    fn test_candidate(
+        profile: usize,
+        label: &str,
+        remaining: Option<f64>,
+        rate: Option<f64>,
+        low_buffer: bool,
+    ) -> Candidate {
+        Candidate {
+            profile,
+            label: label.into(),
+            configuration: Configuration::provider_default(Provider::Claude),
+            metrics: Metrics::default(),
+            metric: None,
+            headroom: Headroom {
+                rate,
+                remaining,
+                low_buffer,
+            },
+        }
+    }
+
+    #[test]
+    fn describe_floors_remaining_headroom_percentage() {
+        let cases = [
+            (Some(0.9), "0% left"),
+            (Some(1.4), "1% left"),
+            (Some(23.9), "23% left"),
+            (Some(100.0), "100% left"),
+            (None, "headroom unknown"),
+        ];
+        for (remaining, expected) in cases {
+            let candidate = test_candidate(0, "claude/main", remaining, remaining, false);
+            assert!(
+                describe(&candidate).ends_with(expected),
+                "remaining={remaining:?} described as {}",
+                describe(&candidate)
+            );
+        }
+    }
+
+    #[test]
+    fn rank_deprioritizes_low_buffer_profiles_below_healthy_and_unknown_but_keeps_last_resort() {
+        let candidates = vec![
+            test_candidate(0, "claude/main-1pct", Some(1.0), Some(0.05), true),
+            test_candidate(1, "claude/low-4pct", Some(4.0), Some(0.01), true),
+            test_candidate(2, "claude/unknown", None, None, false),
+            test_candidate(3, "claude/default-23pct", Some(23.0), Some(0.001), false),
+        ];
+        let expected = [
+            "claude/default-23pct",
+            "claude/unknown",
+            "claude/low-4pct",
+            "claude/main-1pct",
+        ];
+        for policy in [Policy::Default, Policy::Ordinary] {
+            let ranked = rank(candidates.clone(), policy, Difficulty::Any).unwrap();
+            let labels: Vec<&str> = ranked.iter().map(|c| c.label.as_str()).collect();
+            assert_eq!(labels, expected, "policy={policy:?}");
+
+            let reversed: Vec<Candidate> = candidates.iter().cloned().rev().collect();
+            let ranked_rev = rank(reversed, policy, Difficulty::Any).unwrap();
+            let labels_rev: Vec<&str> = ranked_rev.iter().map(|c| c.label.as_str()).collect();
+            assert_eq!(labels_rev, expected, "reversed policy={policy:?}");
+        }
+
+        let only_low = vec![test_candidate(
+            0,
+            "claude/standby",
+            Some(3.0),
+            Some(0.001),
+            true,
+        )];
+        let choice = choose(
+            rank(only_low, Policy::Default, Difficulty::Any),
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(choice.candidate.label, "claude/standby");
     }
 }
