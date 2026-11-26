@@ -258,7 +258,8 @@ fn draw_usage_deck(
             inner.width.saturating_sub(1),
             RING_TILE_HEIGHT,
         );
-        let lines = card.ring_tile_lines(tile.width, &deck_palette);
+        let mut lines = card.ring_tile_lines(tile.width, &deck_palette);
+        annotate_usage_tile(app, index, &card, &mut lines, tile.width, palette);
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(palette.surface)),
             tile,
@@ -267,6 +268,91 @@ fn draw_usage_deck(
         y += RING_TILE_HEIGHT;
     }
     y
+}
+
+fn annotate_usage_tile(
+    app: &App,
+    index: usize,
+    card: &token_burn::AccountCard,
+    lines: &mut [Line<'static>],
+    tile_width: u16,
+    palette: &UiPalette,
+) {
+    let Some(live) = &app.live else {
+        return;
+    };
+    let Some(profile) = live.profiles.get(index) else {
+        return;
+    };
+    let allowance = live.allowances.get(index).copied().unwrap_or_default();
+    let dual = card.ring_windows().len() > 1;
+    let max_width = usize::from(tile_width);
+    let bg = palette.surface;
+    let Some(last) = lines.get_mut(3) else {
+        return;
+    };
+
+    if profile.provider == crate::auth::Provider::Gemini {
+        if allowance.latched {
+            let label = match (dual, allowance.reset_in.is_none()) {
+                (true, true) => " · reset unknown",
+                (true, false) => " · latched",
+                (false, true) => "reset unknown",
+                (false, false) => "latched",
+            };
+            let mut spans = std::mem::take(&mut last.spans);
+            spans.push(styled(label, palette.warning, bg));
+            *last = token_burn::fit_line(spans, max_width);
+            return;
+        }
+        if allowance.five.is_none() && allowance.week.is_none() {
+            let mut spans = std::mem::take(&mut last.spans);
+            spans.push(styled("no CLI quota", palette.subtle, bg));
+            *last = token_burn::fit_line(spans, max_width);
+            return;
+        }
+    }
+
+    if allowance.latched && allowance.reset_in.is_none() {
+        let mut spans = std::mem::take(&mut last.spans);
+        let label = if dual {
+            " · reset unknown"
+        } else {
+            "reset unknown"
+        };
+        spans.push(styled(label, palette.warning, bg));
+        *last = token_burn::fit_line(spans, max_width);
+        return;
+    }
+
+    if allowance.stale && (allowance.five.is_some() || allowance.week.is_some()) {
+        let mut spans = std::mem::take(&mut last.spans);
+        if dual {
+            spans.push(styled(" · stale", palette.subtle, bg));
+        } else {
+            let label = match (allowance.five.is_some(), allowance.week.is_some()) {
+                (false, true) => "7d · stale",
+                (true, false) => "5h · stale",
+                _ => "stale",
+            };
+            spans.push(styled(label, palette.subtle, bg));
+        }
+        *last = token_burn::fit_line(spans, max_width);
+        return;
+    }
+
+    if !dual {
+        let window_label = match (allowance.five.is_some(), allowance.week.is_some()) {
+            (false, true) => Some("7d window"),
+            (true, false) => Some("5h window"),
+            _ => None,
+        };
+        if let Some(window_label) = window_label {
+            let mut spans = std::mem::take(&mut last.spans);
+            spans.push(styled(window_label, palette.subtle, bg));
+            *last = token_burn::fit_line(spans, max_width);
+        }
+    }
 }
 
 fn draw_workspace_info(

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -7,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{auth, branches, bridge, github, update};
+use crate::{auth, branches, bridge, github, update, usage};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChangedFile {
@@ -29,6 +30,7 @@ pub enum AppEvent {
     AuthDetected {
         detections: Vec<auth::AuthDetection>,
         profiles: Vec<auth::Profile>,
+        profile_detections: HashMap<String, auth::AuthDetection>,
     },
     GitHubDetected(github::GitHubAuthStatus),
     UpdateChecked(update::UpdateState),
@@ -107,9 +109,15 @@ pub fn spawn_startup_probes(
             .as_deref()
             .and_then(|root| auth::all_profiles(root).ok())
             .unwrap_or_default();
+        usage::Usage::reconcile_peer_accounts(&profiles, usage::now());
+        let profile_detections = profiles
+            .iter()
+            .map(|profile| (profile.to_string(), profile.detect_passive()))
+            .collect();
         let _ = auth_tx.send(AppEvent::AuthDetected {
             detections,
             profiles,
+            profile_detections,
         });
     });
 

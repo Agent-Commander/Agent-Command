@@ -684,7 +684,14 @@ impl AccountCard {
     }
 
     pub fn headline_remaining(&self) -> Option<f64> {
-        clamp_percent(self.primary_remaining).or(clamp_percent(self.secondary_remaining))
+        match (
+            clamp_percent(self.primary_remaining),
+            clamp_percent(self.secondary_remaining),
+        ) {
+            (Some(primary), Some(secondary)) => Some(primary.min(secondary)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
     }
 
     pub fn ring_tile_lines(&self, width: u16, palette: &TokenBurnPalette) -> Vec<Line<'static>> {
@@ -1136,7 +1143,7 @@ mod tests {
         let text = ring_text(&cards()[0].ring_tile_lines(29, &p)).join("\n");
         assert!(text.contains("claude · work"), "{text}");
         assert!(
-            text.contains("64% left") && text.contains(" MAX "),
+            text.contains("12% left") && text.contains(" MAX "),
             "{text}"
         );
         assert!(
@@ -1155,6 +1162,36 @@ mod tests {
         };
         let none = ring_text(&missing.ring_tile_lines(29, &p)).join("\n");
         assert!(none.contains("-- left") && !none.contains("0%"), "{none}");
+    }
+
+    #[test]
+    fn headline_remaining_uses_tightest_window_when_both_exist() {
+        let card = |primary, secondary| AccountCard {
+            primary_remaining: primary,
+            secondary_remaining: secondary,
+            ..AccountCard::default()
+        };
+        assert_eq!(card(Some(80.0), Some(0.0)).headline_remaining(), Some(0.0));
+        assert_eq!(
+            card(Some(64.0), Some(12.0)).headline_remaining(),
+            Some(12.0)
+        );
+        assert_eq!(
+            card(Some(15.0), Some(90.0)).headline_remaining(),
+            Some(15.0)
+        );
+        assert_eq!(card(Some(50.0), None).headline_remaining(), Some(50.0));
+        assert_eq!(card(None, Some(30.0)).headline_remaining(), Some(30.0));
+        assert_eq!(
+            card(Some(f64::NAN), Some(30.0)).headline_remaining(),
+            Some(30.0)
+        );
+        assert_eq!(card(None, None).headline_remaining(), None);
+
+        let p = TokenBurnPalette::default();
+        let glyph = compact_ring(card(Some(80.0), Some(0.0)).headline_remaining(), &p);
+        assert_eq!(glyph.content, "○");
+        assert_eq!(glyph.style.fg, Some(p.depleted));
     }
 
     #[test]
