@@ -1,10 +1,32 @@
+use std::{env, fs, path::PathBuf};
+
 use agent_command::{
+    auth::{Profile, Provider},
     markdown::{ToolKind, TranscriptEntry},
+    tui::{
+        graphics::GraphicsMode,
+        tabs::{VaultModalMode, VaultModalState},
+    },
     update::{self, UpdateState},
+    vault::VaultMeta,
     App,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
+
+fn find_in_buffer(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+    let width = needle.chars().count();
+    if width == 0 {
+        return None;
+    }
+    (0..buffer.area.height).find_map(|y| {
+        let symbols: Vec<&str> = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        (0..=symbols.len().saturating_sub(width))
+            .find_map(|x| (symbols[x..x + width].concat() == needle).then_some((x as u16, y)))
+    })
+}
 
 fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.key(KeyEvent::new(code, modifiers));
@@ -381,4 +403,290 @@ fn top_bar_settings_has_clean_spacing_bottom_padding_and_empty_thinking_expands(
         bottom_row_text.trim().is_empty(),
         "expected blank bottom padding row, got: {bottom_row_text:?}"
     );
+}
+
+#[test]
+fn markdown_table_drag_selection_and_quote_popover_work_at_80x24_and_120x40() {
+    for (w, h, use_mouse_quote) in [(80, 24, true), (120, 40, false)] {
+        let mut app = App::default();
+        app.transcript.clear();
+        app.transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "| Crate | Status | Notes |\n| --- | --- | --- |\n| clipboard | ready | pure rust png |".into(),
+            streaming: false,
+        });
+
+        let buf = render(&mut app, w, h);
+        let needle = "pure rust png";
+        let (start_x, row_y) = find_in_buffer(&buf, needle).unwrap_or_else(|| {
+            panic!(
+                "missing table cell {needle:?} at {w}x{h}:\n{}",
+                text(&buf, app.transcript_area)
+            )
+        });
+        let end_x = start_x + needle.chars().count() as u16 - 1;
+
+        app.mouse_down(start_x, row_y);
+        app.mouse_drag(end_x, row_y);
+        app.mouse_up(end_x, row_y);
+
+        assert!(app.scroll.popover_open(), "{w}x{h} popover must open");
+        assert_eq!(
+            app.scroll.extract_selection_text().as_deref(),
+            Some(needle),
+            "{w}x{h} exact table substring must be selected"
+        );
+
+        let selected_buf = render(&mut app, w, h);
+        assert_eq!(
+            selected_buf[(start_x, row_y)].bg,
+            app.ui_palette.selection_bg,
+            "{w}x{h} highlighted cell must use selection_bg"
+        );
+        let rects = app.scroll.popover_rects();
+        assert!(
+            rects.container.width > 0
+                && rects.container.height > 0
+                && rects.container.right() <= w
+                && rects.container.bottom() <= h,
+            "{w}x{h} popover out of bounds: {:?}",
+            rects.container
+        );
+        let popover_text = text(&selected_buf, rects.container);
+        assert!(
+            popover_text.contains("Quote (q)") && popover_text.contains("Copy (c)"),
+            "{w}x{h} popover text missing buttons: {popover_text:?}"
+        );
+
+        if use_mouse_quote {
+            click_center(&mut app, rects.quote, w, h);
+        } else {
+            key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        }
+
+        assert!(
+            !app.scroll.popover_open(),
+            "{w}x{h} popover must close after Quote"
+        );
+        assert!(app.editing, "{w}x{h} Quote must focus composer");
+        assert!(
+            app.composer.text().contains("> pure rust png"),
+            "{w}x{h} composer must contain quoted excerpt, got: {:?}",
+            app.composer.text()
+        );
+
+        for ch in "confirm".chars() {
+            key(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert!(
+            app.composer.text().ends_with("confirm"),
+            "{w}x{h} user must be able to type immediately after Quote: {:?}",
+            app.composer.text()
+        );
+    }
+}
+
+#[test]
+fn composer_image_chip_and_vault_modal_render_safely_at_80x24_and_120x40() {
+    let mut app = App::default();
+    app.composer
+        .attach_image(PathBuf::from("shot.png"), "image/png", "shot.png");
+
+    for (w, h) in [(80, 24), (120, 40)] {
+        let buf = render(&mut app, w, h);
+        assert!(app.input_area.right() <= w && app.input_area.bottom() < h);
+        let composer_view = text(&buf, app.input_area);
+        assert!(
+            composer_view.contains("[Image #1 · shot.png]"),
+            "{w}x{h} missing image chip:\n{composer_view}"
+        );
+    }
+
+    app.editing = false;
+    app.vault_modal = Some(VaultModalState {
+        mode: VaultModalMode::List,
+        entries: vec![VaultMeta {
+            name: "OPENAI_KEY".into(),
+            namespace: "global".into(),
+            description: "API token".into(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            value_bytes: 32,
+            sha256_8: "deadbeef".into(),
+        }],
+        selected: 0,
+        request_id: None,
+        name: String::new(),
+        namespace: "global".into(),
+        description: String::new(),
+        secret_input: String::new(),
+        error: None,
+    });
+
+    for (w, h) in [(80, 24), (120, 40)] {
+        let buf = render(&mut app, w, h);
+        let screen = text(&buf, Rect::new(0, 0, w, h));
+        assert!(
+            screen.contains("Vault Secrets (metadata only)"),
+            "{w}x{h}:\n{screen}"
+        );
+        assert!(screen.contains("global/OPENAI_KEY"), "{w}x{h}:\n{screen}");
+        assert!(screen.contains("sha256:deadbeef"), "{w}x{h}:\n{screen}");
+    }
+
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.vault_modal.as_ref().map(|m| m.mode),
+        Some(VaultModalMode::PromptSecret)
+    );
+    let raw_secret = "sk-super-secret-4242";
+    for ch in raw_secret.chars() {
+        key(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+
+    let expected_mask = "•".repeat(raw_secret.chars().count());
+    for (w, h) in [(80, 24), (120, 40)] {
+        let buf = render(&mut app, w, h);
+        let screen = text(&buf, Rect::new(0, 0, w, h));
+        assert!(
+            screen.contains("Vault · Store Secret"),
+            "{w}x{h}:\n{screen}"
+        );
+        assert!(screen.contains(&expected_mask), "{w}x{h}:\n{screen}");
+        assert!(
+            !screen.contains(raw_secret)
+                && !screen.contains("sk-super")
+                && !screen.contains("4242"),
+            "{w}x{h} vault modal leaked plaintext secret:\n{screen}"
+        );
+    }
+
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.vault_modal.is_none());
+    assert!(app.editing);
+}
+
+#[test]
+fn sixel_ring_cells_are_skipped_and_occluded_when_overlays_open() {
+    let root = env::temp_dir().join(format!(
+        "agent-command-sixel-layout-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let workspace = root.join("work");
+    let state = root.join("state");
+    fs::create_dir_all(&workspace).unwrap();
+    let profile = Profile::new(state.clone(), Provider::Claude, "sixelring").unwrap();
+    profile.prepare_isolated_with_env().unwrap();
+
+    let prev_sub_auth = env::var_os("SUB_AUTH_DIR");
+    env::set_var("SUB_AUTH_DIR", &state);
+    let mut app = App::live(workspace);
+    match prev_sub_auth {
+        Some(value) => env::set_var("SUB_AUTH_DIR", value),
+        None => env::remove_var("SUB_AUTH_DIR"),
+    }
+
+    assert!(
+        !app.usage_cards().is_empty(),
+        "isolated profile must populate left-panel usage cards"
+    );
+
+    app.graphics.sixel = false;
+    app.graphics.mode = GraphicsMode::Auto;
+    let no_sixel_buf = render(&mut app, 120, 40);
+    assert!(app.pending_sixel_rings.is_empty());
+
+    app.graphics.sixel = true;
+    let _ = render(&mut app, 80, 24);
+    assert!(
+        app.pending_sixel_rings.is_empty(),
+        "narrow 80x24 layout hides left panel and must not queue Sixel rings"
+    );
+
+    let wide_buf = render(&mut app, 120, 40);
+    assert!(
+        !app.pending_sixel_rings.is_empty(),
+        "120x40 layout with Sixel enabled must queue ring slots"
+    );
+    let ring_rect = app.pending_sixel_rings[0].rect;
+    assert!(
+        app.pending_sixel_rings
+            .iter()
+            .all(|slot| slot.fits_without_scroll(Rect::new(0, 0, 120, 40))),
+        "all Sixel ring slots must fit without scrolling"
+    );
+    assert_eq!(
+        no_sixel_buf[(ring_rect.x, ring_rect.y)].bg,
+        app.ui_palette.surface,
+        "ring cells must flush surface bg when Sixel is disabled"
+    );
+    for y in ring_rect.y..ring_rect.bottom() {
+        for x in ring_rect.x..ring_rect.right() {
+            assert_eq!(
+                wide_buf[(x, y)].bg,
+                Color::Reset,
+                "unobstructed Sixel ring cell ({x},{y}) must be skipped during Terminal flush"
+            );
+        }
+    }
+    assert_eq!(
+        wide_buf[(ring_rect.right(), ring_rect.y)].bg,
+        app.ui_palette.surface,
+        "left-panel cell next to Sixel ring must still flush normally"
+    );
+
+    app.open_diff_viewer(None);
+    assert!(app.diff_modal.is_open());
+    let occluded_buf = render(&mut app, 120, 40);
+    assert!(
+        app.pending_sixel_rings.is_empty(),
+        "Diff overlay covering left panel must occlude pending Sixel rings"
+    );
+    for y in ring_rect.y..ring_rect.bottom() {
+        for x in ring_rect.x..ring_rect.right() {
+            assert_ne!(
+                occluded_buf[(x, y)].bg,
+                Color::Reset,
+                "occluded ring cell ({x},{y}) must flush normally under Diff overlay"
+            );
+        }
+    }
+
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.diff_modal.is_open());
+    let resumed_buf = render(&mut app, 120, 40);
+    assert!(
+        !app.pending_sixel_rings.is_empty(),
+        "Sixel rings must resume once Diff overlay closes"
+    );
+    assert_eq!(resumed_buf[(ring_rect.x, ring_rect.y)].bg, Color::Reset);
+
+    let settings_btn = app.settings_area;
+    click_center(&mut app, settings_btn, 120, 40);
+    assert!(app.panel_open());
+    let settings_buf = render(&mut app, 120, 40);
+    assert!(
+        app.pending_sixel_rings.is_empty(),
+        "Settings overlay must occlude all pending Sixel rings"
+    );
+    for y in ring_rect.y..ring_rect.bottom() {
+        for x in ring_rect.x..ring_rect.right() {
+            assert_ne!(
+                settings_buf[(x, y)].bg,
+                Color::Reset,
+                "occluded ring cell ({x},{y}) must flush normally under Settings overlay"
+            );
+        }
+    }
+
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.panel_open());
+    let final_buf = render(&mut app, 120, 40);
+    assert!(
+        !app.pending_sixel_rings.is_empty(),
+        "Sixel rings must resume once Settings overlay closes"
+    );
+    assert_eq!(final_buf[(ring_rect.x, ring_rect.y)].bg, Color::Reset);
+
+    let _ = fs::remove_dir_all(&root);
 }

@@ -1,6 +1,7 @@
 pub mod app_ops;
 pub mod diff_modal;
 pub mod events;
+pub mod graphics;
 pub mod left_panel;
 pub mod render;
 pub mod tabs;
@@ -120,6 +121,46 @@ pub fn build_palette_items(
             detail: "Copy via native clipboard + OSC 52".into(),
             shortcut: "Ctrl+Y".into(),
             suggested: true,
+        },
+        PaletteItem {
+            id: "transcript.select_mode".into(),
+            category: "Transcript".into(),
+            label: "Toggle Keyboard Selection Mode".into(),
+            detail: "Select, quote, or copy text across prose, code, and tables".into(),
+            shortcut: "Ctrl+Shift+S".into(),
+            suggested: false,
+        },
+        PaletteItem {
+            id: "transcript.open_link".into(),
+            category: "Transcript".into(),
+            label: "Open Link in Transcript".into(),
+            detail: "Open latest visible URL or workspace file link".into(),
+            shortcut: "Ctrl+O".into(),
+            suggested: false,
+        },
+        PaletteItem {
+            id: "vault.open".into(),
+            category: "Security".into(),
+            label: "Open Credential Vault".into(),
+            detail: "Inspect encrypted secret metadata or store credentials safely".into(),
+            shortcut: "/vault".into(),
+            suggested: true,
+        },
+        PaletteItem {
+            id: "bot.scorecard".into(),
+            category: "Workers".into(),
+            label: "Show Bot Evolution Scorecard".into(),
+            detail: "Inspect Wilson scorecards, probation, and forge status".into(),
+            shortcut: "/bot scorecard".into(),
+            suggested: false,
+        },
+        PaletteItem {
+            id: "inbox.search".into(),
+            category: "View".into(),
+            label: "Search Decision Inbox".into(),
+            detail: "Switch to Inbox and focus live decision search".into(),
+            shortcut: "/".into(),
+            suggested: false,
         },
         PaletteItem {
             id: "update.trigger".into(),

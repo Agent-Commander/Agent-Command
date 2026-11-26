@@ -7,8 +7,11 @@ mod process_tree;
 
 use crate::{
     auth::{Profile, Provider},
+    bridge::{BridgeProvider, LoopbackBridge},
     catalog::Catalog,
     checkpoint::{Checkpoint, Claim, Handoff, Progress},
+    clipboard::{base64_encode, MAX_IMAGE_ATTACHMENT_BYTES},
+    editor::ImageAttachment,
     native::Pins,
     permissions::{self, PermissionEffect, PermissionMode, PermissionPolicy},
     routing::{self, Candidate, Configuration, Request},
@@ -19,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -28,11 +32,12 @@ use std::{
         Arc, Mutex, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SNOOZE_POLL: Duration = Duration::from_millis(200);
 const CANCEL_POLL: Duration = Duration::from_millis(15);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const STDERR_TAIL_LIMIT: usize = 20;
 const OUTPUT_PREVIEW_CHARS: usize = 400;
 const MAX_PARTIAL_TOOL_JSON_BYTES: usize = 256 * 1024;
@@ -124,7 +129,7 @@ pub enum NormalizedEvent {
     },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LaunchOptions {
     pub resume_session: Option<String>,
     pub resume_session_profile: Option<String>,
@@ -133,7 +138,33 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     pub policy: PermissionPolicy,
     pub persistent_stdio: bool,
+    pub attachments: Vec<ImageAttachment>,
+    pub bridge: Option<Arc<LoopbackBridge>>,
+    pub mcp_diet: bool,
+    pub extra_env: Vec<(String, String)>,
+    pub timeout: Option<Duration>,
+    pub heartbeat_path: Option<PathBuf>,
 }
+
+impl PartialEq for LaunchOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.resume_session == other.resume_session
+            && self.resume_session_profile == other.resume_session_profile
+            && self.portable_handoff == other.portable_handoff
+            && self.mcp_config == other.mcp_config
+            && self.extra_args == other.extra_args
+            && self.policy == other.policy
+            && self.persistent_stdio == other.persistent_stdio
+            && self.attachments == other.attachments
+            && self.bridge.as_ref().map(Arc::as_ptr) == other.bridge.as_ref().map(Arc::as_ptr)
+            && self.mcp_diet == other.mcp_diet
+            && self.extra_env == other.extra_env
+            && self.timeout == other.timeout
+            && self.heartbeat_path == other.heartbeat_path
+    }
+}
+
+impl Eq for LaunchOptions {}
 
 pub(crate) enum Event {
     Running {
@@ -573,6 +604,74 @@ pub fn claude_user_turn_json(prompt: &str) -> String {
     .to_string()
 }
 
+pub fn claude_user_turn_json_with_attachments(
+    prompt: &str,
+    attachments: &[ImageAttachment],
+) -> io::Result<String> {
+    if attachments.is_empty() {
+        return Ok(claude_user_turn_json(prompt));
+    }
+    let mut blocks = Vec::with_capacity(attachments.len() + 1);
+    for attachment in attachments {
+        let meta = fs::metadata(&attachment.path)?;
+        if meta.len() > MAX_IMAGE_ATTACHMENT_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Image attachment exceeds 20 MiB limit: {}",
+                    attachment.path.display()
+                ),
+            ));
+        }
+        let bytes = fs::read(&attachment.path)?;
+        if bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Image attachment exceeds 20 MiB limit: {}",
+                    attachment.path.display()
+                ),
+            ));
+        }
+        blocks.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.mime_type,
+                "data": base64_encode(&bytes)
+            }
+        }));
+    }
+    blocks.push(json!({ "type": "text", "text": prompt }));
+    Ok(json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": blocks
+        }
+    })
+    .to_string())
+}
+
+fn prompt_with_image_notes(prompt: &str, attachments: &[ImageAttachment]) -> String {
+    if attachments.is_empty() {
+        return prompt.to_owned();
+    }
+    let mut header = String::from(
+        "[Attached images — inspect each image file with read_file before answering:\n",
+    );
+    for attachment in attachments {
+        header.push_str(&format!(
+            "- {} ({})\n",
+            attachment.path.display(),
+            attachment.mime_type
+        ));
+    }
+    header.push_str("]\n\n");
+    header.push_str(prompt);
+    header
+}
+
 fn agy_user_turn_json(prompt: &str) -> String {
     json!({
         "event": "user",
@@ -581,6 +680,45 @@ fn agy_user_turn_json(prompt: &str) -> String {
         }
     })
     .to_string()
+}
+
+pub fn agy_user_turn_json_with_attachments(
+    prompt: &str,
+    attachments: &[ImageAttachment],
+) -> String {
+    let body = prompt_with_image_notes(prompt, attachments);
+    agy_user_turn_json(&body)
+}
+
+fn unique_attachment_dirs(attachments: &[ImageAttachment]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut dirs = Vec::new();
+    for attachment in attachments {
+        if let Some(parent) = attachment.path.parent() {
+            let rendered = parent.to_string_lossy().into_owned();
+            if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                dirs.push(rendered);
+            }
+        }
+    }
+    dirs
+}
+
+fn split_codex_config_args(extra_args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut leading_config = Vec::new();
+    let mut trailing = Vec::new();
+    let mut iter = extra_args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-c" {
+            if let Some(value) = iter.next() {
+                leading_config.push(arg.clone());
+                leading_config.push(value.clone());
+                continue;
+            }
+        }
+        trailing.push(arg.clone());
+    }
+    (leading_config, trailing)
 }
 
 pub fn claude_interrupt_request_json(request_id: &str) -> String {
@@ -656,7 +794,9 @@ pub fn claude_persistent_arguments(mode: PermissionMode, options: &LaunchOptions
         args.extend(["--resume".to_owned(), session_id.clone()]);
     }
     if let Some(mcp_config) = &options.mcp_config {
-        args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+        if !options.extra_args.iter().any(|arg| arg == "--mcp-config") {
+            args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+        }
     }
     args.extend(mode.claude_arguments().into_iter().map(str::to_owned));
     args.extend(options.extra_args.iter().cloned());
@@ -683,7 +823,12 @@ pub fn build_provider_arguments(
                 args.extend(["--resume".to_owned(), session_id.clone()]);
             }
             if let Some(mcp_config) = &options.mcp_config {
-                args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+                if !options.extra_args.iter().any(|arg| arg == "--mcp-config") {
+                    args.extend(["--mcp-config".to_owned(), mcp_config.display().to_string()]);
+                }
+            }
+            for dir in unique_attachment_dirs(&options.attachments) {
+                args.extend(["--add-dir".to_owned(), dir]);
             }
             args.extend(options.extra_args.iter().cloned());
             if has_trailing_dash {
@@ -692,31 +837,52 @@ pub fn build_provider_arguments(
             args
         }
         Provider::Codex => {
+            let (leading_config, other_extra) = split_codex_config_args(&options.extra_args);
             if let Some(thread_id) = &options.resume_session {
-                let mut args = vec![
+                let mut args = leading_config;
+                args.extend([
                     "exec".to_owned(),
                     "resume".to_owned(),
                     "--json".to_owned(),
                     "--skip-git-repo-check".to_owned(),
-                ];
-                args.extend(options.extra_args.iter().cloned());
+                ]);
+                for attachment in &options.attachments {
+                    args.extend([
+                        "-i".to_owned(),
+                        attachment.path.to_string_lossy().into_owned(),
+                    ]);
+                }
+                args.extend(other_extra);
                 args.push(thread_id.clone());
                 args.push("-".to_owned());
                 args
             } else {
-                let mut args: Vec<String> = permissions::dispatch_arguments(provider, mode)
+                let mut base: Vec<String> = permissions::dispatch_arguments(provider, mode)
                     .into_iter()
                     .map(str::to_owned)
                     .collect();
-                let has_stdin_dash = args.last().is_some_and(|a| a == "-");
+                let has_stdin_dash = base.last().is_some_and(|a| a == "-");
                 if has_stdin_dash {
-                    args.pop();
+                    base.pop();
                 }
-                args.extend(options.extra_args.iter().cloned());
+                if !leading_config.is_empty() {
+                    if let Some(exec_pos) = base.iter().position(|a| a == "exec") {
+                        base.splice(exec_pos..exec_pos, leading_config);
+                    } else {
+                        base.extend(leading_config);
+                    }
+                }
+                for attachment in &options.attachments {
+                    base.extend([
+                        "-i".to_owned(),
+                        attachment.path.to_string_lossy().into_owned(),
+                    ]);
+                }
+                base.extend(other_extra);
                 if has_stdin_dash {
-                    args.push("-".to_owned());
+                    base.push("-".to_owned());
                 }
-                args
+                base
             }
         }
         Provider::Gemini => {
@@ -726,6 +892,9 @@ pub fn build_provider_arguments(
                 .collect();
             if let Some(session_id) = &options.resume_session {
                 args.extend(["--conversation".to_owned(), session_id.clone()]);
+            }
+            for dir in unique_attachment_dirs(&options.attachments) {
+                args.extend(["--add-dir".to_owned(), dir]);
             }
             args.extend(options.extra_args.iter().cloned());
             merge_agy_settings_args(args)
@@ -2767,6 +2936,59 @@ enum RunOutcome {
     StaleSession,
 }
 
+fn write_heartbeat(path: &Path, pid: u32) {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let payload = format!("{{\"pid\":{pid},\"heartbeat_ms\":{millis}}}\n");
+    let staging = path.with_extension(format!("hb.{}.tmp", uuid::Uuid::new_v4().simple()));
+    if fs::write(&staging, payload).is_ok() && fs::rename(&staging, path).is_err() {
+        let _ = fs::remove_file(&staging);
+        let _ = fs::write(
+            path,
+            format!("{{\"pid\":{pid},\"heartbeat_ms\":{millis}}}\n"),
+        );
+    }
+}
+
+fn apply_runtime_options(
+    profile: &Profile,
+    options: &mut LaunchOptions,
+    command: &mut Command,
+) -> io::Result<()> {
+    if options.mcp_diet {
+        options
+            .extra_args
+            .extend(crate::bridge::worker_mcp_diet_args(BridgeProvider::from(
+                profile.provider,
+            )));
+    } else if let Some(bridge) = options.bridge.clone() {
+        let injection =
+            bridge.injection_for_profile(BridgeProvider::from(profile.provider), profile)?;
+        if profile.provider == Provider::Claude && injection.config_file.is_some() {
+            options.mcp_config = None;
+        }
+        options.extra_args.extend(injection.args);
+        for (key, value) in injection.env {
+            command.env(key, value);
+        }
+    }
+    if profile.provider == Provider::Codex {
+        if let crate::auth::ProfileSource::Isolated { root, name, .. } = profile.source() {
+            let sqlite_dir = root
+                .join(profile.provider.binary())
+                .join(name)
+                .join("sqlite");
+            let _ = fs::create_dir_all(&sqlite_dir);
+            command.env("CODEX_SQLITE_HOME", sqlite_dir);
+        }
+    }
+    for (key, value) in &options.extra_env {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     launch: Launch,
@@ -2789,11 +3011,12 @@ fn run(
         reason,
         configuration,
         mode,
-        options,
+        mut options,
     } = launch;
     if cancel.load(Ordering::Acquire) {
         return Ok(RunOutcome::Completed);
     }
+    apply_runtime_options(&profile, &mut options, &mut command)?;
     let resuming = options.resume_session.is_some();
     command.args(configuration.arguments());
     command.args(build_provider_arguments(profile.provider, mode, &options));
@@ -2809,6 +3032,15 @@ fn run(
         }
         Some(Continuation::Uncheckpointed { .. }) | None => prompt,
     };
+    let persistent_claude = profile.provider == Provider::Claude && options.persistent_stdio;
+    let initial_claude_payload = if persistent_claude {
+        Some(claude_user_turn_json_with_attachments(
+            &prompt,
+            &options.attachments,
+        )?)
+    } else {
+        None
+    };
     process_tree::own_group(&mut command);
     let mut child = command.spawn().inspect_err(|error| {
         let code = classify_health(&[], Some(error));
@@ -2821,6 +3053,11 @@ fn run(
     })?;
     let child_pid = child.id();
     active_pid.store(child_pid, Ordering::Release);
+    let attempt_started = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    if let Some(hb_path) = options.heartbeat_path.as_deref() {
+        write_heartbeat(hb_path, child_pid);
+    }
     if let Some(next) = continuation {
         let from = match next {
             Continuation::Checkpointed { from, .. } | Continuation::Uncheckpointed { from } => from,
@@ -2842,7 +3079,6 @@ fn run(
     let output_cancel = Arc::clone(&reader_cancel);
     let stderr_cancel = Arc::clone(&reader_cancel);
     let policy = options.policy.clone();
-    let persistent_claude = profile.provider == Provider::Claude && options.persistent_stdio;
 
     let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let stderr_collect = Arc::clone(&stderr_lines);
@@ -2865,10 +3101,11 @@ fn run(
 
     let mut stdin = child.stdin.take().expect("mission stdin is piped");
     let (writer, control_handle) = if persistent_claude {
+        let first_turn = initial_claude_payload.expect("prepared claude payload");
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
         *control.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctrl_tx);
         let handle = thread::spawn(move || -> io::Result<()> {
-            writeln!(stdin, "{}", claude_user_turn_json(&prompt))?;
+            writeln!(stdin, "{first_turn}")?;
             stdin.flush()?;
             for msg in ctrl_rx {
                 match msg {
@@ -2895,11 +3132,15 @@ fn run(
         });
         (handle, true)
     } else if profile.provider == Provider::Gemini {
-        let payload = agy_user_turn_json(&prompt);
+        let payload = agy_user_turn_json_with_attachments(&prompt, &options.attachments);
         let handle = thread::spawn(move || -> io::Result<()> {
             writeln!(stdin, "{payload}")?;
             stdin.flush()
         });
+        (handle, false)
+    } else if profile.provider == Provider::Claude {
+        let payload = prompt_with_image_notes(&prompt, &options.attachments);
+        let handle = thread::spawn(move || stdin.write_all(payload.as_bytes()));
         (handle, false)
     } else {
         let handle = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
@@ -2957,6 +3198,33 @@ fn run(
                 final_text: String::new(),
             });
             return Ok(RunOutcome::Completed);
+        }
+        if let Some(hb_path) = options.heartbeat_path.as_deref() {
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                write_heartbeat(hb_path, child_pid);
+                last_heartbeat = Instant::now();
+            }
+        }
+        if let Some(limit) = options.timeout {
+            if attempt_started.elapsed() >= limit {
+                reader_cancel.store(true, Ordering::Release);
+                active_pid.store(0, Ordering::Release);
+                process_tree::kill_tree(child_pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                control
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                let detail = format!("Mission attempt timed out after {}s", limit.as_secs());
+                let _ = norm_sender.send(NormalizedEvent::TurnFinished {
+                    interrupted: false,
+                    is_error: true,
+                    error_code: Some(HealthCode::AgentFailed),
+                    final_text: detail.clone(),
+                });
+                return Err(io::Error::new(io::ErrorKind::TimedOut, detail));
+            }
         }
         if limited.load(Ordering::Acquire) {
             active_pid.store(0, Ordering::Release);
@@ -3581,6 +3849,116 @@ mod engine_tests {
         let parsed: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(parsed["event"], "user");
         assert_eq!(parsed["message"]["content"], "Line 1\n\"quoted\" \\ path");
+    }
+
+    #[test]
+    fn image_attachments_and_codex_config_args_format_cleanly_for_all_three_providers() {
+        let dir =
+            std::env::temp_dir().join(format!("ac-mission-img-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("shot.png");
+        let png = crate::clipboard::encode_rgba_to_png(2, 2, &[0x7F; 16]).unwrap();
+        fs::write(&img_path, &png).unwrap();
+
+        let attachment = ImageAttachment {
+            id: 1,
+            placeholder: "[Image #1 · shot.png]".into(),
+            path: img_path.clone(),
+            mime_type: "image/png".into(),
+            label: "shot.png".into(),
+        };
+
+        let claude_json = claude_user_turn_json_with_attachments(
+            "What is broken?",
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        let claude_val: Value = serde_json::from_str(&claude_json).unwrap();
+        let blocks = claude_val["message"]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], base64_encode(&png));
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "What is broken?");
+
+        let agy_json =
+            agy_user_turn_json_with_attachments("Review this", std::slice::from_ref(&attachment));
+        let agy_val: Value = serde_json::from_str(&agy_json).unwrap();
+        let agy_content = agy_val["message"]["content"].as_str().unwrap();
+        assert!(agy_content.contains(&img_path.display().to_string()));
+        assert!(agy_content.contains("read_file"));
+        assert!(agy_content.contains("Review this"));
+
+        let opts = LaunchOptions {
+            attachments: vec![attachment],
+            extra_args: vec![
+                "-c".into(),
+                "mcp_servers.agent_command.url='http://127.0.0.1:9/mcp'".into(),
+            ],
+            ..LaunchOptions::default()
+        };
+        let codex_args =
+            build_provider_arguments(Provider::Codex, PermissionMode::WorkspaceAuto, &opts);
+        let c_pos = codex_args.iter().position(|a| a == "-c").unwrap();
+        let exec_pos = codex_args.iter().position(|a| a == "exec").unwrap();
+        assert!(c_pos < exec_pos, "{codex_args:?}");
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["-i", &img_path.to_string_lossy()]));
+
+        let resume_opts = LaunchOptions {
+            resume_session: Some("thread-99".into()),
+            ..opts.clone()
+        };
+        let codex_resume =
+            build_provider_arguments(Provider::Codex, PermissionMode::WorkspaceAuto, &resume_opts);
+        let rc_pos = codex_resume.iter().position(|a| a == "-c").unwrap();
+        let rexec_pos = codex_resume.iter().position(|a| a == "exec").unwrap();
+        assert!(rc_pos < rexec_pos, "{codex_resume:?}");
+        assert!(codex_resume
+            .windows(2)
+            .any(|pair| pair == ["-i", &img_path.to_string_lossy()]));
+
+        let agy_args =
+            build_provider_arguments(Provider::Gemini, PermissionMode::WorkspaceAuto, &opts);
+        assert!(agy_args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", &dir.to_string_lossy()]));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_options_inject_codex_sqlite_home_extra_env_and_mcp_diet() {
+        let root =
+            std::env::temp_dir().join(format!("ac-codex-sqlite-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let profile = Profile::new(root.clone(), Provider::Codex, "worker").unwrap();
+        let mut options = LaunchOptions {
+            mcp_diet: true,
+            extra_env: vec![("CUSTOM_FLAG".into(), "enabled".into())],
+            ..LaunchOptions::default()
+        };
+        let mut command = Command::new("codex");
+        apply_runtime_options(&profile, &mut options, &mut command).unwrap();
+        assert!(options.extra_args.contains(&"mcp_servers={}".to_owned()));
+        let envs: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(envs.get("CUSTOM_FLAG").map(String::as_str), Some("enabled"));
+        assert_eq!(
+            envs.get("CODEX_SQLITE_HOME").map(PathBuf::from),
+            Some(root.join("codex").join("worker").join("sqlite"))
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

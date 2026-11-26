@@ -6,14 +6,15 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Rect};
+use zeroize::Zeroizing;
 
 use crate::{
     auth::Provider,
     branches, bridge, clipboard,
     editor::{EditorAction, TriggerKind},
     markdown::{
-        DelegationStatus, LiveActivity, NoticeLevel, ScrollState, ToolKind, Transcript,
-        TranscriptEntry, TranscriptHitAction,
+        DelegationStatus, DocPos, LiveActivity, NoticeLevel, ScrollState, SelectionButton,
+        ToolKind, Transcript, TranscriptEntry, TranscriptHitAction,
     },
     mission::{HealthCode, NormalizedEvent, PatchKind},
     palette::PaletteAction,
@@ -22,9 +23,10 @@ use crate::{
         diff_modal::DiffModalAction,
         events::{self, AppEvent, ChangedFile},
         render::{FocusBannerHit, RailHit, WelcomeHit},
+        tabs::{VaultModalMode, ViewTab},
     },
     update::UpdateState,
-    usage, App, RunPhase,
+    usage, vault, App, RunPhase,
 };
 
 const ARM_WINDOW: Duration = Duration::from_secs(2);
@@ -274,6 +276,15 @@ impl App {
             self.specialist_transcripts
                 .entry(name.to_owned())
                 .or_default()
+        }
+    }
+
+    pub(crate) fn active_scroll(&self) -> &ScrollState {
+        let name = self.crew[self.selected].name.as_str();
+        if name == specialists::COMMANDER {
+            &self.scroll
+        } else {
+            self.specialist_scrolls.get(name).unwrap_or(&self.scroll)
         }
     }
 
@@ -593,7 +604,7 @@ impl App {
         let wakes: Vec<bridge::BackgroundResult> = self
             .live
             .as_ref()
-            .and_then(|live| live.bridge.as_ref())
+            .and_then(|live| live.bridge.as_deref())
             .and_then(bridge::LoopbackBridge::wake_queue)
             .map(bridge::WakeQueue::drain)
             .unwrap_or_default();
@@ -772,16 +783,32 @@ impl App {
     }
 
     pub(crate) fn ensure_loopback_bridge(&mut self) -> Option<PathBuf> {
+        let env_snapshot = self.build_env_snapshot();
+        let ledger_path_opt = self.ledger_path.clone();
+        let soul_path = self.settings.effective_soul_path();
         let live = self.live.as_mut()?;
         let root = live.profile_root.clone()?;
         if live.bridge.is_none() {
-            let soul = self
-                .settings
-                .effective_soul_path()
+            let soul = soul_path
                 .map(crate::soul::SoulStore::new)
                 .or_else(crate::soul::SoulStore::from_env);
             let ask_user = bridge::AskUserBroker::new(false);
             live.ask_user = Some(ask_user.clone());
+            let ledger_path = ledger_path_opt
+                .unwrap_or_else(|| root.join("agent-command-ledger-v1").join("ledger.json"));
+            let ledger_docs_dir = ledger_path
+                .parent()
+                .map(|parent| parent.join("ledger-docs"))
+                .unwrap_or_else(|| root.join("agent-command-ledger-v1").join("ledger-docs"));
+            let ui_bridge =
+                bridge::UiBridge::interactive(None).with_ledger_paths(ledger_path, ledger_docs_dir);
+            if let Some(snapshot) = env_snapshot {
+                ui_bridge.set_env_snapshot(snapshot);
+            }
+            let vault_store = live
+                .vault_store
+                .clone()
+                .unwrap_or_else(|| vault::VaultStore::open(root.clone()));
             let config = bridge::BridgeSessionConfig {
                 workspace_root: live.workspace.clone(),
                 profile_root: root,
@@ -791,15 +818,61 @@ impl App {
                 wake_queue: bridge::WakeQueue::new(),
                 shutdown: Arc::new(AtomicBool::new(false)),
             };
-            if let Ok(started) = bridge::LoopbackBridge::start_session(config) {
-                live.bridge = Some(started);
+            if let Ok(started) =
+                bridge::LoopbackBridge::start_session_with_ui(config, ui_bridge, Some(vault_store))
+            {
+                if live.vault_store.is_none() {
+                    live.vault_store = started.vault().cloned();
+                }
+                if live.memory_store.is_none() {
+                    live.memory_store = started.memory().cloned();
+                }
+                if live.evolution_store.is_none() {
+                    live.evolution_store = started.evolution().cloned();
+                }
+                live.bridge = Some(Arc::new(started));
             }
         }
-        let bridge = live.bridge.as_ref()?;
+        let bridge = live.bridge.as_deref()?;
         bridge
             .injection_for(bridge::BridgeProvider::Claude)
             .ok()
             .and_then(|inj| inj.config_file)
+    }
+
+    pub(crate) fn build_env_snapshot(&self) -> Option<bridge::EnvSnapshot> {
+        let live = self.live.as_ref()?;
+        let displayed = live.displayed_profile();
+        let active = live.profiles.get(displayed);
+        let profiles = live
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(idx, profile)| {
+                let allowance = live.allowances.get(idx).copied().unwrap_or_default();
+                let logged_in = live.signed_in.get(idx).copied().unwrap_or(false);
+                bridge::ProfileHeadroom {
+                    label: profile.to_string(),
+                    provider: crate::tui::provider_short_name(profile.provider).to_owned(),
+                    logged_in,
+                    five_hour_remaining: crate::token_burn::clamp_percent(allowance.five)
+                        .map(|v| v.round() as u8),
+                    week_remaining: crate::token_burn::clamp_percent(allowance.week)
+                        .map(|v| v.round() as u8),
+                    latched: allowance.latched,
+                }
+            })
+            .collect();
+        Some(bridge::EnvSnapshot {
+            workspace: live.workspace.display().to_string(),
+            git_branch: self.git_snapshot.branch.clone(),
+            git_dirty_files: self.git_snapshot.files.len(),
+            active_provider: active.map(|p| crate::tui::provider_short_name(p.provider).to_owned()),
+            active_profile: active.map(|p| p.name().to_owned()),
+            permission_mode: Some(self.settings.commander_permission.flag().to_owned()),
+            profiles,
+            external_servers: Vec::new(),
+        })
     }
 
     pub(crate) fn handle_normalized_event(&mut self, name: &str, event: NormalizedEvent) {
@@ -1129,6 +1202,23 @@ impl App {
             "transcript.clear" => {
                 self.clear_active_transcript();
             }
+            "transcript.select_mode" => {
+                self.start_keyboard_selection();
+            }
+            "transcript.open_link" => {
+                self.open_viewport_link();
+            }
+            "vault.open" => {
+                self.open_vault_modal();
+            }
+            "bot.scorecard" => {
+                self.submit_text("/bot scorecard".into());
+            }
+            "inbox.search" => {
+                self.set_view_tab(ViewTab::Inbox);
+                self.inbox_searching = true;
+                self.editing = false;
+            }
             "editor.external" => self.request_external_editor(),
             "git.pr" => self.open_pr(None, false),
             "connect.open" => self.open_connect(panel::Origin::Direct),
@@ -1151,7 +1241,14 @@ impl App {
             }
             _ => {}
         }
-        if self.panel.is_none() && !self.diff_modal.is_open() {
+        if self.panel.is_none()
+            && !self.diff_modal.is_open()
+            && self.vault_modal.is_none()
+            && self.inbox_modal.is_none()
+            && self.ledger_viewer.is_none()
+            && !self.keyboard_select_mode
+            && !self.inbox_searching
+        {
             self.editing = true;
         }
     }
@@ -1275,6 +1372,9 @@ impl App {
              - `Ctrl+B` — Toggle collapsible right rail\n\
              - `F8` / `Ctrl+\\` — Toggle left panel · `Shift+Tab` focus it\n\
              - `Alt+1` / `Alt+2` / `Alt+3` — Chat / Inbox / Ledger tabs\n\
+             - `Drag` in chat — Highlight text -> `[Quote]` / `[Copy]` popdown (`q` / `c`)\n\
+             - `Ctrl+Shift+S` — Keyboard text selection mode · `Ctrl+O` — Open visible link\n\
+             - `Ctrl+V` / `Alt+V` — Paste text or clipboard image as `[Image #N]` chip\n\
              - `Ctrl+E` — Expand or collapse thinking / tool card\n\
              - `Ctrl+Y` — Copy latest reply (host clipboard + OSC 52)\n\
              - `Shift+Enter` / `Alt+Enter` / `Ctrl+J` — Multiline newline\n\
@@ -1464,17 +1564,629 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if self.panel.is_some() || self.palette.is_open() || self.diff_modal.is_open() {
+        if self.panel.is_some()
+            || self.palette.is_open()
+            || self.diff_modal.is_open()
+            || self.vault_modal.is_some()
+            || self.inbox_modal.is_some()
+            || self.ledger_viewer.is_some()
+        {
             return;
         }
         self.rail_focused = false;
+        self.left_focused = false;
         self.editing = true;
         self.composer.handle_paste(text);
         self.input = self.composer.text().to_owned();
         self.refresh_autocomplete();
     }
 
+    pub fn paste_from_clipboard(&mut self) {
+        if let Some(modal) = &mut self.vault_modal {
+            if modal.mode == VaultModalMode::PromptSecret {
+                if let Ok(clipboard::ClipboardContent::Text(text)) = clipboard::read_clipboard() {
+                    let clean: String = text
+                        .chars()
+                        .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                        .collect();
+                    modal.secret_input.push_str(&clean);
+                    modal.error = None;
+                }
+            }
+            return;
+        }
+        if let Some(modal) = &mut self.inbox_modal {
+            if let Ok(clipboard::ClipboardContent::Text(text)) = clipboard::read_clipboard() {
+                if modal.explain_mode {
+                    modal.explain_note.push_str(&text);
+                } else {
+                    modal.write_in.push_str(&text);
+                }
+            }
+            return;
+        }
+        if self.panel.is_some()
+            || self.palette.is_open()
+            || self.diff_modal.is_open()
+            || self.ledger_viewer.is_some()
+        {
+            return;
+        }
+        let state_root = self
+            .live
+            .as_ref()
+            .and_then(|live| live.profile_root.clone());
+        match clipboard::read_clipboard() {
+            Ok(clipboard::ClipboardContent::ImagePng(png)) => {
+                match clipboard::save_clipboard_png(&png, state_root.as_deref()) {
+                    Ok(saved) => self.attach_saved_image(saved),
+                    Err(err) => self.notice = format!("Cannot attach clipboard image: {err}"),
+                }
+            }
+            Ok(clipboard::ClipboardContent::ImageFile(path)) => {
+                match clipboard::stage_image_file(&path, state_root.as_deref()) {
+                    Ok(saved) => self.attach_saved_image(saved),
+                    Err(err) => self.notice = format!("Cannot attach image file: {err}"),
+                }
+            }
+            Ok(clipboard::ClipboardContent::Text(text)) => {
+                self.paste_text_or_image(&text);
+            }
+            Ok(clipboard::ClipboardContent::Empty) => {
+                self.notice = "Clipboard is empty.".into();
+            }
+            Err(err) => {
+                self.notice = format!("Clipboard read unavailable: {err}");
+            }
+        }
+    }
+
+    pub fn paste_text_or_image(&mut self, text: &str) {
+        if let Some(modal) = &mut self.vault_modal {
+            if modal.mode == VaultModalMode::PromptSecret {
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                    .collect();
+                modal.secret_input.push_str(&clean);
+                modal.error = None;
+            }
+            return;
+        }
+        if let Some(modal) = &mut self.inbox_modal {
+            if modal.explain_mode {
+                modal.explain_note.push_str(text);
+            } else {
+                modal.write_in.push_str(text);
+            }
+            return;
+        }
+        if self.panel.is_some()
+            || self.palette.is_open()
+            || self.diff_modal.is_open()
+            || self.ledger_viewer.is_some()
+        {
+            return;
+        }
+        if let Some(image_path) = clipboard::detect_pasted_image_path(text) {
+            let state_root = self
+                .live
+                .as_ref()
+                .and_then(|live| live.profile_root.clone());
+            match clipboard::stage_image_file(&image_path, state_root.as_deref()) {
+                Ok(saved) => {
+                    self.attach_saved_image(saved);
+                    return;
+                }
+                Err(err) => {
+                    self.notice = format!("Cannot attach image: {err}");
+                    return;
+                }
+            }
+        }
+        self.paste(text);
+    }
+
+    fn attach_saved_image(&mut self, saved: clipboard::SavedImageAttachment) {
+        self.rail_focused = false;
+        self.left_focused = false;
+        self.editing = true;
+        let dims = saved
+            .width
+            .zip(saved.height)
+            .map(|(w, h)| format!(" ({w}×{h})"))
+            .unwrap_or_default();
+        let att = self
+            .composer
+            .attach_image(saved.path, saved.mime_type, saved.label);
+        self.input = self.composer.text().to_owned();
+        self.refresh_autocomplete();
+        self.notice = format!("Attached {}{dims}", att.label);
+    }
+
+    fn has_blocking_modal(&self) -> bool {
+        self.vault_modal.is_some()
+            || self.inbox_modal.is_some()
+            || self.ledger_viewer.is_some()
+            || self.panel.is_some()
+            || self.palette.is_open()
+            || self.diff_modal.is_open()
+    }
+
+    pub fn mouse_down(&mut self, col: u16, row: u16) {
+        if self.has_blocking_modal() || self.autocomplete.is_open() {
+            self.handle_click_single_canvas(col, row);
+            return;
+        }
+        if self.view_tab == ViewTab::Chat {
+            if let Some(button) = self.active_scroll().hit_test_popover(col, row) {
+                match button {
+                    SelectionButton::Quote => self.quote_active_selection(),
+                    SelectionButton::Copy => self.copy_active_selection(),
+                }
+                return;
+            }
+            if rect_contains(self.transcript_area, col, row) {
+                self.keyboard_select_mode = false;
+                self.rail_focused = false;
+                self.left_focused = false;
+                self.active_scroll_mut().begin_selection(col, row);
+                return;
+            }
+        }
+        self.active_scroll_mut().clear_selection();
+        self.keyboard_select_mode = false;
+        self.handle_click_single_canvas(col, row);
+    }
+
+    pub fn mouse_drag(&mut self, col: u16, row: u16) {
+        if self.has_blocking_modal() || self.view_tab != ViewTab::Chat {
+            return;
+        }
+        self.active_scroll_mut().update_selection_drag(col, row);
+    }
+
+    pub fn mouse_up(&mut self, col: u16, row: u16) {
+        if self.has_blocking_modal() || self.view_tab != ViewTab::Chat {
+            return;
+        }
+        let was_dragging = self
+            .active_scroll()
+            .selection()
+            .is_some_and(|sel| sel.dragging);
+        if !was_dragging {
+            return;
+        }
+        if self.active_scroll_mut().finish_selection(col, row) {
+            self.keyboard_select_mode = false;
+            return;
+        }
+        self.dispatch_transcript_click(col, row);
+    }
+
+    fn dispatch_transcript_click(&mut self, x: u16, y: u16) {
+        if self.view_tab != ViewTab::Chat {
+            return;
+        }
+        let name = self.crew[self.selected].name.clone();
+        let hit_action = if name == specialists::COMMANDER {
+            self.scroll.hit_test(x, y).cloned()
+        } else {
+            self.specialist_scrolls
+                .get(&name)
+                .and_then(|s| s.hit_test(x, y))
+                .cloned()
+        };
+        if let Some(action) = hit_action {
+            self.handle_transcript_hit(&name, action);
+        }
+    }
+
+    fn quote_active_selection(&mut self) {
+        let excerpt = self.active_scroll().extract_selection_text();
+        self.active_scroll_mut().clear_selection();
+        self.keyboard_select_mode = false;
+        let Some(text) = excerpt else {
+            return;
+        };
+        self.composer.insert_quote(&text);
+        self.input = self.composer.text().to_owned();
+        self.rail_focused = false;
+        self.left_focused = false;
+        self.editing = true;
+        self.refresh_autocomplete();
+        self.notice = "Quoted selection into prompt.".into();
+    }
+
+    fn copy_active_selection(&mut self) {
+        let excerpt = self.active_scroll().extract_selection_text();
+        self.active_scroll_mut().clear_selection();
+        self.keyboard_select_mode = false;
+        self.editing = true;
+        let Some(text) = excerpt else {
+            return;
+        };
+        match clipboard::copy_text(&text) {
+            Ok(clipboard::CopyBackend::Osc52Only) => {
+                self.notice = "Copied selection to terminal clipboard (OSC 52).".into();
+            }
+            Ok(_) => {
+                self.notice = "Copied selection to clipboard.".into();
+            }
+            Err(error) => {
+                self.notice = format!("Clipboard unavailable: {error}");
+            }
+        }
+    }
+
+    fn start_keyboard_selection(&mut self) {
+        if self.view_tab != ViewTab::Chat {
+            self.set_view_tab(ViewTab::Chat);
+        }
+        if self.keyboard_select_mode {
+            self.keyboard_select_mode = false;
+            self.active_scroll_mut().clear_selection();
+            self.editing = true;
+            self.notice = "Exited selection mode.".into();
+            return;
+        }
+        let total = self.active_scroll().total_lines();
+        if total == 0 {
+            self.notice = "No transcript lines to select yet.".into();
+            return;
+        }
+        let offset = self.active_scroll().offset();
+        let vh = self.active_scroll().viewport_height().max(1);
+        let line = offset
+            .saturating_add(vh.saturating_sub(2))
+            .min(total.saturating_sub(1));
+        self.active_scroll_mut().set_selection(
+            DocPos { line, col: 0 },
+            DocPos { line, col: 1 },
+            false,
+        );
+        self.keyboard_select_mode = true;
+        self.rail_focused = false;
+        self.left_focused = false;
+        self.editing = false;
+        self.notice =
+            "Select mode: ↑↓←→ extend · Space anchor · Enter actions · q Quote · c Copy · Esc exit"
+                .into();
+    }
+
+    fn handle_keyboard_selection_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl || alt {
+            return false;
+        }
+        let total = self.active_scroll().total_lines();
+        let max_line = total.saturating_sub(1);
+        let max_col = self.transcript_area.width.saturating_sub(1) as usize;
+        let current = self
+            .active_scroll()
+            .selection()
+            .map(|s| (s.anchor, s.focus))
+            .unwrap_or((
+                DocPos {
+                    line: self.active_scroll().offset().min(max_line),
+                    col: 0,
+                },
+                DocPos {
+                    line: self.active_scroll().offset().min(max_line),
+                    col: 1,
+                },
+            ));
+        let (mut anchor, mut focus) = current;
+
+        match key.code {
+            KeyCode::Esc => {
+                self.keyboard_select_mode = false;
+                self.active_scroll_mut().clear_selection();
+                self.editing = true;
+                self.notice.clear();
+                return true;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.quote_active_selection();
+                return true;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.copy_active_selection();
+                return true;
+            }
+            KeyCode::Enter => {
+                self.keyboard_select_mode = false;
+                self.active_scroll_mut().set_selection(anchor, focus, true);
+                return true;
+            }
+            KeyCode::Char(' ') => {
+                anchor = focus;
+                let next_col = focus.col.saturating_add(1).min(max_col.max(1));
+                focus.col = next_col;
+                self.active_scroll_mut().set_selection(anchor, focus, false);
+                return true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                focus.line = focus.line.saturating_sub(1);
+                if focus.line < self.active_scroll().offset() {
+                    self.active_scroll_mut().scroll_up(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                focus.line = focus.line.saturating_add(1).min(max_line);
+                let bottom_vis = self
+                    .active_scroll()
+                    .offset()
+                    .saturating_add(self.active_scroll().viewport_height().saturating_sub(1));
+                if focus.line > bottom_vis {
+                    self.active_scroll_mut().scroll_down(1);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                focus.col = focus.col.saturating_sub(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                focus.col = focus.col.saturating_add(1).min(max_col.max(1));
+            }
+            KeyCode::Home => {
+                focus.col = 0;
+            }
+            KeyCode::End => {
+                focus.col = max_col.max(1);
+            }
+            _ => return false,
+        }
+        if anchor == focus {
+            focus.col = focus.col.saturating_add(1);
+        }
+        self.active_scroll_mut().set_selection(anchor, focus, false);
+        true
+    }
+
+    fn open_viewport_link(&mut self) {
+        let links = self.active_scroll().links_in_viewport();
+        let Some((_, target)) = links.last() else {
+            self.notice = "No clickable links visible in chat.".into();
+            return;
+        };
+        let workspace = self.live.as_ref().map(|live| live.workspace.clone());
+        match clipboard::open_external(target, workspace.as_deref()) {
+            Ok(_) => self.notice = format!("Opened {target}"),
+            Err(error) => self.notice = format!("Cannot open {target}: {error}"),
+        }
+    }
+
+    fn cancel_vault_modal(&mut self) {
+        let Some(mut modal) = self.vault_modal.take() else {
+            return;
+        };
+        modal.secret_input.clear();
+        if let Some(req_id) = modal.request_id {
+            if let Some(ui_bridge) = self
+                .live
+                .as_ref()
+                .and_then(|live| live.bridge.as_deref())
+                .and_then(bridge::LoopbackBridge::ui_bridge)
+            {
+                ui_bridge.resolve_vault_request(
+                    &req_id,
+                    bridge::VaultRequestOutcome {
+                        status: bridge::VaultRequestStatus::Cancelled,
+                        name: modal.name,
+                        namespace: modal.namespace,
+                        sha256_8: None,
+                    },
+                );
+            }
+        }
+        self.editing = true;
+    }
+
+    fn handle_vault_modal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let Some(mode) = self.vault_modal.as_ref().map(|m| m.mode) else {
+            return;
+        };
+        match mode {
+            VaultModalMode::List => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.cancel_vault_modal();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(modal) = &mut self.vault_modal {
+                        modal.selected = modal.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(modal) = &mut self.vault_modal {
+                        let max_idx = modal.entries.len().saturating_sub(1);
+                        modal.selected = modal.selected.saturating_add(1).min(max_idx);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(modal) = &mut self.vault_modal {
+                        if let Some(entry) = modal.entries.get(modal.selected).cloned() {
+                            modal.mode = VaultModalMode::PromptSecret;
+                            modal.request_id = None;
+                            modal.name = entry.name;
+                            modal.namespace = entry.namespace;
+                            modal.description = entry.description;
+                            modal.secret_input.clear();
+                            modal.error = None;
+                        } else {
+                            self.notice = "Run `/vault set NAME` to add a secret.".into();
+                        }
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    let target = self
+                        .vault_modal
+                        .as_ref()
+                        .and_then(|m| m.entries.get(m.selected))
+                        .map(|e| (e.name.clone(), e.namespace.clone()));
+                    if let Some((name, namespace)) = target {
+                        let store = self.live.as_ref().and_then(|live| live.vault_store.clone());
+                        if let Some(store) = store {
+                            match store.delete(&name, Some(&namespace)) {
+                                Ok(true) => {
+                                    let refreshed = store.list(None).unwrap_or_default();
+                                    if let Some(modal) = &mut self.vault_modal {
+                                        modal.entries = refreshed;
+                                        modal.selected = modal
+                                            .selected
+                                            .min(modal.entries.len().saturating_sub(1));
+                                    }
+                                    self.notice = format!("Deleted secret {namespace}/{name}.");
+                                }
+                                Ok(false) => {
+                                    self.notice = format!("Secret {namespace}/{name} not found.");
+                                }
+                                Err(err) => {
+                                    self.notice = format!("Vault delete failed: {err}");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            VaultModalMode::PromptSecret => {
+                if (ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+                    || (alt && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+                {
+                    self.paste_from_clipboard();
+                    return;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        self.cancel_vault_modal();
+                        self.notice = "Cancelled vault secret prompt.".into();
+                    }
+                    KeyCode::Backspace | KeyCode::Delete => {
+                        if let Some(modal) = &mut self.vault_modal {
+                            modal.secret_input.pop();
+                            modal.error = None;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let Some(modal_snapshot) = self.vault_modal.as_ref().map(|m| {
+                            (
+                                m.request_id.clone(),
+                                m.name.clone(),
+                                m.namespace.clone(),
+                                m.description.clone(),
+                                Zeroizing::new(m.secret_input.clone()),
+                            )
+                        }) else {
+                            return;
+                        };
+                        let (request_id, name, namespace, description, secret_val) = modal_snapshot;
+                        if secret_val.is_empty() {
+                            if let Some(modal) = &mut self.vault_modal {
+                                modal.error = Some("Secret value cannot be empty.".into());
+                            }
+                            return;
+                        }
+                        let store = self
+                            .live
+                            .as_ref()
+                            .and_then(|live| live.vault_store.clone())
+                            .or_else(|| {
+                                self.live
+                                    .as_ref()
+                                    .and_then(|live| live.profile_root.clone())
+                                    .map(vault::VaultStore::open)
+                            });
+                        let Some(store) = store else {
+                            if let Some(modal) = &mut self.vault_modal {
+                                modal.error =
+                                    Some("Vault store unavailable in preview mode.".into());
+                            }
+                            return;
+                        };
+                        match store.set(
+                            &name,
+                            secret_val,
+                            Some(&namespace),
+                            (!description.trim().is_empty()).then_some(description.as_str()),
+                        ) {
+                            Ok(meta) => {
+                                if let Some(mut closed) = self.vault_modal.take() {
+                                    closed.secret_input.clear();
+                                }
+                                if let Some(req_id) = request_id {
+                                    if let Some(ui_bridge) = self
+                                        .live
+                                        .as_ref()
+                                        .and_then(|live| live.bridge.as_deref())
+                                        .and_then(bridge::LoopbackBridge::ui_bridge)
+                                    {
+                                        ui_bridge.resolve_vault_request(
+                                            &req_id,
+                                            bridge::VaultRequestOutcome {
+                                                status: bridge::VaultRequestStatus::Saved,
+                                                name: meta.name.clone(),
+                                                namespace: meta.namespace.clone(),
+                                                sha256_8: Some(meta.sha256_8.clone()),
+                                            },
+                                        );
+                                    }
+                                }
+                                self.editing = true;
+                                self.notice = format!(
+                                    "Saved secret {}/{} (sha256:{}).",
+                                    meta.namespace, meta.name, meta.sha256_8
+                                );
+                            }
+                            Err(err) => {
+                                if let Some(modal) = &mut self.vault_modal {
+                                    modal.error = Some(err.to_string());
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        if let Some(modal) = &mut self.vault_modal {
+                            modal.secret_input.push(c);
+                            modal.error = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     pub fn scroll_mouse(&mut self, col: u16, row: u16, delta: isize) {
+        if let Some(modal) = &mut self.vault_modal {
+            if modal.mode == VaultModalMode::List && !modal.entries.is_empty() {
+                let max_idx = modal.entries.len().saturating_sub(1);
+                if delta < 0 {
+                    modal.selected = modal.selected.saturating_sub(delta.unsigned_abs());
+                } else if delta > 0 {
+                    modal.selected = modal.selected.saturating_add(delta as usize).min(max_idx);
+                }
+            }
+            return;
+        }
+        if let Some(modal) = &mut self.inbox_modal {
+            if delta < 0 {
+                modal.scroll = modal.scroll.saturating_sub(delta.unsigned_abs() as u16);
+            } else if delta > 0 {
+                modal.scroll = modal.scroll.saturating_add(delta as u16);
+            }
+            return;
+        }
+        if let Some(viewer) = &mut self.ledger_viewer {
+            if delta < 0 {
+                viewer.scroll = viewer.scroll.saturating_sub(delta.unsigned_abs() as u16);
+            } else if delta > 0 {
+                viewer.scroll = viewer.scroll.saturating_add(delta as u16);
+            }
+            return;
+        }
         if self.panel.is_some() {
             self.panel_scroll(delta);
             return;
@@ -1500,6 +2212,7 @@ impl App {
     pub(crate) fn handle_key_single_canvas(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         if ctrl && key.code == KeyCode::Char('q') {
             self.interrupt_all_runs();
@@ -1507,6 +2220,21 @@ impl App {
             return;
         }
         if ctrl && key.code == KeyCode::Char('c') {
+            if self.vault_modal.is_some() {
+                self.cancel_vault_modal();
+                return;
+            }
+            if self.inbox_modal.is_some() {
+                let _ = self.save_inbox_draft();
+                self.inbox_modal = None;
+                self.editing = self.view_tab == ViewTab::Chat;
+                return;
+            }
+            if self.ledger_viewer.is_some() {
+                self.close_ledger_document();
+                self.editing = self.view_tab == ViewTab::Chat;
+                return;
+            }
             if self.panel.is_some() {
                 self.panel = None;
                 self.editing = true;
@@ -1522,6 +2250,10 @@ impl App {
                 self.editing = true;
                 return;
             }
+            if self.view_tab == ViewTab::Chat && self.active_scroll().has_selection() {
+                self.copy_active_selection();
+                return;
+            }
             if !self.composer.is_empty() && !self.ctrl_c_armed_active() {
                 self.composer.clear();
                 self.input.clear();
@@ -1532,6 +2264,24 @@ impl App {
             }
             self.interrupt_all_runs();
             self.quit = true;
+            return;
+        }
+
+        if self.vault_modal.is_some() {
+            self.handle_vault_modal_key(key);
+            return;
+        }
+
+        if self.inbox_modal.is_some() {
+            if (ctrl || alt) && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                self.paste_from_clipboard();
+            } else {
+                let _ = self.handle_inbox_modal_key(key);
+            }
+            return;
+        }
+
+        if self.ledger_viewer.is_some() && self.handle_ledger_viewer_key(key) {
             return;
         }
 
@@ -1567,6 +2317,52 @@ impl App {
             return;
         }
 
+        if self.view_tab == ViewTab::Chat && self.active_scroll().popover_open() {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl && !alt => {
+                    self.quote_active_selection();
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') if !ctrl && !alt => {
+                    self.copy_active_selection();
+                    return;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    self.active_scroll_mut().toggle_popover_button();
+                    return;
+                }
+                KeyCode::Enter => {
+                    let focused = self
+                        .active_scroll()
+                        .selection()
+                        .map(|s| s.focused_button)
+                        .unwrap_or(SelectionButton::Quote);
+                    match focused {
+                        SelectionButton::Quote => self.quote_active_selection(),
+                        SelectionButton::Copy => self.copy_active_selection(),
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.active_scroll_mut().clear_selection();
+                    self.keyboard_select_mode = false;
+                    self.editing = true;
+                    return;
+                }
+                _ => {
+                    self.active_scroll_mut().clear_selection();
+                    self.keyboard_select_mode = false;
+                }
+            }
+        }
+
+        if self.keyboard_select_mode
+            && self.view_tab == ViewTab::Chat
+            && self.handle_keyboard_selection_key(key)
+        {
+            return;
+        }
+
         if self.handle_view_key(key) {
             return;
         }
@@ -1586,8 +2382,25 @@ impl App {
             }
         }
 
+        if alt && !ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+            self.paste_from_clipboard();
+            return;
+        }
+
         if ctrl && !alt {
             match key.code {
+                KeyCode::Char('S') | KeyCode::Char('s') if shift => {
+                    self.start_keyboard_selection();
+                    return;
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    self.open_viewport_link();
+                    return;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    self.paste_from_clipboard();
+                    return;
+                }
                 KeyCode::Char('p') => {
                     self.open_command_palette();
                     return;
@@ -1655,6 +2468,11 @@ impl App {
                 return;
             }
             KeyCode::Esc => {
+                if self.active_scroll().has_selection() {
+                    self.active_scroll_mut().clear_selection();
+                    self.keyboard_select_mode = false;
+                    return;
+                }
                 if self.autocomplete.is_open() {
                     self.autocomplete.close();
                     return;
@@ -1844,6 +2662,25 @@ impl App {
     }
 
     pub(crate) fn handle_click_single_canvas(&mut self, x: u16, y: u16) {
+        if self.vault_modal.is_some() {
+            let full_w = self.last_frame_width.max(80);
+            let modal_rect = crate::tui::render::vault_modal_rect(Rect::new(0, 0, full_w, 40));
+            if modal_rect.width > 0 && (x < modal_rect.x || x >= modal_rect.right()) {
+                self.cancel_vault_modal();
+            }
+            return;
+        }
+        if self.inbox_modal.is_some() || self.ledger_viewer.is_some() {
+            if let Some((_, hit)) = self
+                .left_hits
+                .iter()
+                .find(|(rect, _)| rect_contains(*rect, x, y))
+                .copied()
+            {
+                self.handle_tab_hit(hit);
+            }
+            return;
+        }
         if self.panel.is_some() {
             self.panel_click(x, y);
             return;
@@ -1866,6 +2703,15 @@ impl App {
             self.input = self.composer.text().to_owned();
             self.refresh_autocomplete();
             return;
+        }
+        if self.view_tab == ViewTab::Chat {
+            if let Some(button) = self.active_scroll().hit_test_popover(x, y) {
+                match button {
+                    SelectionButton::Quote => self.quote_active_selection(),
+                    SelectionButton::Copy => self.copy_active_selection(),
+                }
+                return;
+            }
         }
 
         let point = Position::new(x, y);
@@ -1968,21 +2814,7 @@ impl App {
             return;
         }
 
-        if self.view_tab != crate::tui::tabs::ViewTab::Chat {
-            return;
-        }
-        let name = self.crew[self.selected].name.clone();
-        let hit_action = if name == specialists::COMMANDER {
-            self.scroll.hit_test(x, y).cloned()
-        } else {
-            self.specialist_scrolls
-                .get(&name)
-                .and_then(|s| s.hit_test(x, y))
-                .cloned()
-        };
-        if let Some(action) = hit_action {
-            self.handle_transcript_hit(&name, action);
-        }
+        self.dispatch_transcript_click(x, y);
     }
 
     fn handle_transcript_hit(&mut self, thread_name: &str, action: TranscriptHitAction) {
@@ -2016,6 +2848,13 @@ impl App {
             TranscriptHitAction::SelectDelegation { worker } => {
                 if let Some(idx) = specialists::find(&self.crew, &worker) {
                     self.select_member_thread(idx);
+                }
+            }
+            TranscriptHitAction::OpenLink { target } => {
+                let workspace = self.live.as_ref().map(|live| live.workspace.clone());
+                match clipboard::open_external(&target, workspace.as_deref()) {
+                    Ok(_) => self.notice = format!("Opened {target}"),
+                    Err(error) => self.notice = format!("Cannot open {target}: {error}"),
                 }
             }
         }
@@ -2063,6 +2902,7 @@ impl App {
                     .push(TranscriptEntry::UserMessage {
                         text: clean.to_owned(),
                         timestamp: at,
+                        attachments: Vec::new(),
                     });
             }
             "SYSTEM" | "SNOOZED" => {
@@ -2122,13 +2962,67 @@ impl App {
             .unwrap_or_default();
         let gh_ctx = crate::github::gh_prompt_context(&self.github_status);
         let workers = specialists::roster_summary(&self.crew);
-        let tools_summary = "spawn_worker, message_worker, read_worker, list_workers, interrupt_worker, ask_user, remember, search_memory, github_pr_*, github_issue_*";
+        let mut active_tools = vec![
+            "spawn_worker",
+            "message_worker",
+            "read_worker",
+            "list_workers",
+            "interrupt_worker",
+            "ask_user",
+            "remember",
+            "search_memory",
+            "env_status",
+            "inbox_list",
+            "inbox_post",
+            "inbox_submit_decision",
+            "inbox_update_decision",
+            "inbox_dismiss",
+            "ledger_list",
+            "ledger_record",
+            "ledger_update",
+            "ledger_read_doc",
+            "ledger_append_doc",
+            "ui_post_table",
+            "ui_post_card",
+        ];
+        if live.vault_store.is_some() || live.bridge.as_deref().is_some_and(|b| b.vault().is_some())
+        {
+            active_tools.extend(["vault_list", "vault_check", "vault_request", "vault_delete"]);
+        }
+        if live.memory_store.is_some()
+            || live.bridge.as_deref().is_some_and(|b| b.memory().is_some())
+        {
+            active_tools.extend([
+                "memory_search",
+                "memory_write",
+                "memory_supersede",
+                "memory_delete",
+            ]);
+        }
+        if live.evolution_store.is_some()
+            || live
+                .bridge
+                .as_deref()
+                .is_some_and(|b| b.evolution().is_some())
+        {
+            active_tools.extend([
+                "bot_scorecard",
+                "bot_forge",
+                "bot_record_feedback",
+                "bot_evolve",
+                "bot_decommission",
+            ]);
+        }
+        if self.github_status.authenticated {
+            active_tools.extend(["github_pr_*", "github_issue_*"]);
+        }
+        let tools_summary = active_tools.join(", ");
         let system = crate::soul::commander_system_prompt(
             &soul_text,
             &live.workspace,
             gh_ctx.as_deref(),
             Some(&workers),
-            Some(tools_summary),
+            Some(&tools_summary),
         );
         let mut sections = vec![system];
         if !live.recent_shell_context.is_empty() {
@@ -2901,5 +3795,247 @@ mod tests {
         assert!(is_session_not_found_error(
             "warning: conversation \"184b62a6\" not found"
         ));
+    }
+
+    #[test]
+    fn mouse_drag_selection_and_popover_quote_copy_and_keyboard_parity_work() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App {
+            show_welcome: false,
+            ..App::default()
+        };
+        app.transcript.push_user("Show status", None);
+        app.transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "Highlight this exact sentence for quoting.".into(),
+            streaming: false,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let target_row = (0..28u16)
+            .find(|&y| {
+                let row: String = (0..100u16).map(|x| buf[(x, y)].symbol()).collect();
+                row.contains("Highlight this exact")
+            })
+            .expect("assistant row visible");
+        let start_col = (0..90u16)
+            .find(|&x| {
+                let slice: String = (0..5u16)
+                    .map(|d| buf[(x + d, target_row)].symbol())
+                    .collect();
+                slice == "exact"
+            })
+            .expect("exact col");
+        let end_col = start_col + "exact sentence".len() as u16 - 1;
+
+        app.mouse_down(start_col, target_row);
+        app.mouse_drag(end_col, target_row);
+        app.mouse_up(end_col, target_row);
+        assert!(app.scroll.popover_open());
+        assert_eq!(
+            app.scroll.extract_selection_text().as_deref(),
+            Some("exact sentence")
+        );
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let quote_rect = app.scroll.popover_rects().quote;
+        assert!(quote_rect.width > 0);
+
+        app.open_command_palette();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.scroll.popover_rects().container.width, 0);
+        app.palette.close();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let quote_rect = app.scroll.popover_rects().quote;
+        assert!(quote_rect.width > 0);
+
+        app.mouse_down(quote_rect.x + 1, quote_rect.y);
+        assert!(!app.scroll.popover_open());
+        assert!(app.editing);
+        assert!(app.composer.text().contains("> exact sentence"));
+
+        app.composer.clear();
+        app.input.clear();
+        app.handle_key_single_canvas(KeyEvent::new(
+            KeyCode::Char('S'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.keyboard_select_mode);
+        app.handle_key_single_canvas(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.keyboard_select_mode);
+        assert!(!app.scroll.has_selection());
+    }
+
+    #[test]
+    fn paste_text_or_image_attaches_image_chip_and_renders_composer_badge() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let dir =
+            std::env::temp_dir().join(format!("ac-wave2c-img-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_root = dir.join("state");
+        let img_path = dir.join("shot.png");
+        let png = clipboard::encode_rgba_to_png(2, 2, &[0x44; 16]).unwrap();
+        std::fs::write(&img_path, png).unwrap();
+
+        let mut live = crate::Live::new(dir.clone(), Vec::new(), None);
+        live.profile_root = Some(state_root);
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        app.paste_text_or_image(&img_path.to_string_lossy());
+        assert_eq!(app.composer.images().len(), 1, "notice: {}", app.notice);
+        assert!(app.composer.text().contains("[Image #1 · shot.png]"));
+
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buf = terminal.backend().buffer();
+            let text: String = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("[Image #1 · shot.png]"), "{w}x{h}:\n{text}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vault_modal_masks_secret_input_and_saves_without_leaking_plaintext() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let root =
+            std::env::temp_dir().join(format!("ac-wave2c-vault-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state_root = root.join("state");
+        let store = vault::VaultStore::open(state_root.clone());
+        let mut live = crate::Live::new(root.clone(), Vec::new(), None);
+        live.profile_root = Some(state_root);
+        live.vault_store = Some(store.clone());
+
+        let mut app = App {
+            live: Some(live),
+            vault_modal: Some(crate::tui::tabs::VaultModalState {
+                mode: VaultModalMode::PromptSecret,
+                entries: Vec::new(),
+                selected: 0,
+                request_id: None,
+                name: "API_TOKEN".into(),
+                namespace: "global".into(),
+                description: "Test secret".into(),
+                secret_input: String::new(),
+                error: None,
+            }),
+            ..App::default()
+        };
+
+        let raw_secret = "super-secret-value-9911";
+        for ch in raw_secret.chars() {
+            app.handle_key_single_canvas(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buf = terminal.backend().buffer();
+            let rendered: String = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("Vault · Store Secret"), "{rendered}");
+            assert!(rendered.contains("••••"), "{rendered}");
+            assert!(
+                !rendered.contains(raw_secret),
+                "raw secret leaked into TUI buffer!"
+            );
+        }
+
+        app.handle_key_single_canvas(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.vault_modal.is_none(),
+            "vault error: {:?}",
+            app.vault_modal.as_ref().and_then(|m| m.error.as_deref())
+        );
+        assert!(!app.notice.contains(raw_secret));
+        assert!(app.notice.contains("API_TOKEN"));
+        assert!(app.notice.contains("sha256:"));
+        let metas = store.list(None).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "API_TOKEN");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn right_rail_shows_bot_badges_hides_decommissioned_and_sixel_occlusion_skips_cells() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let root =
+            std::env::temp_dir().join(format!("ac-wave2c-sixel-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let profile = crate::auth::Profile::system_default(root.clone(), Provider::Claude);
+        let mut live = crate::Live::new(root.clone(), vec![profile], None);
+        live.allowances = vec![usage::Allowance {
+            five: Some(64.0),
+            week: Some(40.0),
+            reset_in: Some(3600),
+            latched: false,
+            stale: false,
+        }];
+        live.signed_in = vec![true];
+
+        let mut app = App {
+            live: Some(live),
+            rail_open: true,
+            ..App::default()
+        };
+        app.graphics.sixel = true;
+        app.crew
+            .push(specialists::Member::new("scout", "Research", None, None));
+        app.crew.push(specialists::Member::new(
+            "retired-bot",
+            "Legacy",
+            None,
+            None,
+        ));
+        app.bot_badges.insert("scout".into(), "PROB".into());
+        app.decommissioned_bots.insert("retired-bot".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rail: String = (0..40u16)
+            .map(|y| {
+                (106..140u16)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rail.contains("scout"), "{rail}");
+        assert!(rail.contains("[PROB]"), "{rail}");
+        assert!(!rail.contains("retired-bot"), "{rail}");
+
+        assert!(
+            !app.pending_sixel_rings.is_empty(),
+            "expected Sixel ring slot in left usage deck"
+        );
+        let slot = app.pending_sixel_rings[0].rect;
+        assert!(slot.bottom() < 40);
+
+        app.open_settings();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            app.pending_sixel_rings.is_empty(),
+            "panel overlay must occlude Sixel ring slots"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,14 +1,18 @@
-use crate::{editor, App};
+use crate::{editor, token_burn::SixelRingCache, App};
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use std::{
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     process::Command,
     time::Duration,
@@ -144,7 +148,7 @@ pub(crate) fn dispatch_input_batch(app: &mut App, events: Vec<Event>) {
         }
         let cleaned = strip_bracketed_paste_markers(&combined);
         if !cleaned.is_empty() {
-            app.paste(&cleaned);
+            app.paste_text_or_image(&cleaned);
         }
         return;
     }
@@ -152,15 +156,24 @@ pub(crate) fn dispatch_input_batch(app: &mut App, events: Vec<Event>) {
     for ev in events {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
-            Event::Paste(text) => app.paste(&strip_bracketed_paste_markers(&text)),
+            Event::Paste(text) => {
+                let cleaned = strip_bracketed_paste_markers(&text);
+                if cleaned.is_empty() {
+                    app.paste_from_clipboard();
+                } else {
+                    app.paste_text_or_image(&cleaned);
+                }
+            }
             Event::Mouse(m) => match m.kind {
-                MouseEventKind::Down(MouseButton::Left) => app.click(m.column, m.row),
+                MouseEventKind::Down(MouseButton::Left) => app.mouse_down(m.column, m.row),
+                MouseEventKind::Drag(MouseButton::Left) => app.mouse_drag(m.column, m.row),
+                MouseEventKind::Up(MouseButton::Left) => app.mouse_up(m.column, m.row),
                 MouseEventKind::ScrollUp => app.scroll_mouse(m.column, m.row, -3),
                 MouseEventKind::ScrollDown => app.scroll_mouse(m.column, m.row, 3),
                 _ => {}
             },
             Event::Resize(_, _) => {
-                app.full_redraw = false;
+                app.full_redraw = true;
             }
             _ => {}
         }
@@ -184,8 +197,9 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
         Some(("mcp", rest)) => return crate::mcp::run(rest),
         Some(("model", rest)) => return crate::native::run(rest),
         Some(("specialist", rest)) => return crate::specialists::run(rest),
-        Some(("update", rest)) => return crate::update::run(rest),
         Some(("triage", rest)) => return crate::triage::run(rest),
+        Some(("update", rest)) => return crate::update::run(rest),
+        Some(("vault", rest)) => return crate::vault::run(rest),
         _ => {}
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -200,6 +214,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
              \x20      agent-command mcp [--root PATH] [--scope supervised|read-only]\n\
              \x20      agent-command model {{show|pin PROVIDER PROFILE MODEL [EFFORT]|unpin PROVIDER PROFILE}}\n\
              \x20      agent-command specialist {{list|spawn NAME ROLE [--mode MODE] [TASK]|review NAME [--next-revision] [FOCUS]|status NAME|diff NAME|pr NAME [--commit]|settle NAME|unsettle NAME|remove NAME}}\n\
+             \x20      agent-command vault {{list|check NAME...|set NAME --stdin|delete NAME|reveal NAME --confirm}}\n\
              \x20      agent-command update\n\
              \x20      agent-command triage [--json] [--pipe claude|codex|gemini]\n\n\
              Interactive Single-Canvas TUI:\n\
@@ -238,14 +253,17 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     let mut exit_message = None;
     let mut relaunch_executable = None;
 
+    let graphics = crate::tui::graphics::probe_terminal_graphics();
     install_panic_restore_hook();
     let mut terminal = ratatui::init();
     let result = (|| {
         execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         let workspace = std::env::current_dir()?;
         let mut app = App::live_fast(workspace);
+        app.graphics = graphics;
         app.attach_fast(Box::new(crate::panel::TerminalHost), launch);
         app.start_background_probes();
+        let mut sixel_cache = SixelRingCache::default();
 
         while !app.quit {
             if !app.mission_running()
@@ -271,13 +289,41 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
                 app.full_redraw = true;
             }
 
-            if std::mem::take(&mut app.full_redraw) {
+            let force_redraw = std::mem::take(&mut app.full_redraw);
+            if force_redraw {
                 terminal.clear()?;
+                sixel_cache.clear();
             }
-            terminal.draw(|f| app.draw(f))?;
+            app.pending_sixel_rings.clear();
+            if app.graphics.use_sixel() {
+                let mut stdout = io::stdout();
+                let _ = execute!(stdout, BeginSynchronizedUpdate);
+                let draw_result = terminal.draw(|f| app.draw(f));
+                if draw_result.is_ok() {
+                    let update = sixel_cache.diff_and_encode(
+                        &app.pending_sixel_rings,
+                        app.graphics.cell_px,
+                        force_redraw,
+                    );
+                    if !update.sequences.is_empty() {
+                        for (x, y, payload) in &update.sequences {
+                            let _ = execute!(stdout, MoveTo(*x, *y));
+                            let _ = stdout.write_all(payload.as_bytes());
+                        }
+                        let _ = stdout.flush();
+                    }
+                }
+                let _ = execute!(stdout, EndSynchronizedUpdate);
+                draw_result?;
+            } else {
+                terminal.draw(|f| app.draw(f))?;
+            }
 
             if event::poll(Duration::from_millis(33))? {
                 let batch = drain_input_batch()?;
+                if batch.iter().any(|ev| matches!(ev, Event::Resize(_, _))) {
+                    sixel_cache.clear();
+                }
                 dispatch_input_batch(&mut app, batch);
             }
         }

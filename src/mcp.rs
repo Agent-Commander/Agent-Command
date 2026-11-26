@@ -1,15 +1,31 @@
 use crate::{
-    bridge::{AskUserBroker, AskUserRequest, ExternalCallResult, ExternalToolCatalog},
+    bridge::{
+        decision_meaning_fingerprint, AskUserBroker, AskUserRequest, ExternalCallResult,
+        ExternalToolCatalog, UiBridge, UiDecisionOption, UiDecisionPatch, UiDecisionRecord,
+        UiInboxItem, UiInfoCard, UiTableCard, VaultRequestStatus, VaultSecretRequest,
+    },
     connect,
     control::{self, Brief, Control, Failure, Scope, SpawnWorkerRequest},
+    evolution::{
+        BotCharter, EvolutionStore, FailureMode, ForgeBotRequest, MutateBotRequest, OutcomeSignal,
+        WorkClass, MAX_PROBATION_RUNS, MIN_PROBATION_RUNS,
+    },
+    ledger::{Ledger, LedgerDocument, LedgerFilter, TaskKind, TaskStatus, TaskUpdate},
+    memory::{
+        MemoryKind, MemoryOrigin, MemoryScope, MemoryStore, TombstoneReason, WriteMemoryInput,
+        DEFAULT_SEARCH_LIMIT, DEFAULT_TOKEN_BUDGET, MAX_ACTIVE_ENTRIES, MAX_BODY_CHARS,
+        MAX_BOT_ID_CHARS, MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS,
+    },
     permissions::PermissionMode,
-    soul::SoulStore,
+    soul::{self, SoulStore},
+    vault::{self, VaultStore},
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use std::{
+    fs,
     io::{self, BufRead, Write},
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex, PoisonError},
     thread,
@@ -25,6 +41,13 @@ const DEFAULT_GITHUB_LIMIT: usize = 20;
 const MAX_MEMORY_LIMIT: usize = 50;
 const DEFAULT_MEMORY_LIMIT: usize = 20;
 const MAX_ASK_CHOICES: usize = 3;
+const MAX_INBOX_LIMIT: usize = 100;
+const DEFAULT_INBOX_LIMIT: usize = 50;
+const MAX_LEDGER_DOC_BYTES: usize = 256 * 1024;
+const MAX_TABLE_COLUMNS: usize = 12;
+const MAX_TABLE_ROWS: usize = 100;
+const MAX_CARD_FIELDS: usize = 20;
+const MAX_VAULT_CHECK_NAMES: usize = 50;
 const ASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -32,7 +55,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-const READ_TOOLS: [&str; 14] = [
+const READ_TOOLS: [&str; 22] = [
     "list_threads",
     "search_threads",
     "read_thread",
@@ -47,6 +70,14 @@ const READ_TOOLS: [&str; 14] = [
     "github_pr_checks",
     "github_issue_list",
     "github_issue_view",
+    "env_status",
+    "inbox_list",
+    "ledger_list",
+    "ledger_read_doc",
+    "vault_list",
+    "vault_check",
+    "memory_search",
+    "bot_scorecard",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,6 +326,277 @@ struct GithubPrMergeArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct InboxListArguments {
+    include_dismissed: Option<bool>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxPostArguments {
+    title: String,
+    detail: String,
+    level: Option<String>,
+    thread: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionOptionInput {
+    id: String,
+    label: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    recommended: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxSubmitDecisionArguments {
+    id: Option<String>,
+    kind: Option<String>,
+    title: String,
+    question: String,
+    recommendation: String,
+    options: Vec<DecisionOptionInput>,
+    directions: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxUpdateDecisionArguments {
+    id: String,
+    expected_version: Option<u64>,
+    status: Option<String>,
+    title: Option<String>,
+    question: Option<String>,
+    recommendation: Option<String>,
+    options: Option<Vec<DecisionOptionInput>>,
+    directions: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxDismissArguments {
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerListArguments {
+    filter: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerRecordArguments {
+    kind: String,
+    owner: String,
+    title: String,
+    status: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerUpdateArguments {
+    id_or_owner: String,
+    status: String,
+    branch: Option<String>,
+    changed_files: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerReadDocArguments {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerAppendDocArguments {
+    path: String,
+    section: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiPostTableArguments {
+    title: String,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    alignments: Option<Vec<String>>,
+    caption: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CardFieldInput {
+    label: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiPostCardArguments {
+    title: String,
+    level: Option<String>,
+    badge: Option<String>,
+    fields: Option<Vec<CardFieldInput>>,
+    body_markdown: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultListArguments {
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultCheckArguments {
+    names: Vec<String>,
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultRequestArguments {
+    name: String,
+    title: String,
+    namespace: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultDeleteArguments {
+    name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySearchArguments {
+    scope: String,
+    bot_id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+    token_budget: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryWriteArguments {
+    scope: String,
+    bot_id: Option<String>,
+    kind: String,
+    title: String,
+    body: String,
+    tags: Option<Vec<String>>,
+    author: Option<String>,
+    salience: Option<f64>,
+    confidence: Option<f64>,
+    pinned: Option<bool>,
+    ttl_secs: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySupersedeArguments {
+    scope: String,
+    bot_id: Option<String>,
+    target_id: String,
+    kind: String,
+    title: String,
+    body: String,
+    tags: Option<Vec<String>>,
+    author: Option<String>,
+    salience: Option<f64>,
+    confidence: Option<f64>,
+    pinned: Option<bool>,
+    ttl_secs: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryDeleteArguments {
+    scope: String,
+    bot_id: Option<String>,
+    id: String,
+    reason: String,
+    actor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotScorecardArguments {
+    bot_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CharterInput {
+    job: String,
+    anti_jobs: Vec<String>,
+    #[serde(default)]
+    voice_and_style: String,
+    verification_bar: String,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    instructions: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotForgeArguments {
+    bot_id: String,
+    role: String,
+    work_class: String,
+    charter: CharterInput,
+    permission_mode: Option<String>,
+    preferred_model: Option<String>,
+    pinned_core: Option<bool>,
+    initial_memory_seeds: Option<Vec<String>>,
+    probation_runs: Option<u32>,
+    rationale: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotRecordFeedbackArguments {
+    bot_id: String,
+    signal: String,
+    task_id: Option<String>,
+    duration_ms: Option<u64>,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotEvolveArguments {
+    bot_id: String,
+    failure_mode: String,
+    task_summary: String,
+    root_cause: String,
+    patched_charter: CharterInput,
+    diff_summary: Vec<String>,
+    memory_correction: Option<String>,
+    probation_runs: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotDecommissionArguments {
+    bot_id: String,
+    reason: String,
+    confirmed: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallParams {
     name: String,
     #[serde(default)]
@@ -309,17 +611,32 @@ pub(crate) struct Server {
     soul: Option<SoulStore>,
     catalog: ExternalToolCatalog,
     ask_user: AskUserBroker,
+    ui: UiBridge,
+    vault: Option<VaultStore>,
+    memory: Option<MemoryStore>,
+    evolution: Option<EvolutionStore>,
     gh: Arc<dyn GhExecutor>,
 }
 
 impl Server {
     pub(crate) fn new(control: Control, scope: Scope) -> Self {
+        let profile_root = crate::auth::root().ok();
+        let memory = profile_root
+            .as_ref()
+            .map(|root| MemoryStore::for_workspace(root.clone(), control.root()));
+        let evolution = profile_root
+            .as_ref()
+            .map(|root| EvolutionStore::for_workspace(root.clone(), control.root()));
         Self {
             control,
             scope,
             soul: SoulStore::from_env(),
             catalog: ExternalToolCatalog::new(),
             ask_user: AskUserBroker::default(),
+            ui: UiBridge::new(),
+            vault: VaultStore::from_env().ok(),
+            memory,
+            evolution,
             gh: Arc::new(CliGhExecutor),
         }
     }
@@ -337,6 +654,33 @@ impl Server {
     pub(crate) fn with_ask_user(mut self, broker: AskUserBroker) -> Self {
         self.ask_user = broker;
         self
+    }
+
+    pub(crate) fn with_ui(mut self, ui: UiBridge) -> Self {
+        self.ui = ui;
+        self
+    }
+
+    pub(crate) fn with_vault(mut self, vault: VaultStore) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    pub(crate) fn with_memory(mut self, memory: MemoryStore) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    pub(crate) fn with_evolution(mut self, evolution: EvolutionStore) -> Self {
+        self.evolution = Some(evolution);
+        self
+    }
+
+    pub(crate) fn advertised_tool_names(&self) -> Vec<String> {
+        self.tools()
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
     }
 
     #[cfg(test)]
@@ -581,6 +925,35 @@ impl Server {
             "github_issue_view" => self.run_github_issue_view(parse(arguments)?),
             "github_issue_create" => self.run_github_issue_create(parse(arguments)?),
             "github_pr_merge" => self.run_github_pr_merge(parse(arguments)?),
+            "env_status" => {
+                let NoArguments {} = parse(arguments)?;
+                self.run_env_status()
+            }
+            "inbox_list" => self.run_inbox_list(parse(arguments)?),
+            "inbox_post" => self.run_inbox_post(parse(arguments)?),
+            "inbox_submit_decision" => self.run_inbox_submit_decision(parse(arguments)?),
+            "inbox_update_decision" => self.run_inbox_update_decision(parse(arguments)?),
+            "inbox_dismiss" => self.run_inbox_dismiss(parse(arguments)?),
+            "ledger_list" => self.run_ledger_list(parse(arguments)?),
+            "ledger_record" => self.run_ledger_record(parse(arguments)?),
+            "ledger_update" => self.run_ledger_update(parse(arguments)?),
+            "ledger_read_doc" => self.run_ledger_read_doc(parse(arguments)?),
+            "ledger_append_doc" => self.run_ledger_append_doc(parse(arguments)?),
+            "ui_post_table" => self.run_ui_post_table(parse(arguments)?),
+            "ui_post_card" => self.run_ui_post_card(parse(arguments)?),
+            "vault_list" => self.run_vault_list(parse(arguments)?),
+            "vault_check" => self.run_vault_check(parse(arguments)?),
+            "vault_request" => self.run_vault_request(parse(arguments)?),
+            "vault_delete" => self.run_vault_delete(parse(arguments)?),
+            "memory_search" => self.run_memory_search(parse(arguments)?),
+            "memory_write" => self.run_memory_write(parse(arguments)?),
+            "memory_supersede" => self.run_memory_supersede(parse(arguments)?),
+            "memory_delete" => self.run_memory_delete(parse(arguments)?),
+            "bot_scorecard" => self.run_bot_scorecard(parse(arguments)?),
+            "bot_forge" => self.run_bot_forge(parse(arguments)?),
+            "bot_record_feedback" => self.run_bot_record_feedback(parse(arguments)?),
+            "bot_evolve" => self.run_bot_evolve(parse(arguments)?),
+            "bot_decommission" => self.run_bot_decommission(parse(arguments)?),
             other => Err(ToolError::Rpc(RpcError::params(format!(
                 "Unknown tool: {other}"
             )))),
@@ -1075,6 +1448,1445 @@ impl Server {
             "url": inspect["url"].as_str().unwrap_or_default(),
         }))
     }
+
+    fn ledger_path(&self) -> Result<PathBuf, ToolError> {
+        if let Some(path) = self.ui.ledger_path() {
+            return Ok(path);
+        }
+        let root = crate::auth::root().map_err(|error| {
+            ToolError::Failed(format!("Failed to locate profile root: {error}"))
+        })?;
+        let directory = crate::auth::private_state_directory(&root, "agent-command-ledger-v1")
+            .map_err(|error| {
+                ToolError::Failed(format!("Failed to prepare ledger directory: {error}"))
+            })?;
+        Ok(directory.join("ledger.json"))
+    }
+
+    fn ledger_docs_dir(&self) -> Result<PathBuf, ToolError> {
+        if let Some(dir) = self.ui.ledger_docs_dir() {
+            return Ok(dir);
+        }
+        let root = crate::auth::root().map_err(|error| {
+            ToolError::Failed(format!("Failed to locate profile root: {error}"))
+        })?;
+        let directory = crate::auth::private_state_directory(&root, "agent-command-ledger-v1")
+            .map_err(|error| {
+                ToolError::Failed(format!("Failed to prepare ledger directory: {error}"))
+            })?;
+        Ok(directory.join("ledger-docs"))
+    }
+
+    fn run_env_status(&self) -> Result<Value, ToolError> {
+        let snapshot = self.ui.env_snapshot().unwrap_or_default();
+        let workspace = if snapshot.workspace.trim().is_empty() {
+            self.control.root().display().to_string()
+        } else {
+            snapshot.workspace
+        };
+        let workers = self.control.list();
+        let workers_running = workers.iter().filter(|worker| worker.running).count();
+        let (inbox_items, open_decisions) = self.ui.inbox_counts();
+        let (ledger_total, ledger_active) = match self.ledger_path() {
+            Ok(path) => {
+                let ledger = Ledger::load(&path);
+                (ledger.total(), ledger.active_count())
+            }
+            Err(_) => (0, 0),
+        };
+        let vault_secret_count = self
+            .vault
+            .as_ref()
+            .and_then(|store| store.count().ok())
+            .unwrap_or(0);
+        let mut payload = json!({
+            "scope": self.scope.label(),
+            "workspace": workspace,
+            "git_branch": snapshot.git_branch,
+            "git_dirty_files": snapshot.git_dirty_files,
+            "active_provider": snapshot.active_provider,
+            "active_profile": snapshot.active_profile,
+            "permission_mode": snapshot.permission_mode,
+            "profiles": snapshot.profiles,
+            "external_servers": snapshot.external_servers,
+            "external_tool_count": self.catalog.tool_count(),
+            "workers_total": workers.len(),
+            "workers_running": workers_running,
+            "inbox_items": inbox_items,
+            "open_decisions": open_decisions,
+            "ledger_total": ledger_total,
+            "ledger_active": ledger_active,
+            "vault_backend": VaultStore::backend_name(),
+            "vault_secret_count": vault_secret_count,
+            "mcp_tools": self.advertised_tool_names(),
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_inbox_list(&self, args: InboxListArguments) -> Result<Value, ToolError> {
+        let limit = bounded_inbox_limit(args.limit)?;
+        let include_dismissed = args.include_dismissed.unwrap_or(false);
+        let (items, decisions) = self.ui.list_inbox(include_dismissed, limit);
+        let count = items.len() + decisions.len();
+        Ok(json!({
+            "items": items,
+            "decisions": decisions,
+            "count": count,
+        }))
+    }
+
+    fn run_inbox_post(&self, args: InboxPostArguments) -> Result<Value, ToolError> {
+        control::bounded_text("title", &args.title, 200)?;
+        control::bounded_text("detail", &args.detail, control::MAX_TEXT_CHARS)?;
+        let level = validate_enum(
+            "level",
+            args.level.as_deref().unwrap_or("info"),
+            &["info", "attention", "warning", "error"],
+        )?;
+        let thread = match args.thread.as_deref() {
+            Some(value) => {
+                control::bounded_text("thread", value, 80)?;
+                vault::redact_values(value.trim())
+            }
+            None => "commander".into(),
+        };
+        let item = UiInboxItem {
+            key: format!("agent:{}", uuid::Uuid::new_v4().simple()),
+            kind: "agent_notice".into(),
+            title: vault::redact_values(args.title.trim()),
+            detail: vault::redact_values(args.detail.trim()),
+            thread,
+            level: level.into(),
+            needs_action: matches!(level, "attention" | "warning" | "error"),
+            dismissed: false,
+        };
+        self.ui.post_inbox_item(item.clone());
+        Ok(json!({
+            "posted": true,
+            "item": item,
+        }))
+    }
+
+    fn run_inbox_submit_decision(
+        &self,
+        args: InboxSubmitDecisionArguments,
+    ) -> Result<Value, ToolError> {
+        let id = match args.id.as_deref() {
+            Some(raw) => validate_decision_id(raw)?,
+            None => format!("DEC-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        };
+        let kind = validate_enum(
+            "kind",
+            args.kind.as_deref().unwrap_or("decision"),
+            &["decision", "design", "risk", "ops", "release"],
+        )?;
+        control::bounded_text("title", &args.title, 200)?;
+        control::bounded_text("question", &args.question, 1000)?;
+        control::bounded_text("recommendation", &args.recommendation, 1000)?;
+        let directions = validate_optional_text("directions", args.directions.as_deref(), 2000)?;
+        reject_placeholder_text("title", &args.title)?;
+        reject_placeholder_text("question", &args.question)?;
+        reject_placeholder_text("recommendation", &args.recommendation)?;
+        reject_placeholder_text("directions", &directions)?;
+        let options = validate_decision_options(args.options)?;
+
+        let title = vault::redact_values(args.title.trim());
+        let question = vault::redact_values(args.question.trim());
+        let recommendation = vault::redact_values(args.recommendation.trim());
+        let directions = vault::redact_values(&directions);
+        let meaning_fingerprint =
+            decision_meaning_fingerprint(&question, &recommendation, &options, &directions);
+        let record = UiDecisionRecord {
+            id,
+            kind: kind.into(),
+            title,
+            question,
+            recommendation,
+            options,
+            directions,
+            status: "open".into(),
+            record_version: 1,
+            meaning_fingerprint,
+            updated_at: chrono::Utc::now().timestamp(),
+        };
+        let saved = self.ui.submit_decision(record).map_err(ToolError::Failed)?;
+        Ok(json!({
+            "submitted": true,
+            "decision": saved,
+        }))
+    }
+
+    fn run_inbox_update_decision(
+        &self,
+        args: InboxUpdateDecisionArguments,
+    ) -> Result<Value, ToolError> {
+        let id = validate_decision_id(&args.id)?;
+        if args.status.is_none()
+            && args.title.is_none()
+            && args.question.is_none()
+            && args.recommendation.is_none()
+            && args.options.is_none()
+            && args.directions.is_none()
+        {
+            return Err(ToolError::invalid(
+                "Provide at least one decision field to update.",
+            ));
+        }
+        let status = match args.status.as_deref() {
+            Some(raw) => Some(
+                validate_enum(
+                    "status",
+                    raw,
+                    &["open", "deferred", "explain_more", "retired", "resolved"],
+                )?
+                .to_owned(),
+            ),
+            None => None,
+        };
+        let title = match args.title.as_deref() {
+            Some(raw) => {
+                control::bounded_text("title", raw, 200)?;
+                reject_placeholder_text("title", raw)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let question = match args.question.as_deref() {
+            Some(raw) => {
+                control::bounded_text("question", raw, 1000)?;
+                reject_placeholder_text("question", raw)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let recommendation = match args.recommendation.as_deref() {
+            Some(raw) => {
+                control::bounded_text("recommendation", raw, 1000)?;
+                reject_placeholder_text("recommendation", raw)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let options = match args.options {
+            Some(raw) => Some(validate_decision_options(raw)?),
+            None => None,
+        };
+        let directions = match args.directions.as_deref() {
+            Some(raw) => {
+                let clean = validate_optional_text("directions", Some(raw), 2000)?;
+                reject_placeholder_text("directions", &clean)?;
+                Some(vault::redact_values(&clean))
+            }
+            None => None,
+        };
+        let patch = UiDecisionPatch {
+            id,
+            expected_version: args.expected_version,
+            status,
+            title,
+            question,
+            recommendation,
+            options,
+            directions,
+        };
+        let updated = self.ui.update_decision(patch).map_err(ToolError::Failed)?;
+        Ok(json!({
+            "updated": true,
+            "decision": updated,
+        }))
+    }
+
+    fn run_inbox_dismiss(&self, args: InboxDismissArguments) -> Result<Value, ToolError> {
+        control::bounded_text("key", &args.key, 160)?;
+        let dismissed = self
+            .ui
+            .dismiss_inbox(&args.key)
+            .map_err(ToolError::Failed)?;
+        Ok(json!({
+            "dismissed": dismissed,
+            "key": args.key.trim(),
+        }))
+    }
+
+    fn run_ledger_list(&self, args: LedgerListArguments) -> Result<Value, ToolError> {
+        let filter_name = validate_enum(
+            "filter",
+            args.filter.as_deref().unwrap_or("all"),
+            &["all", "active", "attention", "done"],
+        )?;
+        let filter = match filter_name {
+            "active" => LedgerFilter::Active,
+            "attention" => LedgerFilter::Attention,
+            "done" => LedgerFilter::Done,
+            _ => LedgerFilter::All,
+        };
+        let limit = match args.limit {
+            None => 50,
+            Some(value) if (1..=200).contains(&value) => value,
+            Some(_) => {
+                return Err(ToolError::invalid("limit must be between 1 and 200."));
+            }
+        };
+        let path = self.ledger_path()?;
+        let ledger = Ledger::load(&path);
+        let mut entries: Vec<_> = ledger.filtered(filter).into_iter().cloned().collect();
+        entries.truncate(limit);
+        Ok(json!({
+            "filter": filter_name,
+            "entries": entries,
+            "total": ledger.total(),
+            "active": ledger.active_count(),
+        }))
+    }
+
+    fn ledger_state_dir(&self) -> Result<PathBuf, ToolError> {
+        let docs_dir = self.ledger_docs_dir()?;
+        if docs_dir
+            .file_name()
+            .is_some_and(|name| name == "ledger-docs")
+        {
+            if let Some(parent) = docs_dir.parent() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+        if let Some(parent) = self.ledger_path()?.parent() {
+            return Ok(parent.to_path_buf());
+        }
+        Ok(docs_dir)
+    }
+
+    fn run_ledger_record(&self, args: LedgerRecordArguments) -> Result<Value, ToolError> {
+        let kind = parse_task_kind(&args.kind)?;
+        control::bounded_text("owner", &args.owner, 80)?;
+        control::bounded_text("title", &args.title, 300)?;
+        let status = match args.status.as_deref() {
+            Some(raw) => Some(parse_task_status(raw)?),
+            None => None,
+        };
+        let branch = match args.branch.as_deref() {
+            Some(raw) => {
+                control::bounded_text("branch", raw, 120)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let path = self.ledger_path()?;
+        let mut ledger = Ledger::load(&path);
+        let now = chrono::Utc::now().timestamp();
+        let owner = args.owner.trim();
+        let clean_title = vault::redact_values(args.title.trim());
+        let id = ledger.record(kind, owner, &clean_title, now);
+        if status.is_some() || branch.is_some() {
+            let mut update = TaskUpdate::status(status.unwrap_or(TaskStatus::Running));
+            update.branch = branch;
+            ledger.update_latest_of_kind(owner, kind, &update, now);
+        }
+        ledger
+            .save(&path)
+            .map_err(|error| ToolError::Failed(format!("Failed to save ledger: {error}")))?;
+        let entry = ledger
+            .entries()
+            .iter()
+            .rev()
+            .find(|item| item.id == id)
+            .cloned();
+        if let Some(entry_ref) = entry.as_ref() {
+            let state_dir = self.ledger_state_dir()?;
+            let doc = LedgerDocument::from_entry(entry_ref, &clean_title);
+            ledger
+                .write_document(&state_dir, &id, &doc)
+                .map_err(|error| {
+                    ToolError::Failed(format!("Failed to write ledger document: {error}"))
+                })?;
+        }
+        self.ui.notify_ledger_changed();
+        Ok(json!({
+            "recorded": true,
+            "id": id,
+            "entry": entry,
+        }))
+    }
+
+    fn run_ledger_update(&self, args: LedgerUpdateArguments) -> Result<Value, ToolError> {
+        control::bounded_text("id_or_owner", &args.id_or_owner, 80)?;
+        let status = parse_task_status(&args.status)?;
+        let branch = match args.branch.as_deref() {
+            Some(raw) => {
+                control::bounded_text("branch", raw, 120)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let path = self.ledger_path()?;
+        let mut ledger = Ledger::load(&path);
+        let now = chrono::Utc::now().timestamp();
+        let target = args.id_or_owner.trim();
+        let mut update = TaskUpdate::status(status);
+        update.branch = branch;
+        update.changed_files = args.changed_files;
+
+        let by_id = ledger
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.id.eq_ignore_ascii_case(target))
+            .map(|entry| (entry.id.clone(), entry.owner.clone(), entry.kind));
+
+        let (matched_id, changed) = if let Some((id, owner, kind)) = by_id {
+            let changed = ledger.update_latest_of_kind(&owner, kind, &update, now);
+            (id, changed)
+        } else if let Some(entry) = ledger.latest_for(target) {
+            let id = entry.id.clone();
+            let changed = ledger.update_latest(target, &update, now);
+            (id, changed)
+        } else {
+            return Err(ToolError::Failed(format!(
+                "No ledger entry matched {target}."
+            )));
+        };
+
+        if changed {
+            ledger
+                .save(&path)
+                .map_err(|error| ToolError::Failed(format!("Failed to save ledger: {error}")))?;
+            self.ui.notify_ledger_changed();
+        }
+        Ok(json!({
+            "updated": changed,
+            "id": matched_id,
+            "status": status.label(),
+        }))
+    }
+
+    fn run_ledger_read_doc(&self, args: LedgerReadDocArguments) -> Result<Value, ToolError> {
+        let docs_dir = self.ledger_docs_dir()?;
+        let (normalized, full_path) = resolve_safe_ledger_doc_path(&docs_dir, &args.path)?;
+        verify_no_symlink_ancestors(&docs_dir, &full_path)?;
+        let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                ToolError::Failed(format!("Ledger document {normalized} does not exist."))
+            } else {
+                ToolError::Failed(format!("Cannot read ledger document {normalized}: {error}"))
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ToolError::Failed(format!(
+                "Refused to read non-regular ledger document {normalized}."
+            )));
+        }
+        if metadata.len() > MAX_LEDGER_DOC_BYTES as u64 {
+            return Err(ToolError::Failed(format!(
+                "Ledger document {normalized} exceeds {MAX_LEDGER_DOC_BYTES} bytes."
+            )));
+        }
+        let raw = fs::read_to_string(&full_path)
+            .map_err(|error| ToolError::Failed(format!("Failed to read {normalized}: {error}")))?;
+        let content = vault::redact_values(&raw);
+        Ok(json!({
+            "path": normalized,
+            "bytes": content.len(),
+            "content": content,
+        }))
+    }
+
+    fn run_ledger_append_doc(&self, args: LedgerAppendDocArguments) -> Result<Value, ToolError> {
+        if args.section.contains('\0') {
+            return Err(ToolError::invalid("section must not contain NUL bytes."));
+        }
+        let trimmed_section = args.section.trim();
+        if trimmed_section.is_empty() {
+            return Err(ToolError::invalid("section must not be empty."));
+        }
+        if args.section.len() > MAX_LEDGER_DOC_BYTES {
+            return Err(ToolError::invalid(format!(
+                "section exceeds {MAX_LEDGER_DOC_BYTES} bytes."
+            )));
+        }
+        if soul::contains_secret_like(trimmed_section) {
+            return Err(ToolError::Failed(
+                "Refused to append secret-like material to a ledger document.".into(),
+            ));
+        }
+        let scrubbed_section = vault::redact_values(trimmed_section);
+        let docs_dir = self.ledger_docs_dir()?;
+        let (normalized, full_path) = resolve_safe_ledger_doc_path(&docs_dir, &args.path)?;
+        verify_no_symlink_ancestors(&docs_dir, &full_path)?;
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ToolError::Failed(format!("Failed to prepare ledger docs directory: {error}"))
+            })?;
+        }
+        verify_no_symlink_ancestors(&docs_dir, &full_path)?;
+        let existing = match fs::symlink_metadata(&full_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(ToolError::Failed(format!(
+                        "Refused to append to non-regular file {normalized}."
+                    )));
+                }
+                if metadata.len() > MAX_LEDGER_DOC_BYTES as u64 {
+                    return Err(ToolError::Failed(format!(
+                        "Ledger document {normalized} exceeds {MAX_LEDGER_DOC_BYTES} bytes."
+                    )));
+                }
+                fs::read_to_string(&full_path).map_err(|error| {
+                    ToolError::Failed(format!("Failed to read existing {normalized}: {error}"))
+                })?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(ToolError::Failed(format!(
+                    "Failed to inspect {normalized}: {error}"
+                )));
+            }
+        };
+
+        let mut combined = existing;
+        if !combined.is_empty() {
+            if !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            if !combined.ends_with("\n\n") {
+                combined.push('\n');
+            }
+        }
+        combined.push_str(&scrubbed_section);
+        combined.push('\n');
+        if combined.len() > MAX_LEDGER_DOC_BYTES {
+            return Err(ToolError::Failed(format!(
+                "Appending would exceed {MAX_LEDGER_DOC_BYTES} byte limit for {normalized}."
+            )));
+        }
+        write_doc_atomic(&full_path, combined.as_bytes()).map_err(|error| {
+            ToolError::Failed(format!(
+                "Failed to write ledger document {normalized}: {error}"
+            ))
+        })?;
+        self.ui.notify_ledger_changed();
+        Ok(json!({
+            "path": normalized,
+            "appended": true,
+            "bytes": combined.len(),
+        }))
+    }
+
+    fn run_ui_post_table(&self, args: UiPostTableArguments) -> Result<Value, ToolError> {
+        control::bounded_text("title", &args.title, 200)?;
+        if args.headers.is_empty() || args.headers.len() > MAX_TABLE_COLUMNS {
+            return Err(ToolError::invalid(format!(
+                "headers must contain between 1 and {MAX_TABLE_COLUMNS} columns."
+            )));
+        }
+        if args.rows.len() > MAX_TABLE_ROWS {
+            return Err(ToolError::invalid(format!(
+                "rows must contain at most {MAX_TABLE_ROWS} rows."
+            )));
+        }
+        let mut headers = Vec::with_capacity(args.headers.len());
+        for header in &args.headers {
+            control::bounded_text("header", header, 80)?;
+            headers.push(vault::redact_values(header.trim()));
+        }
+        let mut rows = Vec::with_capacity(args.rows.len());
+        for (index, row) in args.rows.iter().enumerate() {
+            if row.len() != headers.len() {
+                return Err(ToolError::invalid(format!(
+                    "Row {index} has {} cells, expected {}.",
+                    row.len(),
+                    headers.len()
+                )));
+            }
+            let mut clean_row = Vec::with_capacity(row.len());
+            for cell in row {
+                if cell.contains('\0') || cell.chars().count() > 500 {
+                    return Err(ToolError::invalid(
+                        "Table cells must be at most 500 characters without NUL bytes.",
+                    ));
+                }
+                clean_row.push(vault::redact_values(cell.trim()));
+            }
+            rows.push(clean_row);
+        }
+        let alignments = match args.alignments {
+            Some(list) => {
+                if list.len() != headers.len() {
+                    return Err(ToolError::invalid(format!(
+                        "alignments length ({}) must match headers length ({}).",
+                        list.len(),
+                        headers.len()
+                    )));
+                }
+                let mut clean = Vec::with_capacity(list.len());
+                for item in &list {
+                    clean.push(
+                        validate_enum("alignment", item, &["left", "center", "right"])?.to_owned(),
+                    );
+                }
+                clean
+            }
+            None => Vec::new(),
+        };
+        let caption = match args.caption.as_deref() {
+            Some(raw) => {
+                let clean = validate_optional_text("caption", Some(raw), 300)?;
+                if clean.is_empty() {
+                    None
+                } else {
+                    Some(vault::redact_values(&clean))
+                }
+            }
+            None => None,
+        };
+        let title = vault::redact_values(args.title.trim());
+        let row_count = rows.len();
+        let column_count = headers.len();
+        self.ui.post_table(UiTableCard {
+            title: title.clone(),
+            headers,
+            rows,
+            alignments,
+            caption,
+        });
+        Ok(json!({
+            "posted": true,
+            "title": title,
+            "columns": column_count,
+            "rows": row_count,
+        }))
+    }
+
+    fn run_ui_post_card(&self, args: UiPostCardArguments) -> Result<Value, ToolError> {
+        control::bounded_text("title", &args.title, 200)?;
+        let level = validate_enum(
+            "level",
+            args.level.as_deref().unwrap_or("info"),
+            &["info", "success", "warning", "error"],
+        )?;
+        let badge = match args.badge.as_deref() {
+            Some(raw) => {
+                control::bounded_text("badge", raw, 40)?;
+                Some(vault::redact_values(raw.trim()))
+            }
+            None => None,
+        };
+        let mut fields = Vec::new();
+        if let Some(raw_fields) = args.fields {
+            if raw_fields.len() > MAX_CARD_FIELDS {
+                return Err(ToolError::invalid(format!(
+                    "fields must contain at most {MAX_CARD_FIELDS} entries."
+                )));
+            }
+            for field in raw_fields {
+                control::bounded_text("field.label", &field.label, 80)?;
+                if field.value.contains('\0') || field.value.chars().count() > 500 {
+                    return Err(ToolError::invalid(
+                        "field.value must be at most 500 characters without NUL bytes.",
+                    ));
+                }
+                fields.push((
+                    vault::redact_values(field.label.trim()),
+                    vault::redact_values(field.value.trim()),
+                ));
+            }
+        }
+        let body_markdown = match args.body_markdown.as_deref() {
+            Some(raw) => {
+                let clean =
+                    validate_optional_text("body_markdown", Some(raw), control::MAX_TEXT_CHARS)?;
+                vault::redact_values(&clean)
+            }
+            None => String::new(),
+        };
+        let title = vault::redact_values(args.title.trim());
+        self.ui.post_card(UiInfoCard {
+            title: title.clone(),
+            level: level.into(),
+            badge,
+            fields,
+            body_markdown,
+        });
+        Ok(json!({
+            "posted": true,
+            "title": title,
+            "level": level,
+        }))
+    }
+
+    fn run_vault_list(&self, args: VaultListArguments) -> Result<Value, ToolError> {
+        let Some(store) = &self.vault else {
+            return Err(ToolError::Failed(
+                "Vault store is not configured for this session.".into(),
+            ));
+        };
+        let secrets = store
+            .list(args.namespace.as_deref())
+            .map_err(map_vault_io_error)?;
+        Ok(json!({
+            "secrets": secrets,
+            "count": secrets.len(),
+            "backend": VaultStore::backend_name(),
+        }))
+    }
+
+    fn run_vault_check(&self, args: VaultCheckArguments) -> Result<Value, ToolError> {
+        if args.names.is_empty() || args.names.len() > MAX_VAULT_CHECK_NAMES {
+            return Err(ToolError::invalid(format!(
+                "names must contain between 1 and {MAX_VAULT_CHECK_NAMES} secret names."
+            )));
+        }
+        let Some(store) = &self.vault else {
+            return Err(ToolError::Failed(
+                "Vault store is not configured for this session.".into(),
+            ));
+        };
+        let namespace = match args.namespace.as_deref() {
+            Some(ns) => vault::validate_namespace(ns).map_err(ToolError::invalid)?,
+            None => vault::DEFAULT_NAMESPACE.to_owned(),
+        };
+        let check = store
+            .check(&args.names, Some(&namespace))
+            .map_err(map_vault_io_error)?;
+        Ok(json!({
+            "namespace": namespace,
+            "present": check.present,
+            "missing": check.missing,
+        }))
+    }
+
+    fn run_vault_request(&self, args: VaultRequestArguments) -> Result<Value, ToolError> {
+        let name = vault::validate_secret_name(&args.name).map_err(ToolError::invalid)?;
+        let namespace = match args.namespace.as_deref() {
+            Some(ns) => vault::validate_namespace(ns).map_err(ToolError::invalid)?,
+            None => vault::DEFAULT_NAMESPACE.to_owned(),
+        };
+        control::bounded_text("title", &args.title, 200)?;
+        if soul::contains_secret_like(&args.title) {
+            return Err(ToolError::invalid(
+                "title must not contain secret-like material.",
+            ));
+        }
+        let description = match args.description.as_deref() {
+            Some(raw) => vault::validate_description(raw).map_err(ToolError::invalid)?,
+            None => String::new(),
+        };
+        let request = VaultSecretRequest {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            name: name.clone(),
+            namespace: namespace.clone(),
+            title: vault::redact_values(args.title.trim()),
+            description,
+        };
+        let request_id = request.request_id.clone();
+        match self.ui.request_vault_secret(request, ASK_WAIT_TIMEOUT) {
+            Some(outcome) => Ok(json!({
+                "status": outcome.status,
+                "request_id": request_id,
+                "name": outcome.name,
+                "namespace": outcome.namespace,
+                "sha256_8": outcome.sha256_8,
+            })),
+            None => Ok(json!({
+                "status": VaultRequestStatus::Pending,
+                "request_id": request_id,
+                "name": name,
+                "namespace": namespace,
+            })),
+        }
+    }
+
+    fn run_vault_delete(&self, args: VaultDeleteArguments) -> Result<Value, ToolError> {
+        let name = vault::validate_secret_name(&args.name).map_err(ToolError::invalid)?;
+        let namespace = match args.namespace.as_deref() {
+            Some(ns) => vault::validate_namespace(ns).map_err(ToolError::invalid)?,
+            None => vault::DEFAULT_NAMESPACE.to_owned(),
+        };
+        let Some(store) = &self.vault else {
+            return Err(ToolError::Failed(
+                "Vault store is not configured for this session.".into(),
+            ));
+        };
+        let deleted = store
+            .delete(&name, Some(&namespace))
+            .map_err(map_vault_io_error)?;
+        Ok(json!({
+            "deleted": deleted,
+            "name": name,
+            "namespace": namespace,
+        }))
+    }
+
+    fn require_memory(&self) -> Result<&MemoryStore, ToolError> {
+        self.memory.as_ref().ok_or_else(|| {
+            ToolError::Failed("Two-tier memory store is not configured for this session.".into())
+        })
+    }
+
+    fn require_evolution(&self) -> Result<&EvolutionStore, ToolError> {
+        self.evolution.as_ref().ok_or_else(|| {
+            ToolError::Failed("Bot evolution store is not configured for this session.".into())
+        })
+    }
+
+    fn run_memory_search(&self, args: MemorySearchArguments) -> Result<Value, ToolError> {
+        if args.query.contains('\0') || args.query.chars().count() > control::MAX_QUERY_CHARS {
+            return Err(ToolError::invalid("Invalid memory search query."));
+        }
+        let limit = match args.limit {
+            None => DEFAULT_SEARCH_LIMIT,
+            Some(value) if (1..=MAX_ACTIVE_ENTRIES).contains(&value) => value,
+            Some(_) => {
+                return Err(ToolError::invalid(format!(
+                    "limit must be between 1 and {MAX_ACTIVE_ENTRIES}."
+                )));
+            }
+        };
+        let token_budget = match args.token_budget {
+            None => DEFAULT_TOKEN_BUDGET,
+            Some(value) if (32..=16_000).contains(&value) => value,
+            Some(_) => {
+                return Err(ToolError::invalid(
+                    "token_budget must be between 32 and 16000.",
+                ));
+            }
+        };
+        let scopes = parse_memory_search_scopes(&args.scope, args.bot_id.as_deref())?;
+        let store = self.require_memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let result = store
+            .search(&scopes, &args.query, limit, token_budget, now)
+            .map_err(map_store_io_error)?;
+        let count = result.hits.len();
+        let mut payload = json!({
+            "query": result.query,
+            "hits": result.hits,
+            "count": count,
+            "truncated_by_budget": result.truncated_by_budget,
+            "approx_tokens": result.approx_tokens,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_memory_write(&self, args: MemoryWriteArguments) -> Result<Value, ToolError> {
+        let scope = MemoryScope::parse_wire(&args.scope, args.bot_id.as_deref())
+            .map_err(map_store_io_error)?;
+        let kind = MemoryKind::parse(&args.kind).map_err(ToolError::invalid)?;
+        let tags = args.tags.unwrap_or_default();
+        reject_memory_secrets(&args.title, &args.body, &tags)?;
+        let origin = match &scope {
+            MemoryScope::Shared => MemoryOrigin::Commander,
+            MemoryScope::Bot(_) => MemoryOrigin::Bot,
+        };
+        let author = args.author.unwrap_or_else(|| match &scope {
+            MemoryScope::Shared => "commander".to_owned(),
+            MemoryScope::Bot(id) => id.clone(),
+        });
+        let input = WriteMemoryInput {
+            scope,
+            kind,
+            title: args.title,
+            body: args.body,
+            tags,
+            author,
+            origin,
+            salience: args.salience,
+            confidence: args.confidence,
+            pinned: args.pinned.unwrap_or(false),
+            ttl_secs: args.ttl_secs,
+        };
+        let store = self.require_memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let outcome = store.write(input, now).map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "status": outcome.status,
+            "entry": outcome.entry,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_memory_supersede(&self, args: MemorySupersedeArguments) -> Result<Value, ToolError> {
+        let scope = MemoryScope::parse_wire(&args.scope, args.bot_id.as_deref())
+            .map_err(map_store_io_error)?;
+        let kind = MemoryKind::parse(&args.kind).map_err(ToolError::invalid)?;
+        let tags = args.tags.unwrap_or_default();
+        reject_memory_secrets(&args.title, &args.body, &tags)?;
+        let origin = match &scope {
+            MemoryScope::Shared => MemoryOrigin::Commander,
+            MemoryScope::Bot(_) => MemoryOrigin::Bot,
+        };
+        let author = args.author.unwrap_or_else(|| match &scope {
+            MemoryScope::Shared => "commander".to_owned(),
+            MemoryScope::Bot(id) => id.clone(),
+        });
+        let replacement = WriteMemoryInput {
+            scope: scope.clone(),
+            kind,
+            title: args.title,
+            body: args.body,
+            tags,
+            author,
+            origin,
+            salience: args.salience,
+            confidence: args.confidence,
+            pinned: args.pinned.unwrap_or(false),
+            ttl_secs: args.ttl_secs,
+        };
+        let store = self.require_memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let created = store
+            .supersede(&scope, &args.target_id, replacement, now)
+            .map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "superseded_id": args.target_id.trim(),
+            "entry": created,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_memory_delete(&self, args: MemoryDeleteArguments) -> Result<Value, ToolError> {
+        let scope = MemoryScope::parse_wire(&args.scope, args.bot_id.as_deref())
+            .map_err(map_store_io_error)?;
+        let reason = TombstoneReason::parse(&args.reason).map_err(ToolError::invalid)?;
+        if reason == TombstoneReason::Superseded {
+            return Err(ToolError::invalid(
+                "Use memory_supersede instead of memory_delete for superseded entries.",
+            ));
+        }
+        let actor = args.actor.as_deref().unwrap_or("commander");
+        let store = self.require_memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let deleted = store
+            .delete(&scope, &args.id, reason, actor, now)
+            .map_err(map_store_io_error)?;
+        Ok(json!({
+            "deleted": deleted,
+            "id": args.id.trim(),
+            "reason": reason.label(),
+        }))
+    }
+
+    fn run_bot_scorecard(&self, args: BotScorecardArguments) -> Result<Value, ToolError> {
+        let store = self.require_evolution()?;
+        let now = chrono::Utc::now().timestamp();
+        let scorecards = store
+            .scorecard_report(args.bot_id.as_deref())
+            .map_err(map_store_io_error)?;
+        let healthcheck = store.healthcheck_audit(now).map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "scorecards": scorecards,
+            "count": scorecards.len(),
+            "healthcheck_quiet": healthcheck.is_quiet(),
+            "findings": healthcheck.findings,
+            "ready_gaps": healthcheck.ready_gaps,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_bot_forge(&self, args: BotForgeArguments) -> Result<Value, ToolError> {
+        let work_class = WorkClass::parse(&args.work_class).map_err(ToolError::invalid)?;
+        let permission_mode = match args.permission_mode.as_deref() {
+            Some(raw) => {
+                let mode = PermissionMode::parse(raw).map_err(ToolError::invalid)?;
+                if mode == PermissionMode::WorkspaceAuto
+                    && !self.scope.allows_elevated_worker_modes()
+                {
+                    return Err(ToolError::Failed(
+                        "workspace-auto requires commander scope.".into(),
+                    ));
+                }
+                Some(mode)
+            }
+            None => None,
+        };
+        reject_charter_secrets(&args.charter)?;
+        if soul::contains_secret_like(&args.rationale) {
+            return Err(ToolError::Failed(
+                "Refused secret-like material in bot_forge rationale.".into(),
+            ));
+        }
+        let initial_memory_seeds = args.initial_memory_seeds.unwrap_or_default();
+        for seed in &initial_memory_seeds {
+            if soul::contains_secret_like(seed) {
+                return Err(ToolError::Failed(
+                    "Refused secret-like material in initial_memory_seeds.".into(),
+                ));
+            }
+        }
+        let memory = self.require_memory()?;
+        let evolution = self.require_evolution()?;
+        let now = chrono::Utc::now().timestamp();
+        let request = ForgeBotRequest {
+            bot_id: args.bot_id,
+            role: args.role,
+            work_class,
+            charter: charter_from_input(args.charter),
+            permission_mode,
+            preferred_model: args.preferred_model,
+            pinned_core: args.pinned_core.unwrap_or(false),
+            initial_memory_seeds,
+            probation_runs: args.probation_runs,
+            rationale: args.rationale,
+        };
+        let bot = evolution
+            .forge_bot(memory, request, now)
+            .map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "forged": true,
+            "bot": bot,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_bot_record_feedback(
+        &self,
+        args: BotRecordFeedbackArguments,
+    ) -> Result<Value, ToolError> {
+        let signal = OutcomeSignal::parse(&args.signal).map_err(ToolError::invalid)?;
+        if args.note.as_deref().is_some_and(soul::contains_secret_like) {
+            return Err(ToolError::Failed(
+                "Refused secret-like material in bot feedback note.".into(),
+            ));
+        }
+        let evolution = self.require_evolution()?;
+        let now = chrono::Utc::now().timestamp();
+        let report = evolution
+            .record_feedback(
+                &args.bot_id,
+                signal,
+                args.task_id.as_deref(),
+                args.duration_ms,
+                args.note.as_deref(),
+                now,
+            )
+            .map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "recorded": true,
+            "report": report,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_bot_evolve(&self, args: BotEvolveArguments) -> Result<Value, ToolError> {
+        let failure_mode = FailureMode::parse(&args.failure_mode).map_err(ToolError::invalid)?;
+        reject_charter_secrets(&args.patched_charter)?;
+        if soul::contains_secret_like(&args.task_summary)
+            || soul::contains_secret_like(&args.root_cause)
+            || args
+                .diff_summary
+                .iter()
+                .any(|delta| soul::contains_secret_like(delta))
+            || args
+                .memory_correction
+                .as_deref()
+                .is_some_and(soul::contains_secret_like)
+        {
+            return Err(ToolError::Failed(
+                "Refused secret-like material in bot_evolve payload.".into(),
+            ));
+        }
+        let memory = self.require_memory()?;
+        let evolution = self.require_evolution()?;
+        let now = chrono::Utc::now().timestamp();
+        let request = MutateBotRequest {
+            bot_id: args.bot_id,
+            failure_mode,
+            task_summary: args.task_summary,
+            root_cause: args.root_cause,
+            patched_charter: charter_from_input(args.patched_charter),
+            diff_summary: args.diff_summary,
+            memory_correction: args.memory_correction,
+            probation_runs: args.probation_runs,
+        };
+        let revision = evolution
+            .propose_mutation(memory, request, now)
+            .map_err(map_store_io_error)?;
+        let mut payload = json!({
+            "evolved": true,
+            "revision": revision,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_bot_decommission(&self, args: BotDecommissionArguments) -> Result<Value, ToolError> {
+        if soul::contains_secret_like(&args.reason) {
+            return Err(ToolError::Failed(
+                "Refused secret-like material in decommission reason.".into(),
+            ));
+        }
+        let memory = self.require_memory()?;
+        let evolution = self.require_evolution()?;
+        let now = chrono::Utc::now().timestamp();
+        let outcome = evolution
+            .decommission_bot(
+                memory,
+                &args.bot_id,
+                &args.reason,
+                args.confirmed.unwrap_or(false),
+                now,
+            )
+            .map_err(map_store_io_error)?;
+        let mut payload = json!(outcome);
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+}
+
+fn map_store_io_error(error: io::Error) -> ToolError {
+    let message = error.to_string();
+    if error.kind() == io::ErrorKind::InvalidInput
+        && !message.to_ascii_lowercase().contains("secret")
+    {
+        ToolError::invalid(message)
+    } else {
+        ToolError::Failed(message)
+    }
+}
+
+fn parse_memory_search_scopes(
+    scope: &str,
+    bot_id: Option<&str>,
+) -> Result<Vec<MemoryScope>, ToolError> {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "shared" => Ok(vec![MemoryScope::Shared]),
+        "self" | "bot" => {
+            let parsed = MemoryScope::parse_wire("self", bot_id).map_err(map_store_io_error)?;
+            Ok(vec![parsed])
+        }
+        "both" => {
+            let parsed = MemoryScope::parse_wire("self", bot_id).map_err(map_store_io_error)?;
+            Ok(vec![MemoryScope::Shared, parsed])
+        }
+        other => Err(ToolError::invalid(format!(
+            "Unknown memory scope {other}. Use shared, self, or both."
+        ))),
+    }
+}
+
+fn reject_memory_secrets(title: &str, body: &str, tags: &[String]) -> Result<(), ToolError> {
+    if soul::contains_secret_like(title)
+        || soul::contains_secret_like(body)
+        || tags.iter().any(|tag| soul::contains_secret_like(tag))
+    {
+        return Err(ToolError::Failed(
+            "Refused to store secret-like material in durable memory.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_charter_secrets(charter: &CharterInput) -> Result<(), ToolError> {
+    if soul::contains_secret_like(&charter.job)
+        || charter
+            .anti_jobs
+            .iter()
+            .any(|item| soul::contains_secret_like(item))
+        || soul::contains_secret_like(&charter.voice_and_style)
+        || soul::contains_secret_like(&charter.verification_bar)
+        || charter
+            .allowed_tools
+            .iter()
+            .any(|tool| soul::contains_secret_like(tool))
+        || soul::contains_secret_like(&charter.instructions)
+    {
+        return Err(ToolError::Failed(
+            "Refused secret-like material in bot charter.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn charter_from_input(input: CharterInput) -> BotCharter {
+    BotCharter {
+        job: input.job,
+        anti_jobs: input.anti_jobs,
+        voice_and_style: input.voice_and_style,
+        verification_bar: input.verification_bar,
+        allowed_tools: input.allowed_tools,
+        instructions: input.instructions,
+    }
+}
+
+fn charter_schema() -> Value {
+    object_schema(
+        json!({
+            "job": text_schema(240),
+            "anti_jobs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": text_schema(240),
+            },
+            "voice_and_style": {"type": "string", "maxLength": 300},
+            "verification_bar": text_schema(400),
+            "allowed_tools": {
+                "type": "array",
+                "maxItems": 32,
+                "items": text_schema(64),
+            },
+            "instructions": text_schema(4_000),
+        }),
+        &["job", "anti_jobs", "verification_bar", "instructions"],
+    )
+}
+
+fn map_vault_io_error(error: io::Error) -> ToolError {
+    match error.kind() {
+        io::ErrorKind::InvalidInput => ToolError::invalid(error.to_string()),
+        _ => ToolError::Failed(error.to_string()),
+    }
+}
+
+fn bounded_inbox_limit(limit: Option<usize>) -> Result<usize, ToolError> {
+    match limit {
+        None => Ok(DEFAULT_INBOX_LIMIT),
+        Some(value) if (1..=MAX_INBOX_LIMIT).contains(&value) => Ok(value),
+        Some(_) => Err(ToolError::invalid(format!(
+            "limit must be between 1 and {MAX_INBOX_LIMIT}."
+        ))),
+    }
+}
+
+fn validate_decision_id(raw: &str) -> Result<String, ToolError> {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 48
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if !valid {
+        return Err(ToolError::invalid(
+            "Decision id must be 1-48 characters of A-Za-z0-9_- starting with a letter or digit.",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_optional_text(
+    label: &str,
+    raw: Option<&str>,
+    max_chars: usize,
+) -> Result<String, ToolError> {
+    let Some(value) = raw else {
+        return Ok(String::new());
+    };
+    if value.contains('\0') {
+        return Err(ToolError::invalid(format!(
+            "{label} must not contain NUL bytes."
+        )));
+    }
+    if value.chars().count() > max_chars {
+        return Err(ToolError::invalid(format!(
+            "{label} must be at most {max_chars} characters."
+        )));
+    }
+    Ok(value.trim().to_owned())
+}
+
+fn contains_placeholder_token(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case("tbd") || token.eq_ignore_ascii_case("todo"))
+}
+
+fn reject_placeholder_text(label: &str, text: &str) -> Result<(), ToolError> {
+    if contains_placeholder_token(text) {
+        return Err(ToolError::invalid(format!(
+            "{label} must not contain placeholder text (TBD/TODO)."
+        )));
+    }
+    Ok(())
+}
+
+fn validate_decision_options(
+    inputs: Vec<DecisionOptionInput>,
+) -> Result<Vec<UiDecisionOption>, ToolError> {
+    if !(2..=4).contains(&inputs.len()) {
+        return Err(ToolError::invalid(
+            "options must contain between 2 and 4 concrete choices.",
+        ));
+    }
+    let mut seen_ids = Vec::with_capacity(inputs.len());
+    let mut validated = Vec::with_capacity(inputs.len());
+    for option in inputs {
+        let id = option.id.trim();
+        let valid_id = !id.is_empty()
+            && id.len() <= 40
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        if !valid_id {
+            return Err(ToolError::invalid(
+                "Each decision option id must be 1-40 characters of A-Za-z0-9_-.",
+            ));
+        }
+        if seen_ids
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(id))
+        {
+            return Err(ToolError::invalid(format!(
+                "Duplicate decision option id: {id}."
+            )));
+        }
+        control::bounded_text("option.label", &option.label, 160)?;
+        reject_placeholder_text("option.label", &option.label)?;
+        let summary = validate_optional_text("option.summary", Some(&option.summary), 500)?;
+        reject_placeholder_text("option.summary", &summary)?;
+        seen_ids.push(id.to_owned());
+        validated.push(UiDecisionOption {
+            id: id.to_owned(),
+            label: vault::redact_values(option.label.trim()),
+            summary: vault::redact_values(&summary),
+            recommended: option.recommended,
+        });
+    }
+    Ok(validated)
+}
+
+fn parse_task_kind(raw: &str) -> Result<TaskKind, ToolError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "mission" => Ok(TaskKind::Mission),
+        "spawn" => Ok(TaskKind::Spawn),
+        "goal" => Ok(TaskKind::Goal),
+        "review" => Ok(TaskKind::Review),
+        _ => Err(ToolError::invalid(
+            "kind must be one of: mission, spawn, goal, review.",
+        )),
+    }
+}
+
+fn parse_task_status(raw: &str) -> Result<TaskStatus, ToolError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "queued" => Ok(TaskStatus::Queued),
+        "running" => Ok(TaskStatus::Running),
+        "needs_approval" => Ok(TaskStatus::NeedsApproval),
+        "done" => Ok(TaskStatus::Done),
+        "error" => Ok(TaskStatus::Error),
+        "snoozed" => Ok(TaskStatus::Snoozed),
+        "cancelled" => Ok(TaskStatus::Cancelled),
+        _ => Err(ToolError::invalid(
+            "status must be one of: queued, running, needs_approval, done, error, snoozed, cancelled.",
+        )),
+    }
+}
+
+fn resolve_safe_ledger_doc_path(
+    docs_dir: &Path,
+    raw: &str,
+) -> Result<(String, PathBuf), ToolError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 160
+        || trimmed.contains('\0')
+        || trimmed.contains('\r')
+        || trimmed.contains('\n')
+        || trimmed.contains('\\')
+    {
+        return Err(ToolError::invalid(
+            "path must be a relative Markdown path using forward slashes.",
+        ));
+    }
+    let stripped = trimmed.strip_prefix("ledger-docs/").unwrap_or(trimmed);
+    if stripped.is_empty() {
+        return Err(ToolError::invalid("path must name a Markdown file."));
+    }
+    let relative = Path::new(stripped);
+    let mut parts = Vec::new();
+    let mut full = docs_dir.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => {
+                let text = segment
+                    .to_str()
+                    .ok_or_else(|| ToolError::invalid("path segments must be valid UTF-8."))?;
+                if text.is_empty() || text.starts_with('.') {
+                    return Err(ToolError::invalid(
+                        "Hidden path segments are not allowed for ledger documents.",
+                    ));
+                }
+                parts.push(text.to_owned());
+                full.push(segment);
+            }
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => {
+                return Err(ToolError::invalid(
+                    "path must stay strictly inside the ledger docs directory without '..' or roots.",
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(ToolError::invalid("path must name a Markdown file."));
+    }
+    let is_markdown = full
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        return Err(ToolError::invalid(
+            "Ledger documents must have a .md extension.",
+        ));
+    }
+    Ok((parts.join("/"), full))
+}
+
+fn verify_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), ToolError> {
+    if let Ok(meta) = fs::symlink_metadata(root) {
+        if meta.file_type().is_symlink() {
+            return Err(ToolError::Failed(
+                "Refused to access symlinked ledger docs directory.".into(),
+            ));
+        }
+    }
+    let Ok(relative) = target.strip_prefix(root) else {
+        return Err(ToolError::invalid(
+            "Ledger document path escapes the ledger docs directory.",
+        ));
+    };
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component);
+        if let Ok(meta) = fs::symlink_metadata(&cursor) {
+            if meta.file_type().is_symlink() {
+                return Err(ToolError::Failed(
+                    "Refused to follow symlink inside ledger docs directory.".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_doc_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Document path has no parent")
+    })?;
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("doc.md");
+    let temporary = parent.join(format!(".{stem}.{}.next", uuid::Uuid::new_v4().simple()));
+    let mut file = fs::File::create_new(&temporary)?;
+    let write_outcome = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_outcome {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn is_gh_auth_error(stderr: &str) -> bool {
@@ -1517,6 +3329,487 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             ),
             false,
         ),
+        tool(
+            "env_status",
+            "Return live Agent Command environment status: workspace, git state, active provider/profile headroom, worker/inbox/ledger counts, vault metadata count, and available MCP tools.",
+            object_schema(json!({}), &[]),
+            true,
+        ),
+        tool(
+            "inbox_list",
+            "List active Inbox alerts and structured operator Decision cards.",
+            object_schema(
+                json!({
+                    "include_dismissed": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_INBOX_LIMIT},
+                }),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "inbox_post",
+            "Post a concise notice or attention item to the operator Inbox.",
+            object_schema(
+                json!({
+                    "title": text_schema(200),
+                    "detail": text_schema(control::MAX_TEXT_CHARS),
+                    "level": {"type": "string", "enum": ["info", "attention", "warning", "error"]},
+                    "thread": text_schema(80),
+                }),
+                &["title", "detail"],
+            ),
+            false,
+        ),
+        tool(
+            "inbox_submit_decision",
+            "Submit a structured 2-4 option operator decision card to the Decision Inbox (TBD/TODO placeholders are refused).",
+            object_schema(
+                json!({
+                    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},
+                    "kind": {"type": "string", "enum": ["decision", "design", "risk", "ops", "release"]},
+                    "title": text_schema(200),
+                    "question": text_schema(1000),
+                    "recommendation": text_schema(1000),
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": object_schema(
+                            json!({
+                                "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,40}$"},
+                                "label": text_schema(160),
+                                "summary": {"type": "string", "maxLength": 500},
+                                "recommended": {"type": "boolean"},
+                            }),
+                            &["id", "label"],
+                        ),
+                    },
+                    "directions": {"type": "string", "maxLength": 2000},
+                }),
+                &["title", "question", "recommendation", "options"],
+            ),
+            false,
+        ),
+        tool(
+            "inbox_update_decision",
+            "Update an existing Decision Inbox card with optional optimistic concurrency check (expected_version).",
+            object_schema(
+                json!({
+                    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                    "status": {"type": "string", "enum": ["open", "deferred", "explain_more", "retired", "resolved"]},
+                    "title": text_schema(200),
+                    "question": text_schema(1000),
+                    "recommendation": text_schema(1000),
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": object_schema(
+                            json!({
+                                "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,40}$"},
+                                "label": text_schema(160),
+                                "summary": {"type": "string", "maxLength": 500},
+                                "recommended": {"type": "boolean"},
+                            }),
+                            &["id", "label"],
+                        ),
+                    },
+                    "directions": {"type": "string", "maxLength": 2000},
+                }),
+                &["id"],
+            ),
+            false,
+        ),
+        tool(
+            "inbox_dismiss",
+            "Dismiss an Inbox item or retire a decision by key (refuses unresolved gate:* ProdGate approvals).",
+            object_schema(json!({"key": text_schema(160)}), &["key"]),
+            false,
+        ),
+        tool(
+            "ledger_list",
+            "List tasks tracked in the durable Task Ledger with optional status filter.",
+            object_schema(
+                json!({
+                    "filter": {"type": "string", "enum": ["all", "active", "attention", "done"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                }),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "ledger_record",
+            "Record a new mission, spawn, goal, or review task in the durable Task Ledger.",
+            object_schema(
+                json!({
+                    "kind": {"type": "string", "enum": ["mission", "spawn", "goal", "review"]},
+                    "owner": text_schema(80),
+                    "title": text_schema(300),
+                    "status": {"type": "string", "enum": ["queued", "running", "needs_approval", "done", "error", "snoozed", "cancelled"]},
+                    "branch": text_schema(120),
+                }),
+                &["kind", "owner", "title"],
+            ),
+            false,
+        ),
+        tool(
+            "ledger_update",
+            "Update an existing Task Ledger entry by short id or owner name.",
+            object_schema(
+                json!({
+                    "id_or_owner": text_schema(80),
+                    "status": {"type": "string", "enum": ["queued", "running", "needs_approval", "done", "error", "snoozed", "cancelled"]},
+                    "branch": text_schema(120),
+                    "changed_files": {"type": "integer", "minimum": 0},
+                }),
+                &["id_or_owner", "status"],
+            ),
+            false,
+        ),
+        tool(
+            "ledger_read_doc",
+            "Read a Markdown document strictly inside the private ledger docs directory.",
+            object_schema(json!({"path": text_schema(160)}), &["path"]),
+            true,
+        ),
+        tool(
+            "ledger_append_doc",
+            "Atomically append a Markdown section to a document inside the private ledger docs directory (secrets are refused).",
+            object_schema(
+                json!({
+                    "path": text_schema(160),
+                    "section": {"type": "string", "minLength": 1, "maxLength": MAX_LEDGER_DOC_BYTES},
+                }),
+                &["path", "section"],
+            ),
+            false,
+        ),
+        tool(
+            "ui_post_table",
+            "Emit a structured Markdown/TUI table widget into the Commander chat transcript.",
+            object_schema(
+                json!({
+                    "title": text_schema(200),
+                    "headers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TABLE_COLUMNS,
+                        "items": text_schema(80),
+                    },
+                    "rows": {
+                        "type": "array",
+                        "maxItems": MAX_TABLE_ROWS,
+                        "items": {
+                            "type": "array",
+                            "maxItems": MAX_TABLE_COLUMNS,
+                            "items": {"type": "string", "maxLength": 500},
+                        },
+                    },
+                    "alignments": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TABLE_COLUMNS,
+                        "items": {"type": "string", "enum": ["left", "center", "right"]},
+                    },
+                    "caption": {"type": "string", "maxLength": 300},
+                }),
+                &["title", "headers", "rows"],
+            ),
+            false,
+        ),
+        tool(
+            "ui_post_card",
+            "Emit a structured summary card widget with key-value fields and optional Markdown body into the Commander chat transcript.",
+            object_schema(
+                json!({
+                    "title": text_schema(200),
+                    "level": {"type": "string", "enum": ["info", "success", "warning", "error"]},
+                    "badge": text_schema(40),
+                    "fields": {
+                        "type": "array",
+                        "maxItems": MAX_CARD_FIELDS,
+                        "items": object_schema(
+                            json!({
+                                "label": text_schema(80),
+                                "value": {"type": "string", "maxLength": 500},
+                            }),
+                            &["label", "value"],
+                        ),
+                    },
+                    "body_markdown": {"type": "string", "maxLength": control::MAX_TEXT_CHARS},
+                }),
+                &["title"],
+            ),
+            false,
+        ),
+        tool(
+            "vault_list",
+            "List encrypted vault credential metadata (name, namespace, description, timestamps, sha256_8). Never returns raw secret values.",
+            object_schema(
+                json!({"namespace": text_schema(vault::MAX_NAMESPACE_LEN)}),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "vault_check",
+            "Check whether required secret names exist in the encrypted vault without exposing any secret values.",
+            object_schema(
+                json!({
+                    "names": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_VAULT_CHECK_NAMES,
+                        "items": text_schema(vault::MAX_SECRET_NAME_LEN),
+                    },
+                    "namespace": text_schema(vault::MAX_NAMESPACE_LEN),
+                }),
+                &["names"],
+            ),
+            true,
+        ),
+        tool(
+            "vault_request",
+            "Request that the operator store a missing secret via the masked TUI prompt or `agent-command vault set`. Returns status and metadata only, never the raw value.",
+            object_schema(
+                json!({
+                    "name": text_schema(vault::MAX_SECRET_NAME_LEN),
+                    "title": text_schema(200),
+                    "namespace": text_schema(vault::MAX_NAMESPACE_LEN),
+                    "description": {"type": "string", "maxLength": vault::MAX_DESCRIPTION_LEN},
+                }),
+                &["name", "title"],
+            ),
+            false,
+        ),
+        tool(
+            "vault_delete",
+            "Delete a named credential entry from the encrypted vault.",
+            object_schema(
+                json!({
+                    "name": text_schema(vault::MAX_SECRET_NAME_LEN),
+                    "namespace": text_schema(vault::MAX_NAMESPACE_LEN),
+                }),
+                &["name"],
+            ),
+            false,
+        ),
+        tool(
+            "memory_search",
+            "Search two-tier durable memory (shared team memory and/or bot-private memory) within a token budget.",
+            object_schema(
+                json!({
+                    "scope": {"type": "string", "enum": ["shared", "self", "both"]},
+                    "bot_id": text_schema(MAX_BOT_ID_CHARS),
+                    "query": {"type": "string", "maxLength": control::MAX_QUERY_CHARS},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ACTIVE_ENTRIES},
+                    "token_budget": {"type": "integer", "minimum": 32, "maximum": 16_000},
+                }),
+                &["scope", "query"],
+            ),
+            true,
+        ),
+        tool(
+            "memory_write",
+            "Write or reinforce a durable memory entry in shared or bot-private memory (secrets are refused).",
+            object_schema(
+                json!({
+                    "scope": {"type": "string", "enum": ["shared", "self"]},
+                    "bot_id": text_schema(MAX_BOT_ID_CHARS),
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "fact",
+                            "decision",
+                            "convention",
+                            "lesson",
+                            "warning",
+                            "playbook",
+                            "tool_recipe",
+                            "correction",
+                            "preference",
+                        ],
+                    },
+                    "title": text_schema(MAX_TITLE_CHARS),
+                    "body": text_schema(MAX_BODY_CHARS),
+                    "tags": {
+                        "type": "array",
+                        "maxItems": MAX_TAGS,
+                        "items": text_schema(MAX_TAG_CHARS),
+                    },
+                    "author": text_schema(48),
+                    "salience": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "pinned": {"type": "boolean"},
+                    "ttl_secs": {"type": "integer", "minimum": 60},
+                }),
+                &["scope", "kind", "title", "body"],
+            ),
+            false,
+        ),
+        tool(
+            "memory_supersede",
+            "Supersede an existing active memory entry with an updated replacement while preserving audit lineage.",
+            object_schema(
+                json!({
+                    "scope": {"type": "string", "enum": ["shared", "self"]},
+                    "bot_id": text_schema(MAX_BOT_ID_CHARS),
+                    "target_id": text_schema(64),
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "fact",
+                            "decision",
+                            "convention",
+                            "lesson",
+                            "warning",
+                            "playbook",
+                            "tool_recipe",
+                            "correction",
+                            "preference",
+                        ],
+                    },
+                    "title": text_schema(MAX_TITLE_CHARS),
+                    "body": text_schema(MAX_BODY_CHARS),
+                    "tags": {
+                        "type": "array",
+                        "maxItems": MAX_TAGS,
+                        "items": text_schema(MAX_TAG_CHARS),
+                    },
+                    "author": text_schema(48),
+                    "salience": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "pinned": {"type": "boolean"},
+                    "ttl_secs": {"type": "integer", "minimum": 60},
+                }),
+                &["scope", "target_id", "kind", "title", "body"],
+            ),
+            false,
+        ),
+        tool(
+            "memory_delete",
+            "Tombstone a memory entry with an explicit reason (privacy scrubs content immediately).",
+            object_schema(
+                json!({
+                    "scope": {"type": "string", "enum": ["shared", "self"]},
+                    "bot_id": text_schema(MAX_BOT_ID_CHARS),
+                    "id": text_schema(64),
+                    "reason": {"type": "string", "enum": ["incorrect", "obsolete", "privacy", "user_request"]},
+                    "actor": text_schema(48),
+                }),
+                &["scope", "id", "reason"],
+            ),
+            false,
+        ),
+        tool(
+            "bot_scorecard",
+            "Inspect statistical competence scorecards (Wilson LCB, Beta posterior, lifecycle, healthcheck findings) for one or all forged bots.",
+            object_schema(
+                json!({"bot_id": text_schema(MAX_BOT_ID_CHARS)}),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "bot_forge",
+            "Forge a narrowly scoped specialist bot with an explicit charter, anti-jobs, verification bar, and initial probation.",
+            object_schema(
+                json!({
+                    "bot_id": name_schema(),
+                    "role": text_schema(40),
+                    "work_class": {"type": "string", "enum": ["coding", "review", "research", "docs", "ops", "general"]},
+                    "charter": charter_schema(),
+                    "permission_mode": {"type": "string", "enum": ["read-only", "supervised", "auto-edits", "worktree-auto", "workspace-auto"]},
+                    "preferred_model": text_schema(80),
+                    "pinned_core": {"type": "boolean"},
+                    "initial_memory_seeds": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": text_schema(MAX_BODY_CHARS),
+                    },
+                    "probation_runs": {"type": "integer", "minimum": MIN_PROBATION_RUNS, "maximum": MAX_PROBATION_RUNS},
+                    "rationale": text_schema(400),
+                }),
+                &["bot_id", "role", "work_class", "charter", "rationale"],
+            ),
+            false,
+        ),
+        tool(
+            "bot_record_feedback",
+            "Record user approval/disapproval or objective verification outcome for a forged bot, updating probation or rollback state.",
+            object_schema(
+                json!({
+                    "bot_id": name_schema(),
+                    "signal": {
+                        "type": "string",
+                        "enum": [
+                            "user_approved",
+                            "user_disapproved",
+                            "user_reverted",
+                            "first_try_pass",
+                            "verification_failure",
+                            "review_rejected",
+                            "stall",
+                            "escalation",
+                        ],
+                    },
+                    "task_id": text_schema(64),
+                    "duration_ms": {"type": "integer", "minimum": 0},
+                    "note": text_schema(400),
+                }),
+                &["bot_id", "signal"],
+            ),
+            false,
+        ),
+        tool(
+            "bot_evolve",
+            "Record a structured failure reflection and propose a versioned charter mutation with probation gating and optional bot-memory correction.",
+            object_schema(
+                json!({
+                    "bot_id": name_schema(),
+                    "failure_mode": {
+                        "type": "string",
+                        "enum": [
+                            "wrong_output",
+                            "scope_creep",
+                            "verification_missed",
+                            "stall",
+                            "user_rejected",
+                            "tool_misuse",
+                        ],
+                    },
+                    "task_summary": text_schema(400),
+                    "root_cause": text_schema(400),
+                    "patched_charter": charter_schema(),
+                    "diff_summary": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": text_schema(240),
+                    },
+                    "memory_correction": text_schema(600),
+                    "probation_runs": {"type": "integer", "minimum": MIN_PROBATION_RUNS, "maximum": MAX_PROBATION_RUNS},
+                }),
+                &["bot_id", "failure_mode", "task_summary", "root_cause", "patched_charter", "diff_summary"],
+            ),
+            false,
+        ),
+        tool(
+            "bot_decommission",
+            "Principled decommissioning of a bot: distills durable lessons into shared memory and preserves audit history (pinned_core bots return needs_confirmation until confirmed=true).",
+            object_schema(
+                json!({
+                    "bot_id": name_schema(),
+                    "reason": text_schema(400),
+                    "confirmed": {"type": "boolean"},
+                }),
+                &["bot_id", "reason"],
+            ),
+            false,
+        ),
     ]
 }
 
@@ -1768,12 +4061,26 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         return run_bridge(remote);
     }
     let profile_root = crate::auth::root()?;
+    let ledger_root = profile_root.join("agent-command-ledger-v1");
+    let ui = UiBridge::new().with_ledger_paths(
+        ledger_root.join("ledger.json"),
+        ledger_root.join("ledger-docs"),
+    );
+    let vault = VaultStore::open(profile_root.clone());
+    let memory = MemoryStore::for_workspace(profile_root.clone(), &options.root);
+    let evolution = EvolutionStore::for_workspace(profile_root.clone(), &options.root);
     let control = Control::open(
         crate::specialists::Store::new(profile_root.clone()),
         &options.root,
         Box::new(control::NativeEngine::new(profile_root)),
     )?;
-    let server = Arc::new(Server::new(control, options.scope));
+    let server = Arc::new(
+        Server::new(control, options.scope)
+            .with_ui(ui)
+            .with_vault(vault)
+            .with_memory(memory)
+            .with_evolution(evolution),
+    );
     serve_stdio(server, io::stdin().lock(), io::stdout())
 }
 
@@ -1782,15 +4089,28 @@ mod tests {
     use super::*;
     use crate::{
         bridge::{
-            AskUserAnswer, ExternalServerSpec, ExternalToolExecutor, ExternalToolSpec,
-            LoopbackBridge,
+            AskUserAnswer, EnvSnapshot, ExternalServerSpec, ExternalToolExecutor, ExternalToolSpec,
+            LoopbackBridge, UiEvent, VaultRequestOutcome,
         },
         control::tests::{control, Scratch},
     };
+    use zeroize::Zeroizing;
 
     fn server(scratch: &Scratch, scope: Scope) -> Server {
+        let ledger_root = scratch.0.join("ledger-state");
+        let ui = UiBridge::new().with_ledger_paths(
+            ledger_root.join("ledger.json"),
+            ledger_root.join("ledger-docs"),
+        );
+        let state_root = scratch.0.join("vault-profiles");
+        let memory = MemoryStore::for_workspace(state_root.clone(), &scratch.0);
+        let evolution = EvolutionStore::for_workspace(state_root.clone(), &scratch.0);
         Server::new(control(scratch, false), scope)
             .with_soul(SoulStore::new(scratch.0.join("SOUL.md")))
+            .with_ui(ui)
+            .with_vault(VaultStore::open(state_root))
+            .with_memory(memory)
+            .with_evolution(evolution)
     }
 
     fn request(id: u64, method: &str, params: Value) -> Value {
@@ -1883,6 +4203,32 @@ mod tests {
             "github_issue_view",
             "github_issue_create",
             "github_pr_merge",
+            "env_status",
+            "inbox_list",
+            "inbox_post",
+            "inbox_submit_decision",
+            "inbox_update_decision",
+            "inbox_dismiss",
+            "ledger_list",
+            "ledger_record",
+            "ledger_update",
+            "ledger_read_doc",
+            "ledger_append_doc",
+            "ui_post_table",
+            "ui_post_card",
+            "vault_list",
+            "vault_check",
+            "vault_request",
+            "vault_delete",
+            "memory_search",
+            "memory_write",
+            "memory_supersede",
+            "memory_delete",
+            "bot_scorecard",
+            "bot_forge",
+            "bot_record_feedback",
+            "bot_evolve",
+            "bot_decommission",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -1970,27 +4316,10 @@ mod tests {
         });
 
         let broker = AskUserBroker::new(true);
-        let responder = broker.clone();
-        let responder_thread = thread::spawn(move || {
-            for _ in 0..100 {
-                let pending = responder.pending();
-                if let Some(req) = pending.first() {
-                    responder.answer(
-                        &req.request_id,
-                        AskUserAnswer {
-                            selected_index: Some(0),
-                            answer: "MIT".into(),
-                        },
-                    );
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
 
         let server = server(&scratch, Scope::Commander)
             .with_catalog(catalog.clone())
-            .with_ask_user(broker);
+            .with_ask_user(broker.clone());
 
         let spawned = call(
             &server,
@@ -2023,6 +4352,24 @@ mod tests {
         let interrupted = call(&server, "interrupt_worker", json!({"worker_id": "bolt"}));
         assert_eq!(structured(&interrupted)["worker"]["running"], false);
 
+        let responder = broker.clone();
+        let responder_thread = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                let pending = responder.pending();
+                if let Some(req) = pending.first() {
+                    responder.answer(
+                        &req.request_id,
+                        AskUserAnswer {
+                            selected_index: Some(0),
+                            answer: "MIT".into(),
+                        },
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
         let asked = call(
             &server,
             "ask_user",
@@ -2341,11 +4688,530 @@ mod tests {
                 json!({"name": "nova", "role": "r", "task": "x"}),
             ),
             ("remember", json!({"note": "test"})),
+            ("inbox_post", json!({"title": "Note", "detail": "Details"})),
+            ("inbox_dismiss", json!({"key": "agent:1"})),
+            (
+                "ledger_record",
+                json!({"kind": "mission", "owner": "commander", "title": "Ship"}),
+            ),
+            (
+                "ledger_append_doc",
+                json!({"path": "notes.md", "section": "hello"}),
+            ),
+            ("ui_post_card", json!({"title": "Status"})),
+            ("vault_delete", json!({"name": "STRIPE_KEY"})),
+            (
+                "memory_write",
+                json!({"scope": "shared", "kind": "fact", "title": "T", "body": "B"}),
+            ),
+            (
+                "memory_delete",
+                json!({"scope": "shared", "id": "m1", "reason": "obsolete"}),
+            ),
+            (
+                "bot_decommission",
+                json!({"bot_id": "nova", "reason": "unused"}),
+            ),
         ] {
             let refused = call(&server, tool, args);
             assert_eq!(refused["result"]["isError"], true, "{tool}");
         }
+        assert_eq!(
+            structured(&call(&server, "env_status", json!({})))["scope"],
+            "read-only"
+        );
+        assert!(structured(&call(&server, "inbox_list", json!({})))["items"].is_array());
+        assert!(structured(&call(&server, "ledger_list", json!({})))["entries"].is_array());
+        assert!(structured(&call(&server, "vault_list", json!({})))["secrets"].is_array());
+        assert!(structured(&call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "rust"})
+        ))["hits"]
+            .is_array());
+        assert!(structured(&call(&server, "bot_scorecard", json!({})))["scorecards"].is_array());
         assert!(server.control().list().is_empty());
+    }
+
+    #[test]
+    fn memory_and_bot_evolution_mcp_tools_round_trip_with_secret_and_pinned_core_guards() {
+        let scratch = Scratch::new("mcp-memory-evolution");
+        let server = server(&scratch, Scope::Commander);
+
+        let secret_mem = call(
+            &server,
+            "memory_write",
+            json!({
+                "scope": "shared",
+                "kind": "fact",
+                "title": "Bad secret",
+                "body": "Use ghp_1234567890abcdef1234567890abcdef1234 for CI",
+            }),
+        );
+        assert_eq!(secret_mem["result"]["isError"], true);
+
+        let wrote = call(
+            &server,
+            "memory_write",
+            json!({
+                "scope": "shared",
+                "kind": "convention",
+                "title": "Zero comments in Rust",
+                "body": "Keep every Rust module strictly comment-free and formatted.",
+                "tags": ["rust", "style"],
+            }),
+        );
+        let mem_id = structured(&wrote)["entry"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(structured(&wrote)["status"], "created");
+
+        let searched = call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "comment-free", "limit": 5, "token_budget": 400}),
+        );
+        assert_eq!(structured(&searched)["count"], 1);
+        assert_eq!(structured(&searched)["hits"][0]["entry"]["id"], mem_id);
+
+        let superseded = call(
+            &server,
+            "memory_supersede",
+            json!({
+                "scope": "shared",
+                "target_id": mem_id,
+                "kind": "convention",
+                "title": "Zero comments in Rust v2",
+                "body": "Keep all Rust modules comment-free and verified with clippy -D warnings.",
+            }),
+        );
+        let new_id = structured(&superseded)["entry"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(new_id, mem_id);
+
+        let deleted = call(
+            &server,
+            "memory_delete",
+            json!({"scope": "shared", "id": new_id, "reason": "privacy"}),
+        );
+        assert_eq!(structured(&deleted)["deleted"], true);
+        let after_delete = call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "clippy"}),
+        );
+        assert_eq!(structured(&after_delete)["count"], 0);
+
+        let charter = json!({
+            "job": "Audit Rust pull requests for safety and performance regressions.",
+            "anti_jobs": ["Never push commits directly to main."],
+            "voice_and_style": "Terse findings with line numbers.",
+            "verification_bar": "Run clippy and cite exact line numbers.",
+            "allowed_tools": ["read_thread", "github_pr_view"],
+            "instructions": "Inspect diffs and verify invariants before approving.",
+        });
+        let forged = call(
+            &server,
+            "bot_forge",
+            json!({
+                "bot_id": "sentinel",
+                "role": "reviewer",
+                "work_class": "review",
+                "charter": charter,
+                "pinned_core": true,
+                "initial_memory_seeds": ["Always verify atomic writes on Windows and Unix."],
+                "probation_runs": 2,
+                "rationale": "Dedicated safety reviewer for v0.3.",
+            }),
+        );
+        assert_eq!(structured(&forged)["forged"], true);
+        assert_eq!(
+            structured(&forged)["bot"]["blueprint"]["lifecycle"],
+            "probation"
+        );
+
+        let bot_mem = call(
+            &server,
+            "memory_search",
+            json!({"scope": "self", "bot_id": "sentinel", "query": "atomic"}),
+        );
+        assert_eq!(structured(&bot_mem)["count"], 1);
+
+        let fb1 = call(
+            &server,
+            "bot_record_feedback",
+            json!({"bot_id": "sentinel", "signal": "first_try_pass", "task_id": "T-1", "duration_ms": 1200}),
+        );
+        assert_eq!(structured(&fb1)["recorded"], true);
+        let fb2 = call(
+            &server,
+            "bot_record_feedback",
+            json!({"bot_id": "sentinel", "signal": "user_approved", "task_id": "T-2", "duration_ms": 950}),
+        );
+        assert_eq!(structured(&fb2)["report"]["lifecycle"], "active");
+
+        let evolved = call(
+            &server,
+            "bot_evolve",
+            json!({
+                "bot_id": "sentinel",
+                "failure_mode": "verification_missed",
+                "task_summary": "Missed symlink guard check",
+                "root_cause": "Did not inspect symlink_metadata path validation.",
+                "patched_charter": {
+                    "job": "Audit Rust pull requests for safety, symlink hygiene, and regressions.",
+                    "anti_jobs": ["Never push commits directly to main."],
+                    "verification_bar": "Verify symlink_metadata and clippy -D warnings.",
+                    "instructions": "Inspect diffs, symlink guards, and tests.",
+                },
+                "diff_summary": ["+ Added symlink_metadata verification requirement"],
+                "memory_correction": "Always verify symlink_metadata before touching private paths.",
+                "probation_runs": 2,
+            }),
+        );
+        assert_eq!(structured(&evolved)["evolved"], true);
+        assert_eq!(structured(&evolved)["revision"]["version"], 2);
+
+        let cards = call(&server, "bot_scorecard", json!({"bot_id": "sentinel"}));
+        assert_eq!(structured(&cards)["count"], 1);
+        assert_eq!(structured(&cards)["scorecards"][0]["active_revision"], 2);
+
+        let needs_confirm = call(
+            &server,
+            "bot_decommission",
+            json!({"bot_id": "sentinel", "reason": "Replaced by v2 reviewer"}),
+        );
+        assert_eq!(structured(&needs_confirm)["outcome"], "needs_confirmation");
+
+        let confirmed = call(
+            &server,
+            "bot_decommission",
+            json!({"bot_id": "sentinel", "reason": "Replaced by v2 reviewer", "confirmed": true}),
+        );
+        assert_eq!(structured(&confirmed)["outcome"], "decommissioned");
+        assert!(!structured(&confirmed)["distilled_memory_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let distilled = call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "symlink_metadata"}),
+        );
+        assert!(structured(&distilled)["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn self_control_env_inbox_ledger_ui_and_vault_tools_enforce_guards_and_zero_secret_leak() {
+        let scratch = Scratch::new("mcp-self-control");
+        let ledger_root = scratch.0.join("ledger-state");
+        let ui = UiBridge::interactive(None).with_ledger_paths(
+            ledger_root.join("ledger.json"),
+            ledger_root.join("ledger-docs"),
+        );
+        ui.set_env_snapshot(EnvSnapshot {
+            workspace: scratch.0.display().to_string(),
+            git_branch: Some("feat/v0.3-platform".into()),
+            git_dirty_files: 3,
+            active_provider: Some("codex".into()),
+            active_profile: Some("codex-work".into()),
+            permission_mode: Some("supervised".into()),
+            profiles: Vec::new(),
+            external_servers: vec!["github".into()],
+        });
+
+        let vault_store = VaultStore::open(scratch.0.join("vault-profiles"));
+        let raw_secret = "ac_test_secret_material_9876543210_never_leak";
+        vault_store
+            .set(
+                "STRIPE_API_KEY",
+                Zeroizing::new(raw_secret.to_owned()),
+                Some("billing"),
+                Some("Billing API key"),
+            )
+            .unwrap();
+        let resolved = vault_store
+            .resolve_value("STRIPE_API_KEY", Some("billing"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.as_str(), raw_secret);
+
+        let server = Server::new(control(&scratch, false), Scope::Commander)
+            .with_soul(SoulStore::new(scratch.0.join("SOUL.md")))
+            .with_ui(ui.clone())
+            .with_vault(vault_store);
+
+        let env = call(&server, "env_status", json!({}));
+        let env_data = structured(&env);
+        assert_eq!(env_data["git_branch"], "feat/v0.3-platform");
+        assert_eq!(env_data["vault_secret_count"], 1);
+        assert!(env_data["mcp_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "ui_post_table"));
+
+        let posted = call(
+            &server,
+            "inbox_post",
+            json!({
+                "title": "Check secret handling",
+                "detail": format!("Never leak {raw_secret} into inbox"),
+                "level": "attention",
+            }),
+        );
+        let posted_text = posted.to_string();
+        assert!(!posted_text.contains(raw_secret));
+        assert!(posted_text.contains("[REDACTED]"));
+
+        let placeholder_bad = call(
+            &server,
+            "inbox_submit_decision",
+            json!({
+                "title": "Deploy plan",
+                "question": "TBD later?",
+                "recommendation": "Wait",
+                "options": [
+                    {"id": "a", "label": "Option A"},
+                    {"id": "b", "label": "Option B"},
+                ],
+            }),
+        );
+        assert_eq!(error_code(&placeholder_bad), INVALID_PARAMS);
+
+        let submitted = call(
+            &server,
+            "inbox_submit_decision",
+            json!({
+                "id": "DEC-MCP-1",
+                "kind": "design",
+                "title": "Choose transport",
+                "question": "Use loopback stdio bridge for Claude and agy?",
+                "recommendation": "Yes, keeps bearer tokens off disk.",
+                "options": [
+                    {"id": "stdio", "label": "Stdio bridge", "recommended": true},
+                    {"id": "http", "label": "Direct HTTP"},
+                ],
+            }),
+        );
+        assert_eq!(structured(&submitted)["decision"]["record_version"], 1);
+
+        let cas_fail = call(
+            &server,
+            "inbox_update_decision",
+            json!({"id": "DEC-MCP-1", "expected_version": 99, "status": "deferred"}),
+        );
+        assert_eq!(cas_fail["result"]["isError"], true);
+
+        let updated = call(
+            &server,
+            "inbox_update_decision",
+            json!({"id": "DEC-MCP-1", "expected_version": 1, "status": "deferred"}),
+        );
+        assert_eq!(structured(&updated)["decision"]["record_version"], 2);
+        assert_eq!(structured(&updated)["decision"]["status"], "deferred");
+
+        let gate_refused = call(&server, "inbox_dismiss", json!({"key": "gate:prod-1"}));
+        assert_eq!(gate_refused["result"]["isError"], true);
+
+        let inbox = call(&server, "inbox_list", json!({}));
+        assert_eq!(structured(&inbox)["items"].as_array().unwrap().len(), 1);
+        assert_eq!(structured(&inbox)["decisions"].as_array().unwrap().len(), 1);
+
+        let recorded = call(
+            &server,
+            "ledger_record",
+            json!({"kind": "mission", "owner": "builder", "title": "Ship vault", "branch": "feat/v0.3-platform"}),
+        );
+        let task_id = structured(&recorded)["id"].as_str().unwrap().to_owned();
+        let doc_rel_path = structured(&recorded)["entry"]["doc_rel_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(doc_rel_path, format!("ledger-docs/active/{task_id}.md"));
+        let initial_doc = call(&server, "ledger_read_doc", json!({"path": doc_rel_path}));
+        assert!(structured(&initial_doc)["content"]
+            .as_str()
+            .unwrap()
+            .contains("Ship vault"));
+        let appended_entry_doc = call(
+            &server,
+            "ledger_append_doc",
+            json!({"path": doc_rel_path, "section": "## Verification\nShared doc path matches."}),
+        );
+        assert_eq!(structured(&appended_entry_doc)["appended"], true);
+        let reloaded_ledger = Ledger::load(&ledger_root.join("ledger.json"));
+        let tui_doc = reloaded_ledger
+            .read_document(&ledger_root, &task_id)
+            .unwrap();
+        assert!(tui_doc.contains("Ship vault"));
+        assert!(tui_doc.contains("Shared doc path matches."));
+        assert!(!ledger_root.join("ledger-docs").join("ledger-docs").exists());
+
+        let ledger_upd = call(
+            &server,
+            "ledger_update",
+            json!({"id_or_owner": task_id, "status": "done", "changed_files": 7}),
+        );
+        assert_eq!(structured(&ledger_upd)["updated"], true);
+        let listed_ledger = call(&server, "ledger_list", json!({"filter": "done"}));
+        assert_eq!(
+            structured(&listed_ledger)["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for bad_doc in [
+            "../escape.md",
+            "ledger-docs/../escape.md",
+            "/abs.md",
+            "notes.txt",
+            ".hidden.md",
+            "a\\b.md",
+        ] {
+            let err = call(
+                &server,
+                "ledger_append_doc",
+                json!({"path": bad_doc, "section": "hi"}),
+            );
+            assert_eq!(error_code(&err), INVALID_PARAMS, "{bad_doc}");
+        }
+        let secret_doc = call(
+            &server,
+            "ledger_append_doc",
+            json!({"path": "tasks/M-001.md", "section": "token ghp_1234567890abcdef1234567890abcdef1234"}),
+        );
+        assert_eq!(secret_doc["result"]["isError"], true);
+
+        let appended = call(
+            &server,
+            "ledger_append_doc",
+            json!({"path": "tasks/M-001.md", "section": "## Progress\nVault verified."}),
+        );
+        assert_eq!(structured(&appended)["appended"], true);
+        let read_doc = call(
+            &server,
+            "ledger_read_doc",
+            json!({"path": "tasks/M-001.md"}),
+        );
+        assert!(structured(&read_doc)["content"]
+            .as_str()
+            .unwrap()
+            .contains("Vault verified."));
+
+        let bad_table = call(
+            &server,
+            "ui_post_table",
+            json!({"title": "Mismatch", "headers": ["A", "B"], "rows": [["only-one"]]}),
+        );
+        assert_eq!(error_code(&bad_table), INVALID_PARAMS);
+
+        let good_table = call(
+            &server,
+            "ui_post_table",
+            json!({
+                "title": "Provider Matrix",
+                "headers": ["Provider", "Status"],
+                "rows": [["Claude", "Ready"], ["Codex", format!("Leak check {raw_secret}")]],
+                "alignments": ["left", "right"],
+            }),
+        );
+        assert_eq!(structured(&good_table)["posted"], true);
+        let good_card = call(
+            &server,
+            "ui_post_card",
+            json!({
+                "title": "Vault Summary",
+                "level": "success",
+                "badge": "OK",
+                "fields": [{"label": "Backend", "value": VaultStore::backend_name()}],
+                "body_markdown": format!("Scrubbed {raw_secret}"),
+            }),
+        );
+        assert_eq!(structured(&good_card)["posted"], true);
+
+        let events = ui.drain_events();
+        let table_event = events
+            .iter()
+            .find_map(|event| match event {
+                UiEvent::PostTable(card) => Some(card),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!table_event.rows[1][1].contains(raw_secret));
+        assert!(table_event.rows[1][1].contains("[REDACTED]"));
+        let card_event = events
+            .iter()
+            .find_map(|event| match event {
+                UiEvent::PostCard(card) => Some(card),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!card_event.body_markdown.contains(raw_secret));
+
+        let listed_vault = call(&server, "vault_list", json!({"namespace": "billing"}));
+        assert!(!listed_vault.to_string().contains(raw_secret));
+        assert_eq!(
+            structured(&listed_vault)["secrets"][0]["name"],
+            "STRIPE_API_KEY"
+        );
+
+        let checked_vault = call(
+            &server,
+            "vault_check",
+            json!({"namespace": "billing", "names": ["STRIPE_API_KEY", "MISSING_KEY"]}),
+        );
+        assert!(!checked_vault.to_string().contains(raw_secret));
+        assert_eq!(
+            structured(&checked_vault)["present"],
+            json!(["STRIPE_API_KEY"])
+        );
+        assert_eq!(
+            structured(&checked_vault)["missing"],
+            json!(["MISSING_KEY"])
+        );
+
+        let resolver_ui = ui.clone();
+        let resolver_thread = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                let pending = resolver_ui.pending_vault_requests();
+                if let Some(req) = pending.first() {
+                    resolver_ui.resolve_vault_request(
+                        &req.request_id,
+                        VaultRequestOutcome {
+                            status: VaultRequestStatus::Saved,
+                            name: req.name.clone(),
+                            namespace: req.namespace.clone(),
+                            sha256_8: Some("1234abcd".into()),
+                        },
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let requested = call(
+            &server,
+            "vault_request",
+            json!({"name": "DEPLOY_TOKEN", "namespace": "ops", "title": "Need deploy token"}),
+        );
+        resolver_thread.join().unwrap();
+        assert_eq!(structured(&requested)["status"], "saved");
+        assert_eq!(structured(&requested)["sha256_8"], "1234abcd");
+
+        let deleted = call(
+            &server,
+            "vault_delete",
+            json!({"name": "STRIPE_API_KEY", "namespace": "billing"}),
+        );
+        assert_eq!(structured(&deleted)["deleted"], true);
     }
 
     #[test]
