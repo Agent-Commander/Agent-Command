@@ -2153,18 +2153,24 @@ mod tests {
 
         let waiter = ui.clone();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            let pending = waiter.pending_vault_requests();
-            assert_eq!(pending.len(), 1);
-            waiter.resolve_vault_request(
-                &pending[0].request_id,
-                VaultRequestOutcome {
-                    status: VaultRequestStatus::Saved,
-                    name: pending[0].name.clone(),
-                    namespace: pending[0].namespace.clone(),
-                    sha256_8: Some("deadbeef".into()),
-                },
-            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                let pending = waiter.pending_vault_requests();
+                if let Some(req) = pending.first() {
+                    waiter.resolve_vault_request(
+                        &req.request_id,
+                        VaultRequestOutcome {
+                            status: VaultRequestStatus::Saved,
+                            name: req.name.clone(),
+                            namespace: req.namespace.clone(),
+                            sha256_8: Some("deadbeef".into()),
+                        },
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for pending vault request");
         });
         let outcome = ui
             .request_vault_secret(

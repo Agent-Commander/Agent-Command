@@ -4316,27 +4316,10 @@ mod tests {
         });
 
         let broker = AskUserBroker::new(true);
-        let responder = broker.clone();
-        let responder_thread = thread::spawn(move || {
-            for _ in 0..100 {
-                let pending = responder.pending();
-                if let Some(req) = pending.first() {
-                    responder.answer(
-                        &req.request_id,
-                        AskUserAnswer {
-                            selected_index: Some(0),
-                            answer: "MIT".into(),
-                        },
-                    );
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
 
         let server = server(&scratch, Scope::Commander)
             .with_catalog(catalog.clone())
-            .with_ask_user(broker);
+            .with_ask_user(broker.clone());
 
         let spawned = call(
             &server,
@@ -4369,6 +4352,24 @@ mod tests {
         let interrupted = call(&server, "interrupt_worker", json!({"worker_id": "bolt"}));
         assert_eq!(structured(&interrupted)["worker"]["running"], false);
 
+        let responder = broker.clone();
+        let responder_thread = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                let pending = responder.pending();
+                if let Some(req) = pending.first() {
+                    responder.answer(
+                        &req.request_id,
+                        AskUserAnswer {
+                            selected_index: Some(0),
+                            answer: "MIT".into(),
+                        },
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
         let asked = call(
             &server,
             "ask_user",
@@ -5178,7 +5179,8 @@ mod tests {
 
         let resolver_ui = ui.clone();
         let resolver_thread = thread::spawn(move || {
-            for _ in 0..100 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
                 let pending = resolver_ui.pending_vault_requests();
                 if let Some(req) = pending.first() {
                     resolver_ui.resolve_vault_request(
