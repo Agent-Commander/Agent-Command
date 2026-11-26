@@ -1012,8 +1012,13 @@ impl ScrollState {
         let last_line = end.line.min(last_valid);
 
         let mut output = String::new();
-        for line_idx in first_line..=last_line {
-            let rendered = &self.rendered_lines[line_idx];
+        for (line_idx, rendered) in self
+            .rendered_lines
+            .iter()
+            .enumerate()
+            .take(last_line + 1)
+            .skip(first_line)
+        {
             let (min_col, max_col) = selection_line_bounds(
                 rendered, line_idx, first_line, last_line, start.col, end.col,
             );
