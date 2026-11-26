@@ -97,6 +97,159 @@ impl Metric {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchmarkComponent {
+    FrontierCode,
+    TerminalBench,
+    SweAtlasQna,
+}
+
+impl BenchmarkComponent {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::FrontierCode => "frontiercode",
+            Self::TerminalBench => "terminal-bench",
+            Self::SweAtlasQna => "swe-atlas-qna",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FrontierCode => "AA frontiercode",
+            Self::TerminalBench => "AA terminal-bench",
+            Self::SweAtlasQna => "AA swe-atlas-qna",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ComponentScores {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontiercode: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_bench: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swe_atlas_qna: Option<f64>,
+}
+
+impl ComponentScores {
+    pub fn value(self, component: BenchmarkComponent) -> Option<f64> {
+        match component {
+            BenchmarkComponent::FrontierCode => self.frontiercode,
+            BenchmarkComponent::TerminalBench => self.terminal_bench,
+            BenchmarkComponent::SweAtlasQna => self.swe_atlas_qna,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.frontiercode.is_none() && self.terminal_bench.is_none() && self.swe_atlas_qna.is_none()
+    }
+}
+
+const COMPONENTS_CACHE_FILE: &str = "components.json";
+const COMPONENTS_SCHEMA: &str = "agent-command-catalog-components-v1";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComponentEntry {
+    pub provider: String,
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub scores: ComponentScores,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ComponentCatalog {
+    pub entries: Vec<ComponentEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ComponentCatalogFile {
+    schema: String,
+    entries: Vec<ComponentEntry>,
+}
+
+impl ComponentCatalog {
+    pub fn load(state: Option<&Path>) -> Self {
+        let Some(state) = state else {
+            return Self::default();
+        };
+        let path = cache_directory(state).join(COMPONENTS_CACHE_FILE);
+        let Ok(bytes) = fs::read(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_slice::<ComponentCatalogFile>(&bytes) {
+            Ok(file) if file.schema == COMPONENTS_SCHEMA => Self {
+                entries: file.entries,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    pub fn save(&self, state: &Path) -> io::Result<()> {
+        let directory = cache_directory(state);
+        fs::create_dir_all(&directory)?;
+        let target = directory.join(COMPONENTS_CACHE_FILE);
+        let temporary = target.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
+        let payload = ComponentCatalogFile {
+            schema: COMPONENTS_SCHEMA.into(),
+            entries: self.entries.clone(),
+        };
+        let mut file = File::create_new(&temporary)?;
+        serde_json::to_writer(&mut file, &payload)?;
+        file.sync_all()?;
+        drop(file);
+        if fs::rename(&temporary, &target).is_err() {
+            let bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+            fs::write(&target, &bytes)?;
+            let _ = fs::remove_file(&temporary);
+        }
+        Ok(())
+    }
+
+    pub fn scores_for(
+        &self,
+        provider: Provider,
+        slug: &str,
+        effort: Option<&str>,
+    ) -> ComponentScores {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.provider == provider.binary()
+                    && entry.slug == slug
+                    && entry.effort.as_deref() == effort
+            })
+            .map(|entry| entry.scores)
+            .unwrap_or_default()
+    }
+}
+
+pub fn extract_component_scores(raw: &Value) -> ComponentScores {
+    let Some(map) = raw.get("components").and_then(Value::as_object) else {
+        return ComponentScores::default();
+    };
+    let lookup = |prefix: &str| {
+        let mut keys: Vec<&String> = map
+            .keys()
+            .filter(|key| *key == prefix || key.starts_with(&format!("{prefix}-")))
+            .collect();
+        keys.sort();
+        if keys.len() != 1 {
+            return None;
+        }
+        map.get(keys[0])
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+    };
+    ComponentScores {
+        frontiercode: lookup(BenchmarkComponent::FrontierCode.prefix()),
+        terminal_bench: lookup(BenchmarkComponent::TerminalBench.prefix()),
+        swe_atlas_qna: lookup(BenchmarkComponent::SweAtlasQna.prefix()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SpeedUnit {
@@ -271,6 +424,7 @@ pub(crate) struct Metrics {
     pub(crate) coding_index: Option<f64>,
     pub(crate) intelligence_index: Option<f64>,
     pub(crate) speed: Option<Speed>,
+    pub(crate) components: ComponentScores,
 }
 
 impl Metrics {
@@ -279,6 +433,10 @@ impl Metrics {
             Metric::Coding => self.coding_index,
             Metric::Intelligence => self.intelligence_index,
         }
+    }
+
+    pub(crate) fn component(&self, component: BenchmarkComponent) -> Option<f64> {
+        self.components.value(component)
     }
 }
 
@@ -367,6 +525,14 @@ impl Catalog {
     }
 
     pub(crate) fn metrics(&self, benchmark: &Benchmark) -> Metrics {
+        self.metrics_with_components(benchmark, None)
+    }
+
+    pub(crate) fn metrics_with_components(
+        &self,
+        benchmark: &Benchmark,
+        components: Option<&ComponentCatalog>,
+    ) -> Metrics {
         let agent = self.exact_row(
             Endpoint::AgentsCoding,
             benchmark.provider,
@@ -379,6 +545,11 @@ impl Catalog {
             &benchmark.models_free_slug(),
             None,
         );
+        let component_scores = components
+            .map(|catalog| {
+                catalog.scores_for(benchmark.provider, &benchmark.slug, benchmark.effort)
+            })
+            .unwrap_or_default();
         Metrics {
             coding_agent_index: agent.and_then(|row| row.coding_index),
             coding_index: model.and_then(|row| row.coding_index),
@@ -386,6 +557,7 @@ impl Catalog {
             speed: agent
                 .and_then(|row| row.speed)
                 .or_else(|| model.and_then(|row| row.speed)),
+            components: component_scores,
         }
     }
 
@@ -1397,6 +1569,7 @@ mod tests {
                 coding_index: None,
                 intelligence_index: Some(61.5),
                 speed: seconds(310.0),
+                components: ComponentScores::default(),
             }
         );
         assert_eq!(
@@ -1406,6 +1579,7 @@ mod tests {
                 coding_index: None,
                 intelligence_index: Some(58.0),
                 speed: seconds(330.0),
+                components: ComponentScores::default(),
             }
         );
         assert_eq!(
@@ -1429,6 +1603,7 @@ mod tests {
                 coding_index: None,
                 intelligence_index: Some(63.0),
                 speed: seconds(280.0),
+                components: ComponentScores::default(),
             }
         );
         let variant_rows: Vec<_> = catalog
@@ -2034,6 +2209,61 @@ mod tests {
             require_same_origin("https://artificialanalysis.ai/api/v2/data/llms/models").is_err()
         );
         assert!(require_same_origin(&page_url(Endpoint::AgentsCoding, 2)).is_ok());
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn component_catalog_extracts_persists_and_merges_aa_components() {
+        let raw = json!({
+            "components": {
+                "frontiercode-v2": 74.5,
+                "terminal-bench-2": 68.0,
+                "swe-atlas-qna": 81.25
+            }
+        });
+        let extracted = extract_component_scores(&raw);
+        assert_eq!(
+            extracted.value(BenchmarkComponent::FrontierCode),
+            Some(74.5)
+        );
+        assert_eq!(
+            extracted.value(BenchmarkComponent::TerminalBench),
+            Some(68.0)
+        );
+        assert_eq!(
+            extracted.value(BenchmarkComponent::SweAtlasQna),
+            Some(81.25)
+        );
+
+        let ambiguous = json!({
+            "components": {
+                "frontiercode-v1": 50.0,
+                "frontiercode-v2": 70.0
+            }
+        });
+        assert!(extract_component_scores(&ambiguous).is_empty());
+
+        let (state, catalog) = refreshed_catalog("components");
+        let comp_catalog = ComponentCatalog {
+            entries: vec![ComponentEntry {
+                provider: "claude".into(),
+                slug: "claude-opus-5-5".into(),
+                effort: Some("high".into()),
+                scores: extracted,
+            }],
+        };
+        comp_catalog.save(&state).unwrap();
+        let reloaded = ComponentCatalog::load(Some(&state));
+        assert_eq!(reloaded, comp_catalog);
+
+        let benchmark =
+            native::benchmark(Provider::Claude, Some("claude-opus-5-5"), Some("high")).unwrap();
+        let merged = catalog.metrics_with_components(&benchmark, Some(&reloaded));
+        assert_eq!(
+            merged.component(BenchmarkComponent::FrontierCode),
+            Some(74.5)
+        );
+        assert_eq!(merged.intelligence_index, Some(63.0));
         fs::remove_dir_all(state).unwrap();
     }
 }

@@ -1,8 +1,9 @@
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    buffer::CellDiffOption,
+    layout::{Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -15,7 +16,7 @@ use crate::{
     tui::{
         events::ChangedFile,
         left_panel, provider_short_name,
-        tabs::{self, ViewTab},
+        tabs::{self, VaultModalMode, ViewTab},
     },
     update::UpdateState,
     App,
@@ -101,6 +102,7 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
     app.focus_banner_hits.clear();
     app.welcome_hits.clear();
     app.left_hits.clear();
+    app.pending_sixel_rings.clear();
     app.last_frame_width = area.width;
 
     if area.width < 12 || area.height < 6 {
@@ -158,8 +160,21 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
         canvas_area
     };
 
+    let any_modal_open = app.panel.is_some()
+        || app.palette.is_open()
+        || app.diff_modal.is_open()
+        || app.inbox_modal.is_some()
+        || app.ledger_viewer.is_some()
+        || app.vault_modal.is_some();
+
     match app.view_tab {
-        ViewTab::Chat => draw_canvas(app, frame, canvas_area, &palette),
+        ViewTab::Chat => draw_canvas(
+            app,
+            frame,
+            canvas_area,
+            &palette,
+            any_modal_open || app.autocomplete.is_open(),
+        ),
         ViewTab::Inbox => {
             app.transcript_area = Rect::default();
             left_panel::draw_inbox_view(app, frame, canvas_area, &palette);
@@ -190,22 +205,19 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
     let composer_focused = app.editing
         && !app.rail_focused
         && !app.left_focused
-        && !app.palette.is_open()
-        && !app.diff_modal.is_open()
-        && app.panel.is_none();
+        && !app.keyboard_select_mode
+        && !any_modal_open;
     let target = (app.selected > 0).then(|| app.crew[app.selected].name.clone());
     app.composer.set_target(target);
     app.composer
         .render(frame, composer_area, composer_focused, &palette);
+    draw_composer_image_badge(app, frame, composer_area, &palette);
 
     draw_footer(app, frame, footer_area, &palette);
 
-    if app.autocomplete.is_open()
-        && composer_focused
-        && !app.palette.is_open()
-        && !app.diff_modal.is_open()
-        && app.panel.is_none()
-    {
+    let mut autocomplete_rect = Rect::default();
+    if app.autocomplete.is_open() && composer_focused && !any_modal_open {
+        autocomplete_rect = estimated_autocomplete_rect(composer_area, area);
         app.autocomplete
             .render(frame, composer_area, area, &palette);
     }
@@ -218,7 +230,11 @@ pub fn draw_single_canvas(app: &mut App, frame: &mut Frame) {
         app.palette.render(frame, area, &palette);
     }
 
+    let vault_rect = draw_vault_modal(app, frame, area, &palette);
+
     app.draw_panel(frame, area);
+
+    apply_sixel_occlusion(app, frame, area, canvas_area, autocomplete_rect, vault_rect);
 }
 
 fn draw_top_bar(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette) {
@@ -392,7 +408,13 @@ fn draw_top_bar_details(
     );
 }
 
-fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette) {
+fn draw_canvas(
+    app: &mut App,
+    frame: &mut Frame,
+    area: Rect,
+    palette: &UiPalette,
+    suppress_popover: bool,
+) {
     if area.width == 0 || area.height == 0 {
         app.transcript_area = Rect::default();
         return;
@@ -431,29 +453,42 @@ fn draw_canvas(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPalette
         return;
     }
     let activity = app.active_live_activity(&selected_key);
+    let render_with_popover_guard =
+        |frame: &mut Frame,
+         transcript: &markdown::Transcript,
+         scroll: &mut markdown::ScrollState| {
+            let paused_popover = if suppress_popover && scroll.popover_open() {
+                scroll
+                    .selection()
+                    .map(|sel| (sel.anchor, sel.focus, sel.focused_button))
+            } else {
+                None
+            };
+            if let Some((anchor, focus, _)) = paused_popover {
+                scroll.set_selection(anchor, focus, false);
+            }
+            markdown::render_transcript_with_activity(
+                frame,
+                content_area,
+                transcript,
+                scroll,
+                palette,
+                activity.as_ref(),
+            );
+            if let Some((anchor, focus, btn)) = paused_popover {
+                scroll.set_selection(anchor, focus, true);
+                scroll.focus_popover_button(btn);
+            }
+        };
     if selected_key == specialists::COMMANDER {
-        markdown::render_transcript_with_activity(
-            frame,
-            content_area,
-            &app.transcript,
-            &mut app.scroll,
-            palette,
-            activity.as_ref(),
-        );
+        render_with_popover_guard(frame, &app.transcript, &mut app.scroll);
     } else {
         let transcript = app
             .specialist_transcripts
             .entry(selected_key.clone())
             .or_default();
         let scroll = app.specialist_scrolls.entry(selected_key).or_default();
-        markdown::render_transcript_with_activity(
-            frame,
-            content_area,
-            transcript,
-            scroll,
-            palette,
-            activity.as_ref(),
-        );
+        render_with_popover_guard(frame, transcript, scroll);
     }
 }
 
@@ -689,7 +724,12 @@ fn draw_right_rail(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPal
     let mut y = inner.y;
     let bottom = inner.bottom();
 
-    let worker_count = app.crew.len().saturating_sub(1);
+    let worker_count = app
+        .crew
+        .iter()
+        .skip(1)
+        .filter(|member| !app.decommissioned_bots.contains(&member.name))
+        .count();
     let header_left = format!(" WORKERS ({worker_count})");
     let toggle_label = "[Ctrl+B]";
     let toggle_w = text_u16(toggle_label);
@@ -717,14 +757,18 @@ fn draw_right_rail(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPal
     let workers_start_y = y;
     let max_worker_rows = ((bottom.saturating_sub(y)) / 2).clamp(2, 10) as usize;
     let rows = app.roster_rows();
-    for row in rows.into_iter().take(max_worker_rows) {
-        if y >= bottom.saturating_sub(1) {
+    let mut rendered_rows = 0usize;
+    for row in rows {
+        if rendered_rows >= max_worker_rows || y >= bottom.saturating_sub(1) {
             break;
         }
         let row_rect = Rect::new(inner.x, y, inner.width, 1);
         match row {
             RosterRow::Member(idx) => {
                 let member = &app.crew[idx];
+                if idx > 0 && app.decommissioned_bots.contains(&member.name) {
+                    continue;
+                }
                 let selected = idx == app.selected;
                 let row_bg = if selected { palette.selection_bg } else { bg };
                 let (dot, dot_fg) = match member.status {
@@ -747,39 +791,65 @@ fn draw_right_rail(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPal
                 };
                 let status_str = status_owned.as_str();
                 let status_w = display_width(status_str);
-                let name_budget = w.saturating_sub(status_w + 5).max(4);
+                let badge = app
+                    .bot_badges
+                    .get(&member.name)
+                    .map(String::as_str)
+                    .filter(|b| !b.is_empty());
+                let badge_text = badge.map(|b| format!(" [{b}]"));
+                let badge_w = badge_text.as_deref().map_or(0, display_width);
+                let show_badge = badge_w > 0 && w >= status_w + badge_w + 10;
+                let used_badge_w = if show_badge { badge_w } else { 0 };
+                let name_budget = w.saturating_sub(status_w + used_badge_w + 5).max(4);
                 let name_text = truncate_width(&member.name, name_budget);
                 let pad = w
-                    .saturating_sub(3 + display_width(&name_text) + status_w + 1)
+                    .saturating_sub(3 + display_width(&name_text) + used_badge_w + status_w + 1)
                     .max(1);
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(format!(" {dot} "), Style::default().fg(dot_fg).bg(row_bg)),
-                        Span::styled(
-                            name_text,
+                let mut row_spans = vec![
+                    Span::styled(format!(" {dot} "), Style::default().fg(dot_fg).bg(row_bg)),
+                    Span::styled(
+                        name_text,
+                        Style::default()
+                            .fg(if selected {
+                                palette.selection_fg
+                            } else {
+                                palette.fg
+                            })
+                            .bg(row_bg)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ];
+                if show_badge {
+                    if let (Some(raw_badge), Some(formatted)) = (badge, badge_text) {
+                        let badge_fg = match raw_badge {
+                            "PROB" => palette.warning,
+                            "MUT" => palette.accent,
+                            "REV" => palette.danger,
+                            "ACT" => palette.success,
+                            _ => palette.info,
+                        };
+                        row_spans.push(Span::styled(
+                            formatted,
                             Style::default()
-                                .fg(if selected {
-                                    palette.selection_fg
-                                } else {
-                                    palette.fg
-                                })
+                                .fg(badge_fg)
                                 .bg(row_bg)
-                                .add_modifier(if selected {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                }),
-                        ),
-                        Span::styled(" ".repeat(pad), Style::default().bg(row_bg)),
-                        Span::styled(
-                            format!("{status_str} "),
-                            Style::default().fg(dot_fg).bg(row_bg),
-                        ),
-                    ])),
-                    row_rect,
-                );
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                row_spans.push(Span::styled(" ".repeat(pad), Style::default().bg(row_bg)));
+                row_spans.push(Span::styled(
+                    format!("{status_str} "),
+                    Style::default().fg(dot_fg).bg(row_bg),
+                ));
+                frame.render_widget(Paragraph::new(Line::from(row_spans)), row_rect);
                 app.rail_hits.push((row_rect, RailHit::SelectMember(idx)));
                 y += 1;
+                rendered_rows += 1;
             }
             RosterRow::Settled { count, open } => {
                 let marker = if open { "▾" } else { "▸" };
@@ -793,6 +863,7 @@ fn draw_right_rail(app: &mut App, frame: &mut Frame, area: Rect, palette: &UiPal
                 );
                 app.rail_hits.push((row_rect, RailHit::ToggleSettled));
                 y += 1;
+                rendered_rows += 1;
             }
         }
     }
@@ -1022,6 +1093,10 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
     let mode_label = app.footer_mode_label();
     let left_text = if app.esc_armed_active() {
         format!(" {mode_label} · Press Esc again to cancel active turn")
+    } else if app.keyboard_select_mode {
+        format!(
+            " {mode_label} · SELECT: ↑↓←→ extend · Space anchor · Enter actions · q Quote · c Copy · Esc exit"
+        )
     } else if !app.notice.is_empty() {
         format!(" {mode_label} · {}", app.notice)
     } else if pending_continuation {
@@ -1029,7 +1104,7 @@ fn draw_footer(app: &mut App, frame: &mut Frame, bar: Rect, palette: &UiPalette)
     } else {
         format!(" {mode_label} · Esc×2 cancel · Ctrl+P palette · /help")
     };
-    let left_fg = if app.esc_armed_active() {
+    let left_fg = if app.esc_armed_active() || app.keyboard_select_mode {
         palette.warning
     } else {
         palette.muted
@@ -1064,4 +1139,358 @@ fn update_button_style(app: &App, palette: &UiPalette) -> Style {
         .fg(palette.bg)
         .bg(bg)
         .add_modifier(Modifier::BOLD)
+}
+
+fn draw_composer_image_badge(
+    app: &App,
+    frame: &mut Frame,
+    composer_area: Rect,
+    palette: &UiPalette,
+) {
+    let images = app.composer.images();
+    if images.is_empty() || composer_area.width < 26 || composer_area.height < 3 {
+        return;
+    }
+    let summary = if images.len() == 1 {
+        format!(" [Image #1 · {}] ", truncate_width(&images[0].label, 24))
+    } else {
+        format!(" [{} images attached] ", images.len())
+    };
+    let max_badge_w = composer_area.width.saturating_sub(18);
+    if max_badge_w < 8 {
+        return;
+    }
+    let clipped = truncate_width(&summary, usize::from(max_badge_w));
+    let badge_w = text_u16(&clipped);
+    let badge_x = composer_area
+        .right()
+        .saturating_sub(badge_w + 2)
+        .max(composer_area.x + 1);
+    let rect = Rect::new(badge_x, composer_area.y, badge_w, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            clipped,
+            Style::default()
+                .fg(palette.bg)
+                .bg(palette.info)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        rect,
+    );
+}
+
+pub(crate) fn vault_modal_rect(area: Rect) -> Rect {
+    if area.width < 24 || area.height < 8 {
+        return Rect::default();
+    }
+    let modal_w = area.width.saturating_sub(6).clamp(24, 74);
+    let modal_h = area.height.saturating_sub(4).clamp(8, 20);
+    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    Rect::new(modal_x, modal_y, modal_w, modal_h)
+}
+
+fn draw_vault_modal(app: &App, frame: &mut Frame, area: Rect, palette: &UiPalette) -> Rect {
+    let Some(modal) = app.vault_modal.as_ref() else {
+        return Rect::default();
+    };
+    let rect = vault_modal_rect(area);
+    if rect.width == 0 || rect.height == 0 {
+        return Rect::default();
+    }
+    frame.render_widget(Clear, rect);
+    let title = match modal.mode {
+        VaultModalMode::List => " Vault Secrets (metadata only) ",
+        VaultModalMode::PromptSecret => " Vault · Store Secret ",
+    };
+    let border_color = match modal.mode {
+        VaultModalMode::List => palette.accent,
+        VaultModalMode::PromptSecret => palette.warning,
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().bg(palette.surface).fg(palette.fg))
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width < 8 || inner.height < 3 {
+        return rect;
+    }
+
+    let w = inner.width as usize;
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let body_area = chunks[0];
+    let footer_area = chunks[1];
+
+    match modal.mode {
+        VaultModalMode::List => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            if modal.entries.is_empty() {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "  No secrets stored in this vault yet.",
+                    Style::default().fg(palette.muted),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  Run `/vault set NAME` or `agent-command vault set NAME --stdin`.",
+                    Style::default().fg(palette.subtle),
+                )));
+            } else {
+                let visible_h = body_area.height as usize;
+                let scroll_top = modal.selected.saturating_sub(visible_h.saturating_sub(1));
+                for (idx, meta) in modal
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(scroll_top)
+                    .take(visible_h)
+                {
+                    let selected = idx == modal.selected;
+                    let row_bg = if selected {
+                        palette.selection_bg
+                    } else {
+                        palette.surface
+                    };
+                    let name_fg = if selected {
+                        palette.selection_fg
+                    } else {
+                        palette.fg
+                    };
+                    let key = format!("{}/{}", meta.namespace, meta.name);
+                    let digest = format!("sha256:{}", meta.sha256_8);
+                    let desc = if meta.description.is_empty() {
+                        format!("{} B", meta.value_bytes)
+                    } else {
+                        format!("{} B · {}", meta.value_bytes, meta.description)
+                    };
+                    let lead = if selected { " ▸ " } else { "   " };
+                    let text = truncate_width(&format!("{lead}{key}  [{digest}]  {desc}"), w);
+                    lines.push(Line::from(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(name_fg)
+                            .bg(row_bg)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    )));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(palette.surface)),
+                body_area,
+            );
+            let footer = truncate_width(
+                " [↑↓] Select · [Enter] Rotate · [d] Delete · [Esc] Close",
+                w,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    footer,
+                    Style::default().fg(palette.muted).bg(palette.surface),
+                ))),
+                footer_area,
+            );
+        }
+        VaultModalMode::PromptSecret => {
+            let masked_len = modal.secret_input.chars().count();
+            let masked = "•".repeat(masked_len);
+            let mut lines: Vec<Line<'static>> = vec![
+                Line::from(vec![
+                    Span::styled(
+                        " Name:      ",
+                        Style::default()
+                            .fg(palette.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_width(&modal.name, w.saturating_sub(12)),
+                        Style::default()
+                            .fg(palette.accent_soft)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        " Namespace: ",
+                        Style::default()
+                            .fg(palette.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_width(&modal.namespace, w.saturating_sub(12)),
+                        Style::default().fg(palette.fg),
+                    ),
+                ]),
+            ];
+            if !modal.description.trim().is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " Reason:    ",
+                        Style::default()
+                            .fg(palette.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_width(&modal.description, w.saturating_sub(12)),
+                        Style::default().fg(palette.muted),
+                    ),
+                ]));
+            }
+            lines.push(Line::default());
+            let input_row_rel = lines.len() as u16;
+            let field_budget = w.saturating_sub(12).max(4);
+            let visible_mask: String = if masked_len > field_budget {
+                "•".repeat(field_budget)
+            } else {
+                masked
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " Secret:    ",
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if visible_mask.is_empty() {
+                        "(type or paste secret — hidden)".to_owned()
+                    } else {
+                        visible_mask.clone()
+                    },
+                    Style::default()
+                        .fg(if visible_mask.is_empty() {
+                            palette.subtle
+                        } else {
+                            palette.fg
+                        })
+                        .bg(palette.code_bg),
+                ),
+            ]));
+            if let Some(error) = modal.error.as_deref() {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    truncate_width(&format!(" ✗ {error}"), w),
+                    Style::default().fg(palette.danger),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(palette.surface)),
+                body_area,
+            );
+            if input_row_rel < body_area.height {
+                let cx = body_area
+                    .x
+                    .saturating_add(12 + visible_mask.chars().count() as u16)
+                    .min(body_area.right().saturating_sub(1));
+                let cy = body_area.y.saturating_add(input_row_rel);
+                frame.set_cursor_position(Position::new(cx, cy));
+            }
+            let footer = truncate_width(
+                " [Enter] Save to Vault · [Ctrl+V] Paste · [Esc] Cancel (never sent to LLM)",
+                w,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    footer,
+                    Style::default().fg(palette.muted).bg(palette.surface),
+                ))),
+                footer_area,
+            );
+        }
+    }
+    rect
+}
+
+fn estimated_autocomplete_rect(anchor_area: Rect, bounds: Rect) -> Rect {
+    if bounds.width < 16 || anchor_area.y <= bounds.y + 2 {
+        return Rect::default();
+    }
+    let avail_above = anchor_area.y.saturating_sub(bounds.y);
+    let popup_h = 9u16.min(avail_above);
+    if popup_h < 3 {
+        return Rect::default();
+    }
+    let popup_w = anchor_area.width.min(bounds.width).clamp(16, 68);
+    let popup_x = anchor_area.x.min(bounds.right().saturating_sub(popup_w));
+    let popup_y = anchor_area.y.saturating_sub(popup_h);
+    Rect::new(popup_x, popup_y, popup_w, popup_h)
+}
+
+fn apply_sixel_occlusion(
+    app: &mut App,
+    frame: &mut Frame,
+    area: Rect,
+    canvas_area: Rect,
+    autocomplete_rect: Rect,
+    vault_rect: Rect,
+) {
+    if !app.graphics.sixel {
+        app.pending_sixel_rings.clear();
+        return;
+    }
+
+    let mut overlays: Vec<Rect> = Vec::new();
+    if app.panel.is_some() {
+        overlays.push(area);
+    }
+    if app.palette.is_open() && area.width >= 12 && area.height >= 6 {
+        let modal_w = area.width.saturating_sub(4).clamp(12, 76);
+        let modal_h = area.height.saturating_sub(2).clamp(6, 22);
+        let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+        let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+        overlays.push(Rect::new(modal_x, modal_y, modal_w, modal_h));
+    }
+    if app.diff_modal.is_open() && area.width >= 16 && area.height >= 8 {
+        overlays.push(Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        ));
+    }
+    if autocomplete_rect.width > 0 && autocomplete_rect.height > 0 {
+        overlays.push(autocomplete_rect);
+    }
+    if app.inbox_modal.is_some() && area.width >= 20 && area.height >= 8 {
+        let modal_w = area.width.saturating_sub(4).clamp(20, 96);
+        let modal_h = area
+            .height
+            .saturating_sub(4)
+            .clamp(8, area.height.saturating_sub(2));
+        let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+        let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+        overlays.push(Rect::new(modal_x, modal_y, modal_w, modal_h));
+    }
+    if app.ledger_viewer.is_some() {
+        if area.width < 120 {
+            overlays.push(area);
+        } else {
+            overlays.push(canvas_area);
+        }
+    }
+    if vault_rect.width > 0 && vault_rect.height > 0 {
+        overlays.push(vault_rect);
+    }
+    let popover_rect = app.active_scroll().popover_rects().container;
+    if popover_rect.width > 0 && popover_rect.height > 0 {
+        overlays.push(popover_rect);
+    }
+
+    app.pending_sixel_rings.retain(|slot| {
+        slot.fits_without_scroll(area) && !token_burn::rect_intersects_any(slot.rect, &overlays)
+    });
+
+    let buf = frame.buffer_mut();
+    for slot in &app.pending_sixel_rings {
+        for y in slot.rect.y..slot.rect.bottom() {
+            for x in slot.rect.x..slot.rect.right() {
+                buf[(x, y)].set_diff_option(CellDiffOption::Skip);
+            }
+        }
+    }
 }

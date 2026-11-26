@@ -322,3 +322,89 @@ fn connect_requires_a_token_for_remote_daemons() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("No daemon token"));
 }
+
+#[test]
+fn vault_subcommand_is_documented_and_round_trips_in_isolated_root() {
+    use std::io::Write;
+    let binary = env!("CARGO_BIN_EXE_agent-command");
+    let help = Command::new(binary)
+        .args(["--help"])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("vault"));
+
+    let root = std::env::temp_dir().join(format!("agent-cli-vault-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let run = |args: &[&str]| {
+        Command::new(binary)
+            .arg("vault")
+            .args(args)
+            .env("SUB_AUTH_DIR", &root)
+            .output()
+            .unwrap()
+    };
+
+    let empty_list = run(&["list"]);
+    assert!(empty_list.status.success(), "{empty_list:?}");
+    assert!(String::from_utf8_lossy(&empty_list.stdout).contains("No secrets stored."));
+
+    let missing_check = run(&["check", "TEST_API_KEY"]);
+    assert!(missing_check.status.success(), "{missing_check:?}");
+    let check_out = String::from_utf8_lossy(&missing_check.stdout);
+    assert!(check_out.contains("missing: TEST_API_KEY"), "{check_out}");
+
+    let refused_no_stdin = run(&["set", "TEST_API_KEY"]);
+    assert!(!refused_no_stdin.status.success());
+
+    let synthetic_secret = "synthetic-vault-test-value-987654321";
+    let mut setter = Command::new(binary)
+        .args([
+            "vault",
+            "set",
+            "TEST_API_KEY",
+            "--stdin",
+            "--desc",
+            "Integration check",
+        ])
+        .env("SUB_AUTH_DIR", &root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    setter
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(synthetic_secret.as_bytes())
+        .unwrap();
+    let set_out = setter.wait_with_output().unwrap();
+    assert!(set_out.status.success(), "{set_out:?}");
+    assert!(!String::from_utf8_lossy(&set_out.stdout).contains(synthetic_secret));
+
+    let present_check = run(&["check", "TEST_API_KEY", "ABSENT_KEY"]);
+    assert!(present_check.status.success(), "{present_check:?}");
+    let present_text = String::from_utf8_lossy(&present_check.stdout);
+    assert!(
+        present_text.contains("present: TEST_API_KEY"),
+        "{present_text}"
+    );
+    assert!(
+        present_text.contains("missing: ABSENT_KEY"),
+        "{present_text}"
+    );
+
+    let listed = run(&["list"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_text = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed_text.contains("TEST_API_KEY"), "{listed_text}");
+    assert!(!listed_text.contains(synthetic_secret));
+
+    let deleted = run(&["delete", "TEST_API_KEY"]);
+    assert!(deleted.status.success(), "{deleted:?}");
+    let after_delete = run(&["list"]);
+    assert!(String::from_utf8_lossy(&after_delete.stdout).contains("No secrets stored."));
+    let _ = std::fs::remove_dir_all(root);
+}

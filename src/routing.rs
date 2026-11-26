@@ -1,13 +1,17 @@
 use crate::{
     auth::{self, Profile, Provider},
-    catalog::{Catalog, Metric, Metrics, SpeedUnit, KEY_VARIABLE},
+    catalog::{
+        BenchmarkComponent, Catalog, ComponentCatalog, Metric, Metrics, SpeedUnit, KEY_VARIABLE,
+    },
     native::{self, Benchmark, Pin, Pins, DEFAULT_SETTING},
     usage::{Tick, Usage},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    fs, io,
+    collections::{BTreeMap, HashMap},
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -318,6 +322,16 @@ pub(crate) fn candidates(
     pins: &Pins,
     now: Tick,
 ) -> (Vec<Candidate>, Vec<Exclusion>) {
+    candidates_with_components(profiles, catalog, None, pins, now)
+}
+
+pub(crate) fn candidates_with_components(
+    profiles: &[Profile],
+    catalog: &Catalog,
+    components: Option<&ComponentCatalog>,
+    pins: &Pins,
+    now: Tick,
+) -> (Vec<Candidate>, Vec<Exclusion>) {
     let mut candidates = Vec::new();
     let mut exclusions = Vec::new();
     for (index, profile) in profiles.iter().enumerate() {
@@ -346,7 +360,10 @@ pub(crate) fn candidates(
                 label: label.clone(),
                 metrics: configuration
                     .benchmark()
-                    .map(|benchmark| catalog.metrics(&benchmark))
+                    .map(|benchmark| match components {
+                        Some(comp) => catalog.metrics_with_components(&benchmark, Some(comp)),
+                        None => catalog.metrics(&benchmark),
+                    })
                     .unwrap_or_default(),
                 metric: None,
                 configuration,
@@ -621,6 +638,530 @@ pub(crate) fn allocate(units: usize, ranked: &[Candidate]) -> Vec<Candidate> {
         .collect()
 }
 
+pub const BOUNDED_MECHANICAL_SPEED_DELTA: f64 = 5.0;
+const QUOTA_PACE_FILE: &str = "quota-pace.json";
+const QUOTA_PACE_SCHEMA: &str = "agent-command-quota-pace-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkClass {
+    HardDesign,
+    BoundedMechanical,
+    Debugging,
+    Verification,
+    Implementation,
+    Pinned,
+}
+
+impl WorkClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HardDesign => "hard-design",
+            Self::BoundedMechanical => "bounded-mechanical",
+            Self::Debugging => "debugging",
+            Self::Verification => "verification",
+            Self::Implementation => "implementation",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    pub fn preferred_component(self) -> Option<BenchmarkComponent> {
+        match self {
+            Self::Implementation => Some(BenchmarkComponent::FrontierCode),
+            Self::Debugging => Some(BenchmarkComponent::TerminalBench),
+            Self::Verification => Some(BenchmarkComponent::SweAtlasQna),
+            Self::HardDesign | Self::BoundedMechanical | Self::Pinned => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    Design,
+    Plan,
+    Mechanical,
+    Implementation,
+    Debugging,
+    Review,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Complexity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskClassification {
+    pub task_type: TaskType,
+    pub complexity: Complexity,
+    pub work_class: WorkClass,
+}
+
+pub fn classify_task(
+    title: &str,
+    body: &str,
+    stage_is_verification: bool,
+    is_retry_or_resume: bool,
+    explicit_class: Option<WorkClass>,
+) -> TaskClassification {
+    let combined = format!("{title}\n{body}").to_ascii_lowercase();
+    let words: Vec<&str> = combined
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has_word = |targets: &[&str]| words.iter().any(|word| targets.contains(word));
+
+    if is_retry_or_resume || has_retry_suffix(title.trim()) {
+        return TaskClassification {
+            task_type: if stage_is_verification {
+                TaskType::Review
+            } else {
+                TaskType::Implementation
+            },
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Pinned,
+        };
+    }
+    if stage_is_verification {
+        return TaskClassification {
+            task_type: TaskType::Review,
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Verification,
+        };
+    }
+    if let Some(work_class) = explicit_class {
+        let (task_type, complexity) = match work_class {
+            WorkClass::HardDesign => (TaskType::Design, Complexity::High),
+            WorkClass::BoundedMechanical => (TaskType::Mechanical, Complexity::Low),
+            WorkClass::Debugging => (TaskType::Debugging, Complexity::Medium),
+            WorkClass::Verification => (TaskType::Review, Complexity::Medium),
+            WorkClass::Implementation => (TaskType::Implementation, Complexity::Medium),
+            WorkClass::Pinned => (TaskType::Implementation, Complexity::Medium),
+        };
+        return TaskClassification {
+            task_type,
+            complexity,
+            work_class,
+        };
+    }
+    if has_word(&["architecture", "design", "plan", "rfc", "blueprint"]) {
+        TaskClassification {
+            task_type: TaskType::Design,
+            complexity: Complexity::High,
+            work_class: WorkClass::HardDesign,
+        }
+    } else if has_word(&["debug", "repair", "crash", "flaky", "regression"]) {
+        TaskClassification {
+            task_type: TaskType::Debugging,
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Debugging,
+        }
+    } else if has_word(&["format", "formatting", "rename", "typo", "lint"]) {
+        TaskClassification {
+            task_type: TaskType::Mechanical,
+            complexity: Complexity::Low,
+            work_class: WorkClass::BoundedMechanical,
+        }
+    } else if has_word(&["fix"]) {
+        TaskClassification {
+            task_type: TaskType::Debugging,
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Debugging,
+        }
+    } else if has_word(&["verify", "verification", "review", "audit"]) {
+        TaskClassification {
+            task_type: TaskType::Review,
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Verification,
+        }
+    } else {
+        TaskClassification {
+            task_type: TaskType::Implementation,
+            complexity: Complexity::Medium,
+            work_class: WorkClass::Implementation,
+        }
+    }
+}
+
+fn has_retry_suffix(title: &str) -> bool {
+    let Some((_, tail)) = title.rsplit_once('-') else {
+        return false;
+    };
+    let rest = tail
+        .strip_prefix("NR")
+        .or_else(|| tail.strip_prefix('C'))
+        .or_else(|| tail.strip_prefix('R'));
+    rest.is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn shared_component_for_work_class(
+    candidates: &[Candidate],
+    work_class: WorkClass,
+) -> Option<BenchmarkComponent> {
+    let component = work_class.preferred_component()?;
+    let scored: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.metrics.component(component).is_some()
+                || candidate.metrics.coding_agent_index.is_some()
+                || candidate.metrics.coding_index.is_some()
+                || candidate.metrics.intelligence_index.is_some()
+        })
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored
+        .iter()
+        .all(|candidate| candidate.metrics.component(component).is_some())
+        .then_some(component)
+}
+
+fn effective_work_score(
+    candidate: &Candidate,
+    component: Option<BenchmarkComponent>,
+) -> Option<f64> {
+    if let Some(component) = component {
+        return candidate.metrics.component(component);
+    }
+    candidate.score().or(candidate.metrics.coding_agent_index)
+}
+
+pub(crate) fn rank_for_work_class(
+    mut candidates: Vec<Candidate>,
+    policy: Policy,
+    difficulty: Difficulty,
+    work_class: WorkClass,
+) -> Result<Vec<Candidate>, String> {
+    let metric = ranking_metric(&candidates);
+    for candidate in &mut candidates {
+        candidate.metric = metric;
+    }
+    let component = shared_component_for_work_class(&candidates, work_class);
+    let best = candidates
+        .iter()
+        .filter_map(|candidate| effective_work_score(candidate, component))
+        .max_by(f64::total_cmp);
+    let total = candidates.len();
+    if let Some(floor) = difficulty.floor() {
+        candidates.retain(|candidate| {
+            effective_work_score(candidate, component).is_some_and(|score| score >= floor)
+        });
+    }
+    if candidates.is_empty() && total > 0 {
+        if let (Some(comp), Some(best_val)) = (component, best) {
+            let floor = difficulty.floor().unwrap_or_default();
+            return Err(format!(
+                "No eligible model meets the {} floor {floor:.0} on {}; best is {best_val:.1}.",
+                difficulty.name(),
+                comp.name()
+            ));
+        }
+        return Err(floor_refusal(difficulty, metric, best));
+    }
+    let use_mechanical_speed = if work_class == WorkClass::BoundedMechanical {
+        if let Some(best_score) = best {
+            let near_best: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|candidate| {
+                    effective_work_score(candidate, component)
+                        .is_some_and(|score| score >= best_score - BOUNDED_MECHANICAL_SPEED_DELTA)
+                })
+                .collect();
+            !near_best.is_empty()
+                && near_best
+                    .iter()
+                    .all(|candidate| candidate.metrics.speed.is_some())
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let score_cmp = |left: &Candidate, right: &Candidate| match (
+        effective_work_score(left, component),
+        effective_work_score(right, component),
+    ) {
+        (Some(l), Some(r)) => r.total_cmp(&l),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    candidates.sort_by(|left, right| {
+        let primary = if use_mechanical_speed {
+            let best_score = best.unwrap_or(0.0);
+            let left_near = effective_work_score(left, component)
+                .is_some_and(|score| score >= best_score - BOUNDED_MECHANICAL_SPEED_DELTA);
+            let right_near = effective_work_score(right, component)
+                .is_some_and(|score| score >= best_score - BOUNDED_MECHANICAL_SPEED_DELTA);
+            right_near
+                .cmp(&left_near)
+                .then_with(|| compare_speed(left, right))
+                .then_with(|| score_cmp(left, right))
+                .then_with(|| compare_headroom(left, right))
+        } else {
+            match policy {
+                Policy::Default => score_cmp(left, right)
+                    .then_with(|| compare_speed(left, right))
+                    .then_with(|| compare_headroom(left, right)),
+                Policy::Ordinary => compare_headroom(left, right)
+                    .then_with(|| score_cmp(left, right))
+                    .then_with(|| compare_speed(left, right)),
+                Policy::Urgent => compare_speed(left, right)
+                    .then_with(|| compare_headroom(left, right))
+                    .then_with(|| score_cmp(left, right)),
+            }
+        };
+        primary.then_with(|| compare_identity(left, right))
+    });
+    Ok(candidates)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowAllowance {
+    pub window_id: String,
+    pub remaining: f64,
+    pub reserved: f64,
+    pub reset_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActiveUsageHold {
+    pub profile: String,
+    pub window_id: String,
+    pub reset_at: i64,
+    pub created_at: i64,
+    pub usage_units: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PacedWindow {
+    pub profile: String,
+    pub window_id: String,
+    pub reset_at: i64,
+    pub started_at: i64,
+    pub original_remaining: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuotaPaceFile {
+    schema: String,
+    windows: BTreeMap<String, PacedWindow>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuotaPacer {
+    windows: BTreeMap<String, PacedWindow>,
+}
+
+impl QuotaPacer {
+    pub fn load(state_dir: &Path) -> io::Result<Self> {
+        let path = state_dir.join(QUOTA_PACE_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let file: QuotaPaceFile = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid quota pace state {}: {error}", path.display()),
+            )
+        })?;
+        if file.schema != QUOTA_PACE_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported quota pace schema {} in {}",
+                    file.schema,
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            windows: file.windows,
+        })
+    }
+
+    pub fn save(&self, state_dir: &Path) -> io::Result<()> {
+        fs::create_dir_all(state_dir)?;
+        let path = state_dir.join(QUOTA_PACE_FILE);
+        let temporary = path.with_extension(format!("{}.next", uuid::Uuid::new_v4()));
+        let payload = QuotaPaceFile {
+            schema: QUOTA_PACE_SCHEMA.into(),
+            windows: self.windows.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(io::Error::other)?;
+        let mut file = fs::File::create_new(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if fs::rename(&temporary, &path).is_err() {
+            fs::write(&path, &bytes)?;
+            let _ = fs::remove_file(&temporary);
+        }
+        Ok(())
+    }
+
+    pub fn prune_expired(&mut self, now: i64) {
+        self.windows.retain(|_, entry| entry.reset_at > now);
+    }
+
+    pub fn tracked_windows(&self) -> usize {
+        self.windows.len()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn effective_remaining(
+        &mut self,
+        profile: &str,
+        window: &WindowAllowance,
+        pace_burst_percent: Option<f64>,
+        active_holds: &[ActiveUsageHold],
+        urgent_reserve: f64,
+        is_urgent: bool,
+        now: i64,
+    ) -> Option<f64> {
+        if window.reset_at <= now {
+            return None;
+        }
+        if !window.remaining.is_finite()
+            || !window.reserved.is_finite()
+            || !urgent_reserve.is_finite()
+            || window.remaining < 0.0
+            || window.reserved < 0.0
+            || urgent_reserve < 0.0
+        {
+            return None;
+        }
+        let paced_remaining = match pace_burst_percent {
+            Some(burst) if burst.is_finite() && burst > 0.0 => {
+                let key = format!("{profile}:{}:{}", window.window_id, window.reset_at);
+                let baseline = self.windows.entry(key).or_insert_with(|| PacedWindow {
+                    profile: profile.to_owned(),
+                    window_id: window.window_id.clone(),
+                    reset_at: window.reset_at,
+                    started_at: now,
+                    original_remaining: window.remaining,
+                });
+                let immediate = baseline.original_remaining.min(burst);
+                let span = (window.reset_at - baseline.started_at).max(1) as f64;
+                let progress = ((now - baseline.started_at) as f64 / span).clamp(0.0, 1.0);
+                let allowed = immediate + (baseline.original_remaining - immediate) * progress;
+                let estimated_holds: f64 = active_holds
+                    .iter()
+                    .filter(|hold| {
+                        hold.profile == profile
+                            && hold.window_id == window.window_id
+                            && hold.reset_at == window.reset_at
+                            && hold.created_at >= baseline.started_at
+                            && hold.usage_units.is_finite()
+                            && hold.usage_units > 0.0
+                    })
+                    .map(|hold| hold.usage_units)
+                    .sum();
+                let consumed =
+                    (baseline.original_remaining - window.remaining).max(estimated_holds);
+                window
+                    .remaining
+                    .min((allowed - consumed).max(0.0) + window.reserved)
+            }
+            _ => window.remaining,
+        };
+        let reserve = if is_urgent { 0.0 } else { urgent_reserve };
+        let usable = paced_remaining - window.reserved - reserve;
+        Some(usable.max(0.0))
+    }
+}
+
+pub fn burn_score(usable_remaining: f64, reset_at: i64, now: i64) -> f64 {
+    if !usable_remaining.is_finite() || usable_remaining <= 0.0 || reset_at <= now {
+        return 0.0;
+    }
+    usable_remaining / (reset_at - now).max(1) as f64 * 3600.0
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuePriority {
+    Urgent,
+    Next,
+    #[default]
+    Normal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueuedTask {
+    pub id: String,
+    pub project: String,
+    #[serde(default)]
+    pub priority: QueuePriority,
+    pub created_at: i64,
+    #[serde(default)]
+    pub blocked: bool,
+}
+
+pub fn pick_next_task<'a>(
+    tasks: &'a [QueuedTask],
+    served_by_project: &HashMap<String, u64>,
+) -> Option<&'a QueuedTask> {
+    let ready: Vec<&QueuedTask> = tasks.iter().filter(|task| !task.blocked).collect();
+    for priority in [QueuePriority::Urgent, QueuePriority::Next] {
+        let mut group: Vec<&QueuedTask> = ready
+            .iter()
+            .copied()
+            .filter(|task| task.priority == priority)
+            .collect();
+        if !group.is_empty() {
+            group.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            return group.into_iter().next();
+        }
+    }
+    let mut by_project: BTreeMap<&str, Vec<&QueuedTask>> = BTreeMap::new();
+    for task in ready {
+        by_project
+            .entry(task.project.as_str())
+            .or_default()
+            .push(task);
+    }
+    let mut winner: Option<(&str, f64, i64)> = None;
+    for (project, list) in &by_project {
+        let served = served_by_project.get(*project).copied().unwrap_or(0) as f64;
+        let weight = (list.len() as f64).sqrt().clamp(1.0, 3.0);
+        let ratio = served / weight;
+        let earliest = list.iter().map(|t| t.created_at).min().unwrap_or(i64::MAX);
+        let better = match winner {
+            None => true,
+            Some((win_proj, win_ratio, win_earliest)) => {
+                ratio
+                    .total_cmp(&win_ratio)
+                    .then_with(|| earliest.cmp(&win_earliest))
+                    .then_with(|| project.cmp(&win_proj))
+                    == Ordering::Less
+            }
+        };
+        if better {
+            winner = Some((project, ratio, earliest));
+        }
+    }
+    let (winning_project, _, _) = winner?;
+    let mut chosen_list = by_project.remove(winning_project)?;
+    chosen_list.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    chosen_list.into_iter().next()
+}
+
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
@@ -672,6 +1213,7 @@ exit 3
             coding_index: value(Metric::Coding),
             intelligence_index: value(Metric::Intelligence),
             speed: speed.map(|(unit, value)| Speed { unit, value }),
+            components: crate::catalog::ComponentScores::default(),
         }
     }
 
@@ -1438,5 +1980,234 @@ mod cross_platform_tests {
         )
         .unwrap();
         assert_eq!(choice.candidate.label, "claude/standby");
+    }
+
+    #[test]
+    fn classify_task_identifies_all_work_classes() {
+        assert_eq!(
+            classify_task("Architecture plan for v0.3", "", false, false, None).work_class,
+            WorkClass::HardDesign
+        );
+        assert_eq!(
+            classify_task("Fix flaky parser crash", "", false, false, None).work_class,
+            WorkClass::Debugging
+        );
+        assert_eq!(
+            classify_task("Rename helper and fix typo", "", false, false, None).work_class,
+            WorkClass::BoundedMechanical
+        );
+        assert_eq!(
+            classify_task("Add inbox persistence", "", true, false, None).work_class,
+            WorkClass::Verification
+        );
+        assert_eq!(
+            classify_task("Add inbox persistence", "", false, false, None).work_class,
+            WorkClass::Implementation
+        );
+        assert_eq!(
+            classify_task("AC-TASK-NR1", "", false, false, None).work_class,
+            WorkClass::Pinned
+        );
+        assert_eq!(
+            classify_task("Add feature", "", false, true, None).work_class,
+            WorkClass::Pinned
+        );
+    }
+
+    #[test]
+    fn rank_for_work_class_uses_aa_components_and_bounded_mechanical_speed_tiebreaker() {
+        let make =
+            |label: &str, fc: f64, tb: f64, qna: f64, coding: f64, sec_per_task: f64| Candidate {
+                profile: label.len(),
+                label: label.into(),
+                configuration: Configuration::provider_default(Provider::Codex),
+                metrics: Metrics {
+                    coding_agent_index: Some(coding),
+                    coding_index: Some(coding),
+                    intelligence_index: Some(coding),
+                    speed: Some(crate::catalog::Speed {
+                        unit: SpeedUnit::SecondsPerTask,
+                        value: sec_per_task,
+                    }),
+                    components: crate::catalog::ComponentScores {
+                        frontiercode: Some(fc),
+                        terminal_bench: Some(tb),
+                        swe_atlas_qna: Some(qna),
+                    },
+                },
+                metric: None,
+                headroom: Headroom {
+                    rate: Some(1.0),
+                    remaining: Some(80.0),
+                    low_buffer: false,
+                },
+            };
+        let pool = vec![
+            make("codex/builder", 84.0, 62.0, 70.0, 78.0, 180.0),
+            make("claude/debugger", 74.0, 88.0, 72.0, 75.0, 40.0),
+            make("gemini/verifier", 70.0, 65.0, 91.0, 74.0, 90.0),
+        ];
+
+        let impl_rank = rank_for_work_class(
+            pool.clone(),
+            Policy::Default,
+            Difficulty::Any,
+            WorkClass::Implementation,
+        )
+        .unwrap();
+        assert_eq!(impl_rank[0].label, "codex/builder");
+
+        let debug_rank = rank_for_work_class(
+            pool.clone(),
+            Policy::Default,
+            Difficulty::Any,
+            WorkClass::Debugging,
+        )
+        .unwrap();
+        assert_eq!(debug_rank[0].label, "claude/debugger");
+
+        let verify_rank = rank_for_work_class(
+            pool.clone(),
+            Policy::Default,
+            Difficulty::Any,
+            WorkClass::Verification,
+        )
+        .unwrap();
+        assert_eq!(verify_rank[0].label, "gemini/verifier");
+
+        let mech_rank = rank_for_work_class(
+            pool,
+            Policy::Default,
+            Difficulty::Any,
+            WorkClass::BoundedMechanical,
+        )
+        .unwrap();
+        assert_eq!(mech_rank[0].label, "claude/debugger");
+    }
+
+    #[test]
+    fn quota_pacer_caps_burst_and_respects_urgent_reserve_and_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-command-pacer-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut pacer = QuotaPacer::default();
+        let window = WindowAllowance {
+            window_id: "five_hour".into(),
+            remaining: 100.0,
+            reserved: 0.0,
+            reset_at: 2_000,
+        };
+        let initial = pacer
+            .effective_remaining("codex/main", &window, Some(20.0), &[], 10.0, false, 1_000)
+            .unwrap();
+        assert!((initial - 10.0).abs() < 1e-6);
+
+        let initial_urgent = pacer
+            .effective_remaining("codex/main", &window, Some(20.0), &[], 10.0, true, 1_000)
+            .unwrap();
+        assert!((initial_urgent - 20.0).abs() < 1e-6);
+
+        let holds = vec![ActiveUsageHold {
+            profile: "codex/main".into(),
+            window_id: "five_hour".into(),
+            reset_at: 2_000,
+            created_at: 1_100,
+            usage_units: 15.0,
+        }];
+        let halfway = pacer
+            .effective_remaining(
+                "codex/main",
+                &window,
+                Some(20.0),
+                &holds,
+                10.0,
+                false,
+                1_500,
+            )
+            .unwrap();
+        assert!((halfway - 35.0).abs() < 1e-6);
+
+        assert_eq!(
+            pacer.effective_remaining("codex/main", &window, Some(20.0), &[], 10.0, false, 2_000),
+            None
+        );
+        assert!(burn_score(40.0, 2_000, 1_000) > burn_score(40.0, 5_000, 1_000));
+
+        pacer.save(&dir).unwrap();
+        let reloaded = QuotaPacer::load(&dir).unwrap();
+        assert_eq!(reloaded, pacer);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pick_next_task_enforces_priority_and_backlog_weighted_fair_queue() {
+        let tasks = vec![
+            QueuedTask {
+                id: "n-a1".into(),
+                project: "alpha".into(),
+                priority: QueuePriority::Normal,
+                created_at: 10,
+                blocked: false,
+            },
+            QueuedTask {
+                id: "n-a2".into(),
+                project: "alpha".into(),
+                priority: QueuePriority::Normal,
+                created_at: 11,
+                blocked: false,
+            },
+            QueuedTask {
+                id: "n-a3".into(),
+                project: "alpha".into(),
+                priority: QueuePriority::Normal,
+                created_at: 12,
+                blocked: false,
+            },
+            QueuedTask {
+                id: "n-a4".into(),
+                project: "alpha".into(),
+                priority: QueuePriority::Normal,
+                created_at: 13,
+                blocked: false,
+            },
+            QueuedTask {
+                id: "n-b1".into(),
+                project: "beta".into(),
+                priority: QueuePriority::Normal,
+                created_at: 5,
+                blocked: false,
+            },
+            QueuedTask {
+                id: "blocked-u".into(),
+                project: "gamma".into(),
+                priority: QueuePriority::Urgent,
+                created_at: 1,
+                blocked: true,
+            },
+        ];
+        let mut served = HashMap::new();
+        served.insert("alpha".to_owned(), 2);
+        served.insert("beta".to_owned(), 2);
+        assert_eq!(pick_next_task(&tasks, &served).unwrap().id, "n-a1");
+
+        let mut with_urgent = tasks.clone();
+        with_urgent.push(QueuedTask {
+            id: "u-1".into(),
+            project: "beta".into(),
+            priority: QueuePriority::Urgent,
+            created_at: 50,
+            blocked: false,
+        });
+        with_urgent.push(QueuedTask {
+            id: "next-1".into(),
+            project: "beta".into(),
+            priority: QueuePriority::Next,
+            created_at: 20,
+            blocked: false,
+        });
+        assert_eq!(pick_next_task(&with_urgent, &served).unwrap().id, "u-1");
+        with_urgent.retain(|t| t.id != "u-1");
+        assert_eq!(pick_next_task(&with_urgent, &served).unwrap().id, "next-1");
     }
 }

@@ -365,6 +365,12 @@ impl Store {
             .join(format!("ledger-{}.json", workspace_hash(workspace))))
     }
 
+    pub(crate) fn inbox_path_for_workspace(&self, workspace: &Path) -> io::Result<PathBuf> {
+        Ok(self
+            .directory()?
+            .join(format!("inbox-{}.json", workspace_hash(workspace))))
+    }
+
     pub(crate) fn load_transcript_for_workspace(
         &self,
         workspace: &Path,
@@ -903,6 +909,25 @@ pub(crate) enum Command {
     Mode {
         mode: PermissionMode,
     },
+    Vault {
+        args: Option<String>,
+    },
+    Approve {
+        bot: String,
+        note: Option<String>,
+    },
+    Disapprove {
+        bot: String,
+        reason: String,
+    },
+    Bot {
+        subcommand: String,
+        rest: Option<String>,
+    },
+    Memory {
+        subcommand: String,
+        rest: Option<String>,
+    },
     Help,
     Unknown {
         command: String,
@@ -917,7 +942,7 @@ pub struct CommandHelp {
     pub summary: &'static str,
 }
 
-const HELP_ENTRIES: [CommandHelp; 21] = [
+const HELP_ENTRIES: [CommandHelp; 26] = [
     CommandHelp {
         usage: "/help",
         summary: "Show all slash commands and routing prefixes.",
@@ -979,6 +1004,26 @@ const HELP_ENTRIES: [CommandHelp; 21] = [
         summary: "Pin a multi-turn goal loop or cancel the active goal.",
     },
     CommandHelp {
+        usage: "/vault [list|check NAME...]",
+        summary: "Open the encrypted credential vault or check secret presence.",
+    },
+    CommandHelp {
+        usage: "/approve BOT [NOTE]",
+        summary: "Record operator approval on a bot's competence scorecard.",
+    },
+    CommandHelp {
+        usage: "/disapprove BOT REASON",
+        summary: "Record operator disapproval and trigger reflective review.",
+    },
+    CommandHelp {
+        usage: "/bot scorecard|forge|evolve|decommission [ARGS]",
+        summary: "Inspect bot scorecards or manage bot forge & lifecycle.",
+    },
+    CommandHelp {
+        usage: "/memory search QUERY | write TITLE | BODY",
+        summary: "Search or write shared two-tier durable memory.",
+    },
+    CommandHelp {
         usage: "/settings",
         summary: "Open Settings panel.",
     },
@@ -1004,7 +1049,7 @@ const HELP_ENTRIES: [CommandHelp; 21] = [
     },
 ];
 
-const KNOWN_SLASH_COMMANDS: [&str; 27] = [
+const KNOWN_SLASH_COMMANDS: [&str; 32] = [
     "/help",
     "/spawn",
     "/ask",
@@ -1021,6 +1066,11 @@ const KNOWN_SLASH_COMMANDS: [&str; 27] = [
     "/btw",
     "/side",
     "/goal",
+    "/vault",
+    "/approve",
+    "/disapprove",
+    "/bot",
+    "/memory",
     "/settings",
     "/connect",
     "/disconnect",
@@ -1323,6 +1373,10 @@ const GOAL_USAGE: &str = "Usage: /goal CRITERIA or /goal cancel";
 const DIFF_USAGE: &str = "Usage: /diff [NAME]";
 const PR_USAGE: &str = "Usage: /pr [NAME] [--commit]";
 const SETTLE_USAGE: &str = "Usage: /settle NAME or /unsettle NAME";
+const APPROVE_USAGE: &str = "Usage: /approve BOT [NOTE]";
+const DISAPPROVE_USAGE: &str = "Usage: /disapprove BOT REASON";
+const BOT_USAGE: &str = "Usage: /bot {scorecard|forge|evolve|decommission} [ARGS]";
+const MEMORY_USAGE: &str = "Usage: /memory {search QUERY | write TITLE | BODY}";
 pub(crate) const UPDATE_USAGE: &str = "Usage: /update";
 pub(crate) const DISCONNECT_USAGE: &str = "Usage: /disconnect [claude|codex|PROVIDER/PROFILE]";
 pub(crate) const RECONNECT_USAGE: &str = "Usage: /reconnect [claude|codex|PROVIDER/PROFILE]";
@@ -1475,6 +1529,49 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
             }),
             _ => Err(crate::permissions::COMMANDER_MODE_USAGE.into()),
         },
+        "/vault" => Ok(Command::Vault {
+            args: optional(rest),
+        }),
+        "/approve" => match next_word(rest) {
+            Some((bot, note)) => Ok(Command::Approve {
+                bot: bot.into(),
+                note: optional(note),
+            }),
+            None => Err(APPROVE_USAGE.into()),
+        },
+        "/disapprove" => match next_word(rest) {
+            Some((bot, reason)) if !reason.is_empty() => Ok(Command::Disapprove {
+                bot: bot.into(),
+                reason: reason.into(),
+            }),
+            _ => Err(DISAPPROVE_USAGE.into()),
+        },
+        "/bot" => match next_word(rest) {
+            Some((subcommand, tail))
+                if matches!(
+                    subcommand.to_ascii_lowercase().as_str(),
+                    "scorecard" | "forge" | "evolve" | "decommission"
+                ) =>
+            {
+                Ok(Command::Bot {
+                    subcommand: subcommand.to_ascii_lowercase(),
+                    rest: optional(tail),
+                })
+            }
+            _ => Err(BOT_USAGE.into()),
+        },
+        "/memory" => match next_word(rest) {
+            Some((subcommand, tail))
+                if matches!(subcommand.to_ascii_lowercase().as_str(), "search" | "write")
+                    && !tail.is_empty() =>
+            {
+                Ok(Command::Memory {
+                    subcommand: subcommand.to_ascii_lowercase(),
+                    rest: Some(tail.into()),
+                })
+            }
+            _ => Err(MEMORY_USAGE.into()),
+        },
         "/help" | "/?" if rest.is_empty() => Ok(Command::Help),
         "/help" | "/?" => Err(HELP_USAGE.into()),
         other if ROUTING_DIRECTIVES.contains(&other) => Ok(Command::Message(input.into())),
@@ -1599,6 +1696,15 @@ pub(crate) fn commander_prompt<'a>(
 }
 
 pub(crate) fn specialist_prompt(member: &Member, task: &str) -> String {
+    specialist_prompt_with_context(member, task, None, None)
+}
+
+pub(crate) fn specialist_prompt_with_context(
+    member: &Member,
+    task: &str,
+    charter: Option<&str>,
+    memory_block: Option<&str>,
+) -> String {
     let skip = member.history.len().saturating_sub(CONTEXT_LINES);
     let history: Vec<&str> = member
         .history
@@ -1606,18 +1712,45 @@ pub(crate) fn specialist_prompt(member: &Member, task: &str) -> String {
         .skip(skip)
         .map(|entry| entry.text.as_str())
         .collect();
-    format!(
-        "You are {}, an Agent Command specialist with the role: {}. Work only inside the current directory, your isolated workspace on its own Git branch. Finish with a one-line result summary. If you need the operator's approval before going further, finish instead with a line: {APPROVAL_MARKER} <question>\n\
-         Your previous work:\n{}\n\
-         Task: {task}",
-        member.name,
-        member.role,
+    let mut sections = vec![format!(
+        "You are {}, an Agent Command specialist with the role: {}. Work only inside the current directory, your isolated workspace on its own Git branch. Finish with a one-line result summary. If you need the operator's approval before going further, finish instead with a line: {APPROVAL_MARKER} <question>",
+        member.name, member.role
+    )];
+    if let Some(block) = charter.map(str::trim).filter(|text| !text.is_empty()) {
+        sections.push(block.to_owned());
+    }
+    if let Some(block) = memory_block.map(str::trim).filter(|text| !text.is_empty()) {
+        sections.push(block.to_owned());
+    }
+    sections.push(format!(
+        "Your previous work:\n{}\nTask: {task}",
         if history.is_empty() {
             "- none".into()
         } else {
             history.join("\n")
-        },
-    )
+        }
+    ));
+    sections.join("\n\n")
+}
+
+pub(crate) fn specialist_prompt_for_stores(
+    member: &Member,
+    task: &str,
+    evolution: Option<&crate::evolution::EvolutionStore>,
+    memory: Option<&crate::memory::MemoryStore>,
+    now: i64,
+) -> String {
+    let charter = evolution
+        .and_then(|store| store.render_bot_charter_prompt(&member.name).ok())
+        .flatten();
+    let memory_block = memory
+        .and_then(|store| {
+            store
+                .render_prompt_block(Some(&member.name), task, 500, 700, now)
+                .ok()
+        })
+        .filter(|block| !block.trim().is_empty());
+    specialist_prompt_with_context(member, task, charter.as_deref(), memory_block.as_deref())
 }
 
 pub(crate) fn summary(text: &str) -> String {
@@ -2834,5 +2967,94 @@ mod cross_platform_tests {
             resolve_target("unrelated quantum", &candidates),
             TargetMatch::None
         );
+    }
+
+    #[test]
+    fn v03_slash_commands_and_charter_memory_prompt_injection_work() {
+        assert_eq!(parse_command("/vault"), Ok(Command::Vault { args: None }));
+        assert_eq!(
+            parse_command("/vault check STRIPE_KEY"),
+            Ok(Command::Vault {
+                args: Some("check STRIPE_KEY".into())
+            })
+        );
+        assert_eq!(
+            parse_command("/approve sentinel Clean audit"),
+            Ok(Command::Approve {
+                bot: "sentinel".into(),
+                note: Some("Clean audit".into()),
+            })
+        );
+        assert_eq!(
+            parse_command("/disapprove sentinel Missed edge case"),
+            Ok(Command::Disapprove {
+                bot: "sentinel".into(),
+                reason: "Missed edge case".into(),
+            })
+        );
+        assert!(parse_command("/disapprove sentinel").is_err());
+        assert_eq!(
+            parse_command("/bot scorecard sentinel"),
+            Ok(Command::Bot {
+                subcommand: "scorecard".into(),
+                rest: Some("sentinel".into()),
+            })
+        );
+        assert!(parse_command("/bot invalid").is_err());
+        assert_eq!(
+            parse_command("/memory search atomic"),
+            Ok(Command::Memory {
+                subcommand: "search".into(),
+                rest: Some("atomic".into()),
+            })
+        );
+        assert!(parse_command("/memory search").is_err());
+
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-spec-prompt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mem = crate::memory::MemoryStore::for_workspace(base.join("state"), &ws);
+        let evo = crate::evolution::EvolutionStore::for_workspace(base.join("state"), &ws);
+        let now = 1_760_000_000;
+        let _ = evo
+            .forge_bot(
+                &mem,
+                crate::evolution::ForgeBotRequest {
+                    bot_id: "sentinel".into(),
+                    role: "reviewer".into(),
+                    work_class: crate::evolution::WorkClass::Review,
+                    charter: crate::evolution::BotCharter {
+                        job: "Audit Rust diffs".into(),
+                        anti_jobs: vec!["Never push to main".into()],
+                        voice_and_style: "Terse".into(),
+                        verification_bar: "Run clippy".into(),
+                        allowed_tools: vec!["read_thread".into()],
+                        instructions: "Check symlink guards".into(),
+                    },
+                    permission_mode: None,
+                    preferred_model: None,
+                    pinned_core: false,
+                    initial_memory_seeds: vec!["Always verify atomic renames.".into()],
+                    probation_runs: Some(2),
+                    rationale: "Safety reviewer".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let member = Member::new("sentinel", "reviewer", None, None);
+        let prompt = specialist_prompt_for_stores(
+            &member,
+            "Audit atomic writes",
+            Some(&evo),
+            Some(&mem),
+            now,
+        );
+        assert!(prompt.contains("Bot Charter: sentinel"));
+        assert!(prompt.contains("Always verify atomic renames."));
+        assert!(prompt.contains("Task: Audit atomic writes"));
+        let _ = fs::remove_dir_all(&base);
     }
 }

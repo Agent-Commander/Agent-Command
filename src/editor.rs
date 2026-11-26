@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env, fs, io,
     ops::Range,
+    path::PathBuf,
     process::Command,
 };
 
@@ -62,11 +63,28 @@ pub struct PastedChunk {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub id: usize,
+    pub placeholder: String,
+    pub path: PathBuf,
+    pub mime_type: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerSubmission {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DraftSnapshot {
     text: String,
     cursor: usize,
     pasted_chunks: Vec<PastedChunk>,
     next_paste_id: usize,
+    images: Vec<ImageAttachment>,
+    next_image_id: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +284,9 @@ pub struct Composer {
     scroll_row: usize,
     pasted_chunks: Vec<PastedChunk>,
     next_paste_id: usize,
+    images: Vec<ImageAttachment>,
+    next_image_id: usize,
+    submitted_images: Vec<ImageAttachment>,
     history: Vec<String>,
     history_index: Option<usize>,
     history_scratch: String,
@@ -291,6 +312,9 @@ impl Composer {
             scroll_row: 0,
             pasted_chunks: Vec::new(),
             next_paste_id: 1,
+            images: Vec::new(),
+            next_image_id: 1,
+            submitted_images: Vec::new(),
             history: Vec::new(),
             history_index: None,
             history_scratch: String::new(),
@@ -307,7 +331,7 @@ impl Composer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text.is_empty() && self.images.is_empty()
     }
 
     pub fn cursor(&self) -> usize {
@@ -320,6 +344,14 @@ impl Composer {
 
     pub fn pasted_chunks(&self) -> &[PastedChunk] {
         &self.pasted_chunks
+    }
+
+    pub fn images(&self) -> &[ImageAttachment] {
+        &self.images
+    }
+
+    pub fn take_submitted_images(&mut self) -> Vec<ImageAttachment> {
+        std::mem::take(&mut self.submitted_images)
     }
 
     pub fn history(&self) -> &[String] {
@@ -370,6 +402,7 @@ impl Composer {
         self.preferred_col = None;
         self.scroll_row = 0;
         self.pasted_chunks.clear();
+        self.images.clear();
         self.history_index = None;
     }
 
@@ -379,6 +412,7 @@ impl Composer {
         self.preferred_col = None;
         self.scroll_row = 0;
         self.pasted_chunks.clear();
+        self.images.clear();
         self.history_index = None;
     }
 
@@ -494,6 +528,97 @@ impl Composer {
         }
     }
 
+    pub fn attach_image(
+        &mut self,
+        path: PathBuf,
+        mime_type: impl Into<String>,
+        label: impl Into<String>,
+    ) -> ImageAttachment {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        let raw_label = label.into();
+        let trimmed_label = raw_label.trim();
+        let clean_label = if trimmed_label.is_empty() {
+            "image.png".to_owned()
+        } else {
+            truncate_to_width(trimmed_label, 28)
+        };
+        let placeholder = format!("[Image #{id} · {clean_label}]");
+        let attachment = ImageAttachment {
+            id,
+            placeholder: placeholder.clone(),
+            path,
+            mime_type: mime_type.into(),
+            label: clean_label,
+        };
+        let needs_leading_space = self.cursor > 0
+            && !self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        if needs_leading_space {
+            self.insert_char(' ');
+        }
+        self.insert_str(&placeholder);
+        self.insert_char(' ');
+        self.images.push(attachment.clone());
+        attachment
+    }
+
+    pub fn remove_image(&mut self, id: usize) -> bool {
+        let Some(pos) = self.images.iter().position(|img| img.id == id) else {
+            return false;
+        };
+        let removed = self.images.remove(pos);
+        if let Some(found) = self.text.find(&removed.placeholder) {
+            let mut end = found + removed.placeholder.len();
+            if self.text[end..].starts_with(' ') {
+                end += 1;
+            }
+            self.text.drain(found..end);
+            if self.cursor > end {
+                self.cursor -= end - found;
+            } else if self.cursor > found {
+                self.cursor = found;
+            }
+            self.cursor = self.cursor.min(self.text.len());
+            while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
+                self.cursor -= 1;
+            }
+        }
+        self.preferred_col = None;
+        self.history_index = None;
+        true
+    }
+
+    pub fn insert_quote(&mut self, excerpt: &str) {
+        const MAX_QUOTE_LINES: usize = 8;
+        let normalized = normalize_newlines(excerpt);
+        let trimmed = normalized.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let raw_lines: Vec<&str> = trimmed.lines().collect();
+        let mut quoted_lines = Vec::new();
+        if raw_lines.len() > MAX_QUOTE_LINES {
+            for line in &raw_lines[..MAX_QUOTE_LINES - 1] {
+                quoted_lines.push(format!("> {}", line.trim_end()));
+            }
+            quoted_lines.push("> …".to_owned());
+        } else {
+            for line in raw_lines {
+                quoted_lines.push(format!("> {}", line.trim_end()));
+            }
+        }
+        let mut block = String::new();
+        if self.cursor > 0 && !self.text[..self.cursor].ends_with('\n') {
+            block.push('\n');
+        }
+        block.push_str(&quoted_lines.join("\n"));
+        block.push_str("\n\n");
+        self.insert_str(&block);
+    }
+
     pub fn expand_text(&self) -> String {
         let mut expanded = self.text.clone();
         for chunk in &self.pasted_chunks {
@@ -504,18 +629,46 @@ impl Composer {
         expanded
     }
 
-    pub fn take_submission(&mut self) -> Option<String> {
-        let expanded = self.expand_text();
-        if expanded.trim().is_empty() {
+    pub fn take_submission_with_images(&mut self) -> Option<ComposerSubmission> {
+        let mut expanded = self.expand_text();
+        let active_images: Vec<ImageAttachment> = self
+            .images
+            .iter()
+            .filter(|img| expanded.contains(&img.placeholder))
+            .cloned()
+            .collect();
+        for img in &active_images {
+            expanded = expanded.replace(&img.placeholder, "");
+        }
+        let cleaned = expanded.trim().to_owned();
+        if cleaned.is_empty() && active_images.is_empty() {
             return None;
         }
-        self.push_history(expanded.clone());
+        let final_text = if cleaned.is_empty() {
+            "Inspect the attached image(s).".to_owned()
+        } else {
+            cleaned
+        };
+        self.push_history(final_text.clone());
         self.clear();
-        Some(expanded)
+        Some(ComposerSubmission {
+            text: final_text,
+            images: active_images,
+        })
+    }
+
+    pub fn take_submission(&mut self) -> Option<String> {
+        let submission = self.take_submission_with_images()?;
+        self.submitted_images = submission.images;
+        Some(submission.text)
+    }
+
+    pub fn take_text(&mut self) -> Option<String> {
+        self.take_submission()
     }
 
     pub fn stash_draft(&mut self, thread_id: &str) {
-        if self.text.is_empty() && self.pasted_chunks.is_empty() {
+        if self.text.is_empty() && self.pasted_chunks.is_empty() && self.images.is_empty() {
             self.drafts.remove(thread_id);
         } else {
             self.drafts.insert(
@@ -525,6 +678,8 @@ impl Composer {
                     cursor: self.cursor,
                     pasted_chunks: self.pasted_chunks.clone(),
                     next_paste_id: self.next_paste_id,
+                    images: self.images.clone(),
+                    next_image_id: self.next_image_id,
                 },
             );
         }
@@ -536,6 +691,8 @@ impl Composer {
             self.cursor = snapshot.cursor.min(self.text.len());
             self.pasted_chunks = snapshot.pasted_chunks;
             self.next_paste_id = snapshot.next_paste_id;
+            self.images = snapshot.images;
+            self.next_image_id = snapshot.next_image_id;
             self.preferred_col = None;
             self.scroll_row = 0;
             self.history_index = None;
@@ -663,6 +820,8 @@ impl Composer {
     fn prune_removed_chunks(&mut self) {
         self.pasted_chunks
             .retain(|chunk| self.text.contains(&chunk.placeholder));
+        self.images
+            .retain(|image| self.text.contains(&image.placeholder));
     }
 
     pub fn backspace(&mut self) -> bool {
@@ -672,8 +831,10 @@ impl Composer {
         if let Some(chip_len) = self
             .pasted_chunks
             .iter()
-            .find(|c| self.text[..self.cursor].ends_with(&c.placeholder))
-            .map(|c| c.placeholder.len())
+            .map(|c| c.placeholder.as_str())
+            .chain(self.images.iter().map(|img| img.placeholder.as_str()))
+            .find(|placeholder| self.text[..self.cursor].ends_with(placeholder))
+            .map(str::len)
         {
             let start = self.cursor - chip_len;
             self.text.drain(start..self.cursor);
@@ -699,8 +860,10 @@ impl Composer {
         if let Some(chip_len) = self
             .pasted_chunks
             .iter()
-            .find(|c| self.text[self.cursor..].starts_with(&c.placeholder))
-            .map(|c| c.placeholder.len())
+            .map(|c| c.placeholder.as_str())
+            .chain(self.images.iter().map(|img| img.placeholder.as_str()))
+            .find(|placeholder| self.text[self.cursor..].starts_with(placeholder))
+            .map(str::len)
         {
             let end = self.cursor + chip_len;
             self.text.drain(self.cursor..end);
@@ -1029,7 +1192,12 @@ impl Composer {
                     Span::styled("· ", Style::default().fg(theme.subtle))
                 };
                 let mut spans = vec![gutter];
-                spans.extend(style_editor_row(&row.text, &self.pasted_chunks, theme));
+                spans.extend(style_editor_row(
+                    &row.text,
+                    &self.pasted_chunks,
+                    &self.images,
+                    theme,
+                ));
                 lines.push(Line::from(spans));
             }
         }
@@ -1081,9 +1249,10 @@ impl Composer {
 fn style_editor_row(
     row_text: &str,
     chunks: &[PastedChunk],
+    images: &[ImageAttachment],
     theme: &UiPalette,
 ) -> Vec<Span<'static>> {
-    if chunks.is_empty() {
+    if chunks.is_empty() && images.is_empty() {
         return vec![Span::styled(
             row_text.to_owned(),
             Style::default().fg(theme.fg),
@@ -1092,27 +1261,35 @@ fn style_editor_row(
     let mut spans = Vec::new();
     let mut cursor = 0usize;
     while cursor < row_text.len() {
-        let next_chip = chunks
-            .iter()
-            .filter_map(|c| {
-                row_text[cursor..]
-                    .find(&c.placeholder)
-                    .map(|off| (cursor + off, c.placeholder.len()))
-            })
-            .min_by_key(|&(pos, _)| pos);
+        let next_paste = chunks.iter().filter_map(|c| {
+            row_text[cursor..]
+                .find(&c.placeholder)
+                .map(|off| (cursor + off, c.placeholder.len(), false))
+        });
+        let next_image = images.iter().filter_map(|img| {
+            row_text[cursor..]
+                .find(&img.placeholder)
+                .map(|off| (cursor + off, img.placeholder.len(), true))
+        });
+        let next_chip = next_paste.chain(next_image).min_by_key(|&(pos, _, _)| pos);
         match next_chip {
-            Some((pos, len)) => {
+            Some((pos, len, is_image)) => {
                 if pos > cursor {
                     spans.push(Span::styled(
                         row_text[cursor..pos].to_owned(),
                         Style::default().fg(theme.fg),
                     ));
                 }
+                let badge_bg = if is_image {
+                    theme.info
+                } else {
+                    theme.accent_soft
+                };
                 spans.push(Span::styled(
                     row_text[pos..pos + len].to_owned(),
                     Style::default()
                         .fg(theme.bg)
-                        .bg(theme.accent_soft)
+                        .bg(badge_bg)
                         .add_modifier(Modifier::BOLD),
                 ));
                 cursor = pos + len;
@@ -1681,5 +1858,59 @@ mod tests {
             .unwrap();
         let pos = terminal.get_cursor_position().unwrap();
         assert_eq!(pos.x, area.x + 1 + 2 + 12);
+    }
+
+    #[test]
+    fn image_attachment_chips_attach_delete_atomically_stash_and_submit() {
+        let mut composer = Composer::new();
+        let img =
+            composer.attach_image(PathBuf::from("/tmp/screen.png"), "image/png", "800×600 png");
+        assert_eq!(img.id, 1);
+        assert_eq!(composer.images().len(), 1);
+        assert!(composer.text().contains("[Image #1 · 800×600 png]"));
+
+        composer.switch_thread("commander", "worker-1");
+        assert!(composer.images().is_empty());
+        composer.switch_thread("worker-1", "commander");
+        assert_eq!(composer.images().len(), 1);
+
+        let sub = composer.take_submission_with_images().unwrap();
+        assert_eq!(sub.images.len(), 1);
+        assert_eq!(sub.images[0].path, PathBuf::from("/tmp/screen.png"));
+        assert_eq!(sub.text, "Inspect the attached image(s).");
+        assert!(composer.is_empty());
+
+        composer.insert_str("Check this");
+        composer.attach_image(PathBuf::from("/tmp/ui.jpg"), "image/jpeg", "ui.jpg");
+        composer.insert_str("please");
+        let sub2 = composer.take_submission_with_images().unwrap();
+        assert_eq!(sub2.images.len(), 1);
+        assert_eq!(sub2.text, "Check this  please");
+
+        composer.attach_image(PathBuf::from("/tmp/a.png"), "image/png", "a.png");
+        assert!(composer.backspace());
+        assert!(composer.backspace());
+        assert!(composer.images().is_empty());
+        assert!(composer.text().is_empty());
+    }
+
+    #[test]
+    fn insert_quote_formats_blockquote_and_positions_cursor_for_typing() {
+        let mut composer = Composer::new();
+        composer.insert_quote("first line\nsecond line");
+        composer.insert_str("can you fix this?");
+        assert_eq!(
+            composer.text(),
+            "> first line\n> second line\n\ncan you fix this?"
+        );
+
+        let mut long_composer = Composer::new();
+        let ten_lines = (1..=10)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        long_composer.insert_quote(&ten_lines);
+        assert!(long_composer.text().contains("> row 7\n> …\n\n"));
+        assert!(!long_composer.text().contains("row 8"));
     }
 }

@@ -49,10 +49,13 @@ pub use specialists::{
 };
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender, TryRecvError},
+    sync::{
+        mpsc::{Receiver, Sender, TryRecvError},
+        Arc,
+    },
     time::{Instant, SystemTime},
 };
 
@@ -219,7 +222,7 @@ pub(crate) struct Live {
     pub(crate) allowances: Vec<usage::Allowance>,
     pub(crate) signed_in: Vec<bool>,
     pub(crate) profile_detections: HashMap<String, auth::AuthDetection>,
-    pub(crate) bridge: Option<bridge::LoopbackBridge>,
+    pub(crate) bridge: Option<Arc<bridge::LoopbackBridge>>,
     pub(crate) commander_session_id: Option<String>,
     pub(crate) commander_session_profile: Option<String>,
     pub(crate) soul_store: Option<soul::SoulStore>,
@@ -227,6 +230,10 @@ pub(crate) struct Live {
     pub(crate) handoff_turns: Vec<soul::HandoffTurn>,
     pub(crate) pending_prod_gates: HashMap<String, String>,
     pub(crate) ask_user: Option<bridge::AskUserBroker>,
+    pub inbox_store: Option<inbox::InboxStore>,
+    pub vault_store: Option<vault::VaultStore>,
+    pub memory_store: Option<memory::MemoryStore>,
+    pub evolution_store: Option<evolution::EvolutionStore>,
 }
 
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
@@ -300,6 +307,13 @@ impl Live {
         profiles: Vec<auth::Profile>,
         profile_root: Option<PathBuf>,
     ) -> Self {
+        let vault_store = profile_root.clone().map(vault::VaultStore::open);
+        let memory_store = profile_root
+            .clone()
+            .map(|root| memory::MemoryStore::for_workspace(root, &workspace));
+        let evolution_store = profile_root
+            .clone()
+            .map(|root| evolution::EvolutionStore::for_workspace(root, &workspace));
         Self {
             workspace,
             profiles,
@@ -331,6 +345,10 @@ impl Live {
             handoff_turns: Vec::new(),
             pending_prod_gates: HashMap::new(),
             ask_user: None,
+            inbox_store: None,
+            vault_store,
+            memory_store,
+            evolution_store,
         }
     }
 
@@ -680,6 +698,19 @@ pub struct App {
     pub inbox_selected: usize,
     pub(crate) inbox_dismissed: std::collections::HashSet<String>,
     pub(crate) inbox_wakes: Vec<tui::tabs::WakeNote>,
+    pub graphics: tui::graphics::GraphicsCaps,
+    pub pending_sixel_rings: Vec<token_burn::RingSlot>,
+    pub decision_cards: Vec<inbox::DecisionCard>,
+    pub inbox_filter: tui::tabs::DecisionFilter,
+    pub inbox_search: String,
+    pub inbox_searching: bool,
+    pub inbox_modal: Option<tui::tabs::DecisionModalState>,
+    pub ledger_viewer: Option<tui::tabs::LedgerDocViewer>,
+    pub vault_modal: Option<tui::tabs::VaultModalState>,
+    pub bot_badges: BTreeMap<String, String>,
+    pub decommissioned_bots: BTreeSet<String>,
+    pub keyboard_select_mode: bool,
+    pub(crate) inbox_path: Option<PathBuf>,
 }
 
 impl Default for App {
@@ -771,6 +802,19 @@ impl Default for App {
             inbox_selected: 0,
             inbox_dismissed: std::collections::HashSet::new(),
             inbox_wakes: Vec::new(),
+            graphics: tui::graphics::GraphicsCaps::default(),
+            pending_sixel_rings: Vec::new(),
+            decision_cards: Vec::new(),
+            inbox_filter: tui::tabs::DecisionFilter::default(),
+            inbox_search: String::new(),
+            inbox_searching: false,
+            inbox_modal: None,
+            ledger_viewer: None,
+            vault_modal: None,
+            bot_badges: BTreeMap::new(),
+            decommissioned_bots: BTreeSet::new(),
+            keyboard_select_mode: false,
+            inbox_path: None,
         }
     }
 }
@@ -932,10 +976,27 @@ impl App {
             if let Some(path) = &app.ledger_path {
                 app.ledger = ledger::Ledger::load(path);
             }
+            app.inbox_path = store.inbox_path_for_workspace(&live.workspace).ok();
+            if let Some(path) = &app.inbox_path {
+                match inbox::InboxStore::load(path) {
+                    Ok(loaded) => {
+                        app.decision_cards = loaded.cards().to_vec();
+                        live.inbox_store = Some(loaded);
+                    }
+                    Err(error) => {
+                        app.notice = format!("Cannot read Decision Inbox: {error}");
+                    }
+                }
+            }
+        }
+        if let Some(vault_store) = &live.vault_store {
+            register_vault_secrets_for_redaction(vault_store);
         }
         live.refresh_routes();
         live.read_allowances(usage::now());
         app.live = Some(live);
+        app.refresh_bot_lifecycle_cache();
+        app.refresh_ui_env_snapshot();
         app
     }
 
@@ -958,6 +1019,7 @@ impl App {
             },
             Err(error) => format!("Override not saved: {error}"),
         };
+        self.refresh_ui_env_snapshot();
     }
 
     pub fn status(&self, index: usize) -> &'static str {
@@ -965,6 +1027,7 @@ impl App {
     }
 
     pub fn poll_mission(&mut self) {
+        self.poll_ui_bridge_events();
         self.refresh_usage_and_sync();
         self.poll_side();
 
@@ -1210,6 +1273,10 @@ impl App {
         if result.is_ok() {
             self.apply_directives(&run.reply);
         }
+        self.poll_ui_bridge_events();
+        self.refresh_bot_lifecycle_cache();
+        self.refresh_decision_cards();
+        self.refresh_ui_env_snapshot();
         self.persist_commander_transcript();
         if let (Some(live), Some(tx)) = (&self.live, &self.bg_tx) {
             tui::events::spawn_git_refresh(live.workspace.clone(), tx.clone());
@@ -1238,6 +1305,32 @@ impl App {
         let kind = if run.reviewing { " review" } else { "" };
         self.push_log(format!("{name}{kind}  {label} · {outcome}"));
         self.notice = format!("{name} {label}");
+        if !run.reviewing {
+            let signal = match status {
+                Status::Done => Some(evolution::OutcomeSignal::FirstTryPass),
+                Status::Error => Some(evolution::OutcomeSignal::VerificationFailure),
+                Status::Snoozed => Some(evolution::OutcomeSignal::Stall),
+                Status::NeedsApproval => Some(evolution::OutcomeSignal::Escalation),
+                Status::Idle | Status::Running => None,
+            };
+            if let (Some(signal), Some(evo)) = (
+                signal,
+                self.live
+                    .as_ref()
+                    .and_then(|live| live.evolution_store.as_ref()),
+            ) {
+                let duration_ms = Some(run.started_at.elapsed().as_millis() as u64);
+                let _ = evo.record_feedback(
+                    &name,
+                    signal,
+                    None,
+                    duration_ms,
+                    None,
+                    chrono::Utc::now().timestamp(),
+                );
+            }
+            self.refresh_bot_lifecycle_cache();
+        }
         self.save_roster();
     }
 
@@ -1686,13 +1779,17 @@ impl App {
             member
                 .permission
                 .require_isolation(Some(&workspace.isolation))?;
+            let now = chrono::Utc::now().timestamp();
+            let evolution = live.evolution_store.as_ref();
+            let memory = live.memory_store.as_ref();
             let request = framed(routing::parse(&delegation.task)?, |unit| {
-                specialists::specialist_prompt(member, unit)
+                specialists::specialist_prompt_for_stores(member, unit, evolution, memory, now)
             });
             (request, member.permission)
         };
-        let mut options = mission::LaunchOptions {
+        let options = mission::LaunchOptions {
             policy: permissions::PermissionPolicy::for_mode(mode),
+            mcp_diet: true,
             ..mission::LaunchOptions::default()
         };
         let uniform_provider = live.profiles.first().map(|p| p.provider).filter(|first| {
@@ -1700,10 +1797,6 @@ impl App {
                 .iter()
                 .all(|candidate| candidate.provider == *first)
         });
-        if let Some(provider) = uniform_provider {
-            options.extra_args =
-                bridge::worker_mcp_diet_args(bridge::BridgeProvider::from(provider));
-        }
         let mission = mission::Mission::launch_with_options(
             live.profiles.clone(),
             live.route(request, delegation.target, mode, limits),
@@ -1833,24 +1926,38 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        let from_composer = self.composer.take_submission();
-        let command = match from_composer {
-            Some(text) => {
+        let from_composer = self.composer.take_submission_with_images();
+        let (command, images) = match from_composer {
+            Some(submission) => {
                 self.input.clear();
-                text
+                (submission.text, submission.images)
             }
             None => {
                 let raw = self.input.trim().to_owned();
                 if !raw.is_empty() {
                     self.composer.clear();
                 }
-                raw
+                (raw, Vec::new())
             }
         };
-        if command.trim().is_empty() {
+        if command.trim().is_empty() && images.is_empty() {
             return;
         }
-        self.submit_text(command);
+        if images.is_empty() {
+            self.submit_text(command);
+        } else {
+            let display = if command.trim().is_empty() {
+                format!("[{} image(s) attached]", images.len())
+            } else {
+                command.trim().to_owned()
+            };
+            let prompt = if command.trim().is_empty() {
+                "Inspect the attached image(s) and help with what is shown.".to_owned()
+            } else {
+                command.trim().to_owned()
+            };
+            self.message_commander_with_display_and_images(prompt, display, images);
+        }
     }
 
     pub(crate) fn submit_text(&mut self, command: String) {
@@ -1942,6 +2049,27 @@ impl App {
             specialists::Command::Goal { criteria } => self.start_goal(&criteria),
             specialists::Command::GoalCancel => self.cancel_goal(),
             specialists::Command::Mode { mode } => self.set_commander_mode(mode),
+            specialists::Command::Vault { args } => self.handle_vault_command(args.as_deref()),
+            specialists::Command::Approve { bot, note } => {
+                self.handle_bot_feedback_command(
+                    &bot,
+                    evolution::OutcomeSignal::UserApproved,
+                    note.as_deref(),
+                );
+            }
+            specialists::Command::Disapprove { bot, reason } => {
+                self.handle_bot_feedback_command(
+                    &bot,
+                    evolution::OutcomeSignal::UserDisapproved,
+                    Some(&reason),
+                );
+            }
+            specialists::Command::Bot { subcommand, rest } => {
+                self.handle_bot_command(&subcommand, rest.as_deref());
+            }
+            specialists::Command::Memory { subcommand, rest } => {
+                self.handle_memory_command(&subcommand, rest.as_deref());
+            }
             specialists::Command::Help => {
                 self.show_help_in_transcript();
                 self.record_log_only(0, format!("SYSTEM  {}", specialists::format_help()));
@@ -1959,6 +2087,544 @@ impl App {
                     });
             }
             specialists::Command::Message(text) => self.message_commander(text),
+        }
+    }
+
+    pub(crate) fn open_vault_modal(&mut self) {
+        let entries = self
+            .live
+            .as_ref()
+            .and_then(|live| live.vault_store.as_ref())
+            .and_then(|store| store.list(None).ok())
+            .unwrap_or_default();
+        self.vault_modal = Some(tui::tabs::VaultModalState {
+            mode: tui::tabs::VaultModalMode::List,
+            entries,
+            selected: 0,
+            request_id: None,
+            name: String::new(),
+            namespace: vault::DEFAULT_NAMESPACE.to_owned(),
+            description: String::new(),
+            secret_input: String::new(),
+            error: None,
+        });
+        self.notice = "Opened credential vault (metadata only).".into();
+    }
+
+    pub(crate) fn refresh_bot_lifecycle_cache(&mut self) {
+        let Some(evo) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.evolution_store.as_ref())
+        else {
+            return;
+        };
+        let Ok(cards) = evo.scorecard_report(None) else {
+            return;
+        };
+        self.bot_badges.clear();
+        self.decommissioned_bots.clear();
+        for card in cards {
+            let key = card.bot_id.to_ascii_lowercase();
+            if card.lifecycle == evolution::LifecycleState::Decommissioned {
+                self.decommissioned_bots.insert(key);
+            } else {
+                let badge = if card.rolling_metrics.sample_count > 0 {
+                    format!(
+                        "{} {:.0}%",
+                        card.badge,
+                        card.rolling_metrics.wilson_lower_bound * 100.0
+                    )
+                } else {
+                    card.badge.to_owned()
+                };
+                self.bot_badges.insert(key, badge);
+            }
+        }
+    }
+
+    pub(crate) fn refresh_decision_cards(&mut self) {
+        if let Some(store) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.inbox_store.as_ref())
+        {
+            self.decision_cards = store.cards().to_vec();
+        }
+    }
+
+    pub(crate) fn refresh_ui_env_snapshot(&mut self) {
+        let Some(live) = &self.live else { return };
+        let Some(ui_bridge) = live.bridge.as_ref().and_then(|b| b.ui_bridge()) else {
+            return;
+        };
+        let displayed = live.displayed_profile();
+        let active = live.profiles.get(displayed);
+        let profiles = live
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| {
+                let allowance = live.allowances.get(index).copied().unwrap_or_default();
+                let logged_in = live.signed_in.get(index).copied().unwrap_or(false);
+                bridge::ProfileHeadroom {
+                    label: profile.to_string(),
+                    provider: profile.provider.binary().to_owned(),
+                    logged_in,
+                    five_hour_remaining: allowance.five.map(|v| v.round().clamp(0.0, 100.0) as u8),
+                    week_remaining: allowance.week.map(|v| v.round().clamp(0.0, 100.0) as u8),
+                    latched: allowance.latched,
+                }
+            })
+            .collect();
+        ui_bridge.set_env_snapshot(bridge::EnvSnapshot {
+            workspace: live.workspace.display().to_string(),
+            git_branch: self.git_snapshot.branch.clone(),
+            git_dirty_files: self.git_snapshot.files.len(),
+            active_provider: active.map(|p| p.provider.binary().to_owned()),
+            active_profile: active.map(ToString::to_string),
+            permission_mode: Some(self.settings.commander_permission.flag().to_owned()),
+            profiles,
+            external_servers: Vec::new(),
+        });
+    }
+
+    pub(crate) fn poll_ui_bridge_events(&mut self) {
+        let (events, needs_snapshot, bridge_ledger_path) = {
+            let Some(live) = &self.live else { return };
+            let Some(ui_bridge) = live.bridge.as_ref().and_then(|b| b.ui_bridge()) else {
+                return;
+            };
+            (
+                ui_bridge.drain_events(),
+                ui_bridge.env_snapshot().is_none(),
+                ui_bridge.ledger_path(),
+            )
+        };
+        if needs_snapshot {
+            self.refresh_ui_env_snapshot();
+        }
+        if events.is_empty() {
+            return;
+        }
+        let mut transcript_dirty = false;
+        let mut inbox_dirty = false;
+        let mut ledger_dirty = false;
+        for event in events {
+            match event {
+                bridge::UiEvent::PostTable(card) => {
+                    self.transcript.push(markdown::TranscriptEntry::TableCard {
+                        title: card.title,
+                        headers: card.headers,
+                        rows: card.rows,
+                        alignments: card.alignments,
+                        caption: card.caption,
+                    });
+                    transcript_dirty = true;
+                }
+                bridge::UiEvent::PostCard(card) => {
+                    self.transcript.push(markdown::TranscriptEntry::InfoCard {
+                        title: card.title,
+                        level: card.level,
+                        badge: card.badge,
+                        fields: card.fields,
+                        body_markdown: card.body_markdown,
+                    });
+                    transcript_dirty = true;
+                }
+                bridge::UiEvent::InboxPosted(item) => {
+                    self.notice = format!("Inbox: {}", item.title);
+                }
+                bridge::UiEvent::DecisionSubmitted(rec) | bridge::UiEvent::DecisionUpdated(rec) => {
+                    let now = chrono::Utc::now().timestamp();
+                    let input = ui_decision_to_inbox_input(&rec);
+                    if let Some(live) = &mut self.live {
+                        let store = live
+                            .inbox_store
+                            .get_or_insert_with(inbox::InboxStore::default);
+                        let _ = store.upsert_card(input, now);
+                        inbox_dirty = true;
+                    }
+                    self.notice = format!("Decision queued: {}", rec.title);
+                }
+                bridge::UiEvent::InboxDismissed { key } => {
+                    self.inbox_dismissed.insert(key.clone());
+                    let card_id = key.strip_prefix("decision:").unwrap_or(&key);
+                    let normalized = normalize_inbox_card_id(card_id);
+                    let now = chrono::Utc::now().timestamp();
+                    if let Some(store) = self
+                        .live
+                        .as_mut()
+                        .and_then(|live| live.inbox_store.as_mut())
+                    {
+                        if store
+                            .retire(card_id, "Dismissed via MCP", now, None)
+                            .is_ok()
+                            || store
+                                .retire(&normalized, "Dismissed via MCP", now, None)
+                                .is_ok()
+                        {
+                            inbox_dirty = true;
+                        }
+                    }
+                }
+                bridge::UiEvent::LedgerChanged => {
+                    ledger_dirty = true;
+                }
+                bridge::UiEvent::VaultRequested(req) => {
+                    let entries = self
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.vault_store.as_ref())
+                        .and_then(|store| store.list(None).ok())
+                        .unwrap_or_default();
+                    let title = req.title.clone();
+                    self.vault_modal = Some(tui::tabs::VaultModalState {
+                        mode: tui::tabs::VaultModalMode::PromptSecret,
+                        entries,
+                        selected: 0,
+                        request_id: Some(req.request_id),
+                        name: req.name,
+                        namespace: req.namespace,
+                        description: req.description,
+                        secret_input: String::new(),
+                        error: None,
+                    });
+                    self.notice = format!("Vault secret requested: {title}");
+                }
+            }
+        }
+        if inbox_dirty {
+            if let (Some(path), Some(store)) = (
+                self.inbox_path.as_ref(),
+                self.live
+                    .as_ref()
+                    .and_then(|live| live.inbox_store.as_ref()),
+            ) {
+                let _ = store.save(path);
+            }
+            self.refresh_decision_cards();
+        }
+        if ledger_dirty {
+            if let Some(path) = self.ledger_path.as_ref().or(bridge_ledger_path.as_ref()) {
+                self.ledger = ledger::Ledger::load(path);
+            }
+        }
+        if transcript_dirty {
+            self.persist_commander_transcript();
+        }
+    }
+
+    fn handle_vault_command(&mut self, args: Option<&str>) {
+        let Some(raw) = args.map(str::trim).filter(|text| !text.is_empty()) else {
+            self.open_vault_modal();
+            return;
+        };
+        let words: Vec<&str> = raw.split_whitespace().collect();
+        match words[..] {
+            ["list"] => self.open_vault_modal(),
+            ["check", ref names @ ..] if !names.is_empty() => {
+                let Some(store) = self
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.vault_store.as_ref())
+                else {
+                    self.notice = PREVIEW_NOTICE.into();
+                    return;
+                };
+                let owned: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+                match store.check(&owned, None) {
+                    Ok(res) => {
+                        let summary = format!(
+                            "Vault check · present: [{}] · missing: [{}]",
+                            res.present.join(", "),
+                            res.missing.join(", ")
+                        );
+                        self.notice = summary.clone();
+                        self.transcript
+                            .push(markdown::TranscriptEntry::SystemNotice {
+                                level: markdown::NoticeLevel::Info,
+                                text: summary,
+                            });
+                    }
+                    Err(error) => self.notice = format!("Vault check failed: {error}"),
+                }
+            }
+            _ => {
+                self.open_vault_modal();
+            }
+        }
+    }
+
+    fn handle_bot_feedback_command(
+        &mut self,
+        bot: &str,
+        signal: evolution::OutcomeSignal,
+        note: Option<&str>,
+    ) {
+        let Some(evo) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.evolution_store.as_ref())
+        else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        let now = chrono::Utc::now().timestamp();
+        match evo.record_feedback(bot, signal, None, None, note, now) {
+            Ok(report) => {
+                let message = format!(
+                    "Recorded {} for {} (lifecycle: {}, Wilson LCB {:.0}%).",
+                    signal.label(),
+                    report.bot_id,
+                    report.lifecycle.label(),
+                    report.rolling_metrics.wilson_lower_bound * 100.0
+                );
+                self.notice = message.clone();
+                self.transcript
+                    .push(markdown::TranscriptEntry::SystemNotice {
+                        level: if signal.is_user_negative() {
+                            markdown::NoticeLevel::Warning
+                        } else {
+                            markdown::NoticeLevel::Success
+                        },
+                        text: message,
+                    });
+                self.refresh_bot_lifecycle_cache();
+            }
+            Err(error) => {
+                self.notice = format!("Feedback failed for {bot}: {error}");
+            }
+        }
+    }
+
+    fn handle_bot_command(&mut self, subcommand: &str, rest: Option<&str>) {
+        match subcommand {
+            "scorecard" => {
+                let Some(evo) = self
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.evolution_store.as_ref())
+                else {
+                    self.notice = PREVIEW_NOTICE.into();
+                    return;
+                };
+                let target = rest.and_then(|s| s.split_whitespace().next());
+                match evo.scorecard_report(target) {
+                    Ok(cards) if cards.is_empty() => {
+                        self.notice = "No forged bots recorded yet.".into();
+                    }
+                    Ok(cards) => {
+                        let rows: Vec<Vec<String>> = cards
+                            .iter()
+                            .map(|card| {
+                                vec![
+                                    card.bot_id.clone(),
+                                    card.role.clone(),
+                                    card.badge.to_owned(),
+                                    format!("v{}", card.active_revision),
+                                    format!(
+                                        "{:.0}%",
+                                        card.rolling_metrics.wilson_lower_bound * 100.0
+                                    ),
+                                    format!("{}/{}", card.user_approvals, card.user_disapprovals),
+                                ]
+                            })
+                            .collect();
+                        self.transcript.push(markdown::TranscriptEntry::TableCard {
+                            title: "Bot Competence Scorecards".into(),
+                            headers: vec![
+                                "Bot".into(),
+                                "Role".into(),
+                                "State".into(),
+                                "Rev".into(),
+                                "Wilson".into(),
+                                "App/Dis".into(),
+                            ],
+                            rows,
+                            alignments: vec![
+                                "left".into(),
+                                "left".into(),
+                                "center".into(),
+                                "right".into(),
+                                "right".into(),
+                                "right".into(),
+                            ],
+                            caption: None,
+                        });
+                        self.notice = format!("Displayed {} bot scorecard(s).", cards.len());
+                    }
+                    Err(error) => self.notice = format!("Scorecard error: {error}"),
+                }
+            }
+            "decommission" => {
+                let Some(raw) = rest.map(str::trim).filter(|s| !s.is_empty()) else {
+                    self.notice = "Usage: /bot decommission BOT [--confirm] REASON".into();
+                    return;
+                };
+                let mut words = raw.split_whitespace();
+                let Some(bot_id) = words.next() else {
+                    self.notice = "Usage: /bot decommission BOT [--confirm] REASON".into();
+                    return;
+                };
+                let remaining: Vec<&str> = words.collect();
+                let confirmed = remaining.contains(&"--confirm");
+                let reason = remaining
+                    .into_iter()
+                    .filter(|w| *w != "--confirm")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let reason = if reason.is_empty() {
+                    "Operator requested decommissioning".to_owned()
+                } else {
+                    reason
+                };
+                let Some((evo, mem)) = self.live.as_ref().and_then(|live| {
+                    Some((live.evolution_store.as_ref()?, live.memory_store.as_ref()?))
+                }) else {
+                    self.notice = PREVIEW_NOTICE.into();
+                    return;
+                };
+                let now = chrono::Utc::now().timestamp();
+                match evo.decommission_bot(mem, bot_id, &reason, confirmed, now) {
+                    Ok(evolution::DecommissionOutcome::NeedsConfirmation {
+                        bot_id,
+                        role,
+                        reason,
+                        ..
+                    }) => {
+                        let msg = format!(
+                            "{bot_id} ({role}) is pinned_core. Run `/bot decommission {bot_id} --confirm {reason}` to confirm."
+                        );
+                        self.notice = msg.clone();
+                        self.transcript
+                            .push(markdown::TranscriptEntry::SystemNotice {
+                                level: markdown::NoticeLevel::Warning,
+                                text: msg,
+                            });
+                    }
+                    Ok(evolution::DecommissionOutcome::Decommissioned {
+                        ledger_summary, ..
+                    }) => {
+                        self.notice = ledger_summary.clone();
+                        self.transcript
+                            .push(markdown::TranscriptEntry::SystemNotice {
+                                level: markdown::NoticeLevel::Info,
+                                text: ledger_summary,
+                            });
+                        self.refresh_bot_lifecycle_cache();
+                    }
+                    Ok(evolution::DecommissionOutcome::AlreadyDecommissioned { bot_id }) => {
+                        self.notice = format!("{bot_id} is already decommissioned.");
+                    }
+                    Err(error) => self.notice = format!("Decommission failed: {error}"),
+                }
+            }
+            "forge" | "evolve" => {
+                let detail = rest.unwrap_or_default().trim();
+                let prompt = if detail.is_empty() {
+                    format!(
+                        "Use the `bot_{subcommand}` MCP tool and inspect `bot_scorecard` first."
+                    )
+                } else {
+                    format!("Use `bot_{subcommand}` MCP tool for: {detail}")
+                };
+                self.message_commander(prompt);
+            }
+            _ => {
+                self.notice = "Usage: /bot {scorecard|forge|evolve|decommission} [ARGS]".into();
+            }
+        }
+    }
+
+    fn handle_memory_command(&mut self, subcommand: &str, rest: Option<&str>) {
+        let Some(mem) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.memory_store.as_ref())
+        else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        let raw = rest.unwrap_or_default().trim();
+        let now = chrono::Utc::now().timestamp();
+        match subcommand {
+            "search" => {
+                match mem.search(
+                    &[memory::MemoryScope::Shared],
+                    raw,
+                    memory::DEFAULT_SEARCH_LIMIT,
+                    memory::DEFAULT_TOKEN_BUDGET,
+                    now,
+                ) {
+                    Ok(res) if res.hits.is_empty() => {
+                        self.notice = format!("No shared memory matched '{raw}'.");
+                    }
+                    Ok(res) => {
+                        let fields = res
+                            .hits
+                            .iter()
+                            .take(10)
+                            .map(|hit| {
+                                (
+                                    format!("[{}] {}", hit.entry.kind.label(), hit.entry.title),
+                                    hit.entry.body.clone(),
+                                )
+                            })
+                            .collect();
+                        self.transcript.push(markdown::TranscriptEntry::InfoCard {
+                            title: format!("Shared Memory Search: {raw}"),
+                            level: "info".into(),
+                            badge: Some(format!("{} hit(s)", res.hits.len())),
+                            fields,
+                            body_markdown: String::new(),
+                        });
+                        self.notice = format!("Found {} shared memory hit(s).", res.hits.len());
+                    }
+                    Err(error) => self.notice = format!("Memory search failed: {error}"),
+                }
+            }
+            "write" => {
+                let (title, body) = match raw.split_once('|') {
+                    Some((left, right)) => (left.trim(), right.trim()),
+                    None => (raw, raw),
+                };
+                if title.is_empty() || body.is_empty() {
+                    self.notice = "Usage: /memory write TITLE | BODY".into();
+                    return;
+                }
+                let input = memory::WriteMemoryInput {
+                    scope: memory::MemoryScope::Shared,
+                    kind: memory::MemoryKind::Lesson,
+                    title: title.to_owned(),
+                    body: body.to_owned(),
+                    tags: vec!["operator".to_owned()],
+                    author: "operator".to_owned(),
+                    origin: memory::MemoryOrigin::UserUi,
+                    salience: None,
+                    confidence: None,
+                    pinned: false,
+                    ttl_secs: None,
+                };
+                match mem.write(input, now) {
+                    Ok(outcome) => {
+                        let msg = format!(
+                            "Saved shared memory {} ({:?}).",
+                            outcome.entry.id, outcome.status
+                        );
+                        self.notice = msg.clone();
+                        self.transcript
+                            .push(markdown::TranscriptEntry::SystemNotice {
+                                level: markdown::NoticeLevel::Success,
+                                text: msg,
+                            });
+                    }
+                    Err(error) => self.notice = format!("Memory write refused: {error}"),
+                }
+            }
+            _ => {
+                self.notice = "Usage: /memory {search QUERY | write TITLE | BODY}".into();
+            }
         }
     }
 
@@ -2151,6 +2817,7 @@ impl App {
             },
             None => format!("{change} (no config directory; not saved)."),
         };
+        self.refresh_ui_env_snapshot();
     }
 
     fn message_commander(&mut self, command: String) {
@@ -2158,12 +2825,29 @@ impl App {
     }
 
     fn message_commander_with_display(&mut self, command: String, display: String) {
+        self.message_commander_with_display_and_images(command, display, Vec::new());
+    }
+
+    fn message_commander_with_display_and_images(
+        &mut self,
+        command: String,
+        display: String,
+        images: Vec<editor::ImageAttachment>,
+    ) {
+        let attachment_labels: Vec<String> = images.iter().map(|img| img.label.clone()).collect();
         let limits = self.limit_policy();
         let commander_mode = self.settings.commander_permission;
         let prod_gate_enabled = self.settings.prod_gate;
         if self.live.is_none() {
             self.crew[0].mission = display.clone();
             self.push_log(format!("YOU  {display}"));
+            if !attachment_labels.is_empty() {
+                if let Some(markdown::TranscriptEntry::UserMessage { attachments, .. }) =
+                    self.transcript.entries.last_mut()
+                {
+                    *attachments = attachment_labels;
+                }
+            }
             self.input.clear();
             self.notice = PREVIEW_NOTICE.into();
             return;
@@ -2224,6 +2908,7 @@ impl App {
         };
         let request = framed(parsed, |unit| self.build_commander_prompt_text(unit));
         let mcp_config = self.ensure_loopback_bridge();
+        let bridge = self.live.as_ref().and_then(|live| live.bridge.clone());
         let (resume_session, resume_session_profile, portable_handoff) =
             if let Some(live) = &self.live {
                 let handoff = (!live.handoff_turns.is_empty()).then(|| {
@@ -2245,10 +2930,13 @@ impl App {
             resume_session,
             resume_session_profile,
             portable_handoff,
-            mcp_config,
+            mcp_config: if bridge.is_some() { None } else { mcp_config },
             extra_args: Vec::new(),
             policy,
             persistent_stdio: true,
+            attachments: images,
+            bridge,
+            ..mission::LaunchOptions::default()
         };
         self.turn_changes.clear();
         let live = self.live.as_mut().expect("checked live");
@@ -2273,6 +2961,14 @@ impl App {
         self.composer.set_running(true);
         self.input.clear();
         self.push_log(format!("YOU  {display}"));
+        if !attachment_labels.is_empty() {
+            if let Some(markdown::TranscriptEntry::UserMessage { attachments, .. }) =
+                self.transcript.entries.last_mut()
+            {
+                *attachments = attachment_labels;
+            }
+            self.persist_commander_transcript();
+        }
     }
 
     pub(crate) fn abandon_continuation(&mut self) {
@@ -2306,6 +3002,86 @@ impl App {
         self.selected = self.selected.min(self.crew.len().saturating_sub(1));
         self.sync_ledger();
         tui::render::draw_single_canvas(self, f);
+    }
+}
+
+fn register_vault_secrets_for_redaction(store: &vault::VaultStore) {
+    let Ok(items) = store.list(None) else {
+        return;
+    };
+    for item in items {
+        let _ = store.resolve_value(&item.name, Some(&item.namespace));
+    }
+}
+
+fn normalize_inbox_card_id(raw: &str) -> String {
+    let upper: String = raw
+        .trim()
+        .to_ascii_uppercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = upper.trim_matches('-').to_owned();
+    if inbox::valid_card_id(&trimmed) {
+        return trimmed;
+    }
+    let slug: String = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!(
+            "DEC-{}",
+            uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase()
+        )
+    } else {
+        format!("DEC-{slug}")
+    }
+}
+
+fn ui_decision_to_inbox_input(rec: &bridge::UiDecisionRecord) -> inbox::DecisionInput {
+    let id = normalize_inbox_card_id(&rec.id);
+    let readiness = match rec.status.as_str() {
+        "resolved" => inbox::DecisionReadiness::Answered,
+        "retired" => inbox::DecisionReadiness::ResolvedStale,
+        _ => inbox::DecisionReadiness::Ready,
+    };
+    let alternatives: Vec<inbox::DecisionOption> = rec
+        .options
+        .iter()
+        .map(|opt| inbox::DecisionOption {
+            id: opt.id.clone(),
+            label: opt.label.clone(),
+        })
+        .collect();
+    let current_state = if rec.directions.trim().is_empty() {
+        format!("Submitted by Commander ({})", rec.kind)
+    } else {
+        rec.directions.clone()
+    };
+    inbox::DecisionInput {
+        id: id.clone(),
+        title: rec.title.clone(),
+        question: rec.question.clone(),
+        current_state,
+        why_it_matters: format!("Operator decision requested for {}.", rec.title),
+        recommendation: rec.recommendation.clone(),
+        source_row: id,
+        owner_agent_id: COMMANDER.to_owned(),
+        owner_name: COMMANDER.to_owned(),
+        project: "agent-command".to_owned(),
+        group: rec.kind.clone(),
+        readiness,
+        alternatives,
+        kind: inbox::DecisionKind::Standard,
+        ..inbox::DecisionInput::default()
     }
 }
 
@@ -2410,7 +3186,12 @@ if test "$1" = -p || test "$1" = --print; then
     printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$long"
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude output"},{"type":"tool_use","input":"internal event"}]}}'
 else
-    test "$1" = -a && test "$3" = exec || exit 10
+    test "$1" = -a && test "$2" = never || exit 10
+    shift 2
+    while test "$1" = -c; do
+        shift 2
+    done
+    test "$1" = exec || exit 10
     printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$long"
     printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Codex output"}}'
 fi
@@ -2856,10 +3637,13 @@ while test ! -f release; do sleep 0.01; done
             let arguments = fs::read_to_string(fixture.root.join("arguments")).unwrap();
             assert!(
                 arguments.starts_with(
-                    "--model claude-opus-5-5 --effort high -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --setting-sources user --mcp-config "
-                ) && arguments.ends_with(
-                    ".json --permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit\n"
-                ) && arguments.lines().count() == 1,
+                    "--model claude-opus-5-5 --effort high -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --setting-sources user "
+                ) && arguments.contains("--mcp-config ")
+                    && arguments.contains(".json")
+                    && arguments.contains(
+                        "--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit"
+                    )
+                    && arguments.lines().count() == 1,
                 "{arguments}"
             );
             fs::write(state.join(native::PINS_FILE), b"{\"schema\":\"agent-command-native-pins-v1\",\"pins\":[{\"profile\":\"claude/alpha\",\"model\":\"opus\",\"effort\":null}]}").unwrap();
@@ -2975,7 +3759,9 @@ esac
         assert_eq!(runs.len(), 2, "{argv}");
         assert!(runs[0].starts_with("--print"), "{argv}");
         assert!(
-            runs[0].ends_with("--permission-mode acceptEdits --"),
+            runs[0].contains("--permission-mode acceptEdits")
+                && runs[0].contains("--strict-mcp-config")
+                && runs[0].ends_with(" --"),
             "{argv}"
         );
         assert!(runs[1].ends_with("--sandbox read-only -"), "{argv}");
@@ -3719,6 +4505,7 @@ esac
             markdown::TranscriptEntry::UserMessage {
                 text: "Build gridfall.html".into(),
                 timestamp: Some("01:25:00".into()),
+                attachments: Vec::new(),
             },
             markdown::TranscriptEntry::ThinkingBlock {
                 text: "Design canvas loop and controls".into(),
@@ -4862,5 +5649,119 @@ esac
         assert_eq!(live.next_ready(), None);
         assert!(live.running("S1") && !live.running("s4"));
         assert_eq!(live.queue.len(), 1);
+    }
+
+    #[test]
+    fn ui_bridge_events_and_bot_memory_slash_commands_update_app_state() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-wave2a-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let live = Live::new(workspace.clone(), Vec::new(), Some(root.clone()));
+        let mut app = App::from_live(live);
+
+        let ui_bridge = bridge::UiBridge::new();
+        let config = bridge::BridgeSessionConfig {
+            workspace_root: workspace.clone(),
+            profile_root: root.clone(),
+            soul: None,
+            catalog: bridge::ExternalToolCatalog::new(),
+            ask_user: bridge::AskUserBroker::default(),
+            wake_queue: bridge::WakeQueue::new(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let started =
+            bridge::LoopbackBridge::start_session_with_ui(config, ui_bridge.clone(), None).unwrap();
+        app.live.as_mut().unwrap().bridge = Some(Arc::new(started));
+
+        ui_bridge.post_table(bridge::UiTableCard {
+            title: "Health".into(),
+            headers: vec!["Check".into(), "State".into()],
+            rows: vec![vec!["Vault".into(), "OK".into()]],
+            alignments: vec!["left".into(), "right".into()],
+            caption: None,
+        });
+        ui_bridge.post_card(bridge::UiInfoCard {
+            title: "Summary".into(),
+            level: "success".into(),
+            badge: Some("READY".into()),
+            fields: vec![("Branch".into(), "feat/v0.3-platform".into())],
+            body_markdown: "All systems nominal.".into(),
+        });
+        let _ = ui_bridge.request_vault_secret(
+            bridge::VaultSecretRequest {
+                request_id: "req-1".into(),
+                name: "DEPLOY_KEY".into(),
+                namespace: "ops".into(),
+                title: "Provide deploy key".into(),
+                description: "Used for staging".into(),
+            },
+            std::time::Duration::from_millis(1),
+        );
+
+        app.poll_ui_bridge_events();
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            entry,
+            markdown::TranscriptEntry::TableCard { title, .. } if title == "Health"
+        )));
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            entry,
+            markdown::TranscriptEntry::InfoCard { title, .. } if title == "Summary"
+        )));
+        let modal = app.vault_modal.as_ref().unwrap();
+        assert_eq!(modal.mode, tui::tabs::VaultModalMode::PromptSecret);
+        assert_eq!(modal.name, "DEPLOY_KEY");
+        assert_eq!(modal.request_id.as_deref(), Some("req-1"));
+
+        app.submit_text("/memory write Release Rule | Keep Rust modules comment-free".into());
+        app.submit_text("/memory search comment-free".into());
+        assert!(app.notice.contains("1 shared memory hit"));
+
+        {
+            let live = app.live.as_ref().unwrap();
+            let evo = live.evolution_store.as_ref().unwrap();
+            let mem = live.memory_store.as_ref().unwrap();
+            let _ = evo
+                .forge_bot(
+                    mem,
+                    evolution::ForgeBotRequest {
+                        bot_id: "sentinel".into(),
+                        role: "reviewer".into(),
+                        work_class: evolution::WorkClass::Review,
+                        charter: evolution::BotCharter {
+                            job: "Audit Rust diffs".into(),
+                            anti_jobs: vec!["Never push directly".into()],
+                            voice_and_style: "Terse".into(),
+                            verification_bar: "Run clippy".into(),
+                            allowed_tools: vec![],
+                            instructions: "Inspect changes".into(),
+                        },
+                        permission_mode: None,
+                        preferred_model: None,
+                        pinned_core: true,
+                        initial_memory_seeds: vec![],
+                        probation_runs: Some(2),
+                        rationale: "Safety reviewer".into(),
+                    },
+                    chrono::Utc::now().timestamp(),
+                )
+                .unwrap();
+        }
+        app.submit_text("/approve sentinel Solid diff".into());
+        assert!(app.bot_badges.contains_key("sentinel"));
+
+        app.submit_text("/bot decommission sentinel Retired".into());
+        assert!(app.notice.contains("pinned_core"));
+        assert!(!app.decommissioned_bots.contains("sentinel"));
+
+        app.submit_text("/bot decommission sentinel --confirm Retired".into());
+        assert!(app.decommissioned_bots.contains("sentinel"));
+        assert!(!app.bot_badges.contains_key("sentinel"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

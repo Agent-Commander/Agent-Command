@@ -182,7 +182,12 @@ impl Client {
 
     pub(crate) fn health(&self) -> io::Result<Value> {
         let health = self.get_json("/health")?;
-        if health["status"] != "ok" || health["name"] != "agent-command" {
+        if health["status"] != "ok"
+            || !matches!(
+                health["name"].as_str(),
+                Some("agent-command" | "agent-command-bridge")
+            )
+        {
             return Err(io::Error::other("Endpoint is not an Agent Command daemon"));
         }
         Ok(health)
@@ -543,5 +548,18 @@ mod tests {
         });
         assert!(refused.is_err());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn health_check_accepts_loopback_bridge_identity() {
+        let bridge =
+            crate::bridge::LoopbackBridge::start_with_handler(std::sync::Arc::new(|_| None))
+                .unwrap();
+        let target = Target::parse(&bridge.base_url()).unwrap();
+        let token = Token::parse(bridge.token()).unwrap();
+        let client = Client::new(target, token);
+        let health = client.health().unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["name"], "agent-command-bridge");
     }
 }

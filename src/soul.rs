@@ -421,6 +421,18 @@ pub fn commander_system_prompt(
          - If the user tells you to stop or cancel, halt immediately and interrupt active workers.\n\
          - Lead with plain-English results first. Keep routine coordination internal unless the user asks."
             .to_owned(),
+        "Environment & Tool Routing:\n\
+         - You are connected to the `agent_command` loopback MCP server. Prefer its structured tools over ad-hoc shell scripts:\n\
+         - Environment & Status: call `env_status` for workspace, git status, active provider/profile/mode, quota headroom, and vault/inbox/ledger counts.\n\
+         - Workers: use `spawn_worker`, `message_worker`, `read_worker`, `list_workers`, `interrupt_worker`; rely on `<background-result>` wakeups rather than polling.\n\
+         - Inbox & Decisions: use `inbox_list`, `inbox_post`, `inbox_submit_decision`, `inbox_update_decision`, `inbox_dismiss` (1 decision = 1 card, concrete recommendation + options, never `TBD`).\n\
+         - Ledger & Task Docs: use `ledger_list`, `ledger_record`, `ledger_update`, `ledger_read_doc`, `ledger_append_doc` to keep durable task state and Markdown docs current.\n\
+         - Rich Chat UI: use `ui_post_table` and `ui_post_card` to render structured comparisons, metrics, status cards, or checklists directly in chat.\n\
+         - Credentials (Zero-Leak): call `vault_list` / `vault_check` first; if a secret is missing, call `vault_request` so the user enters it in a masked prompt. NEVER ask for raw secrets in chat and NEVER print, log, or pass secret values in shell arguments.\n\
+         - Two-Tier Memory: use `memory_search`, `memory_write`, `memory_supersede`, `memory_delete` (`shared` for cross-bot facts/decisions/conventions/warnings, `self` for bot-private playbooks/recipes/corrections; secrets are refused).\n\
+         - Bot Forge & Evolution: use `bot_scorecard` for bot health, `bot_forge` to create narrowly scoped specialists, `bot_record_feedback` for outcomes, `bot_evolve` for probation-gated charter mutations with LKG rollback, and `bot_decommission` (requires operator confirmation for `pinned_core` bots).\n\
+         - GitHub & External MCP: use `github_pr_*` / `github_issue_*` for GitHub, and `tool_search` -> `tool_describe` -> `tool_call` for user-configured external MCP servers."
+            .to_owned(),
     ];
 
     if let Some(gh) = gh_context.map(str::trim).filter(|text| !text.is_empty()) {
@@ -718,6 +730,16 @@ mod tests {
         assert!(prompt.contains("spending real money"));
         assert!(prompt.contains("ProdGate"));
         assert!(prompt.contains("plain-English results first"));
+        assert!(prompt.contains("Environment & Tool Routing:"));
+        assert!(prompt.contains("agent_command"));
+        assert!(prompt.contains("env_status"));
+        assert!(prompt.contains("inbox_submit_decision"));
+        assert!(prompt.contains("ledger_read_doc"));
+        assert!(prompt.contains("ui_post_table"));
+        assert!(prompt.contains("vault_request"));
+        assert!(prompt.contains("memory_search"));
+        assert!(prompt.contains("bot_forge"));
+        assert!(prompt.contains("bot_decommission"));
         assert!(prompt.contains("@dev"));
         assert!(prompt.contains("nova (builder, RUNNING)"));
         assert!(prompt.contains("spawn_worker"));

@@ -1,7 +1,10 @@
 use agent_command::{
-    ledger::{LedgerFilter, TaskKind, TaskStatus},
-    tui::tabs::{self, InboxKind, LeftPanelMode, ViewTab},
-    App, Status,
+    inbox::{
+        DecisionCard, DecisionInput, DecisionKind, DecisionOption, DecisionReadiness, InboxStore,
+    },
+    ledger::{Ledger, LedgerDocument, LedgerFilter, TaskKind, TaskStatus},
+    tui::tabs::{self, DecisionFilter, InboxKind, LeftPanelMode, ViewTab},
+    App, Status, COMMANDER,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
@@ -302,9 +305,7 @@ fn ledger_hydrates_from_crew_filters_and_jumps_to_owner_thread() {
     let view = render(&mut app, 140, 40);
     let screen = whole(&view);
     assert!(screen.contains("LEDGER · 0 active · 3 tracked"), "{screen}");
-    for heading in [
-        "ID", "STATUS", "OWNER", "TITLE", "BRANCH", "FILES", "UPDATED",
-    ] {
+    for heading in ["ID", "STATUS", "OWNER", "SUMMARY", "UPDATED"] {
         assert!(screen.contains(heading), "{heading}: {screen}");
     }
     assert!(
@@ -334,6 +335,11 @@ fn ledger_hydrates_from_crew_filters_and_jumps_to_owner_thread() {
     let target = app.ledger_rows()[1].owner.clone();
     press(&mut app, KeyCode::Down, KeyModifiers::NONE);
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_some());
+    let split = render(&mut app, 140, 40);
+    assert!(whole(&split).contains("Task Brief"));
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_none());
     assert_eq!(app.view_tab, ViewTab::Chat);
     assert_eq!(app.crew[app.selected].name, target);
 
@@ -346,12 +352,16 @@ fn ledger_hydrates_from_crew_filters_and_jumps_to_owner_thread() {
         .unwrap();
     app.click(60, row_y);
     app.click(60, row_y);
+    assert!(app.ledger_viewer.is_some());
+    let opened = render(&mut app, 140, 40);
+    let (jx, jy) = find(&opened, " g Jump to thread ").expect("jump button");
+    app.click(jx + 1, jy);
     assert_eq!(app.view_tab, ViewTab::Chat);
     assert_eq!(app.crew[app.selected].name, first_owner);
 }
 
 #[test]
-fn ledger_view_is_usable_at_80_by_24_and_drops_branch_when_tight() {
+fn ledger_view_is_usable_at_80_by_24_and_drops_updated_when_tight() {
     let mut app = crew_app(&["nova"]);
     app.crew[1].status = Status::NeedsApproval;
     app.set_view_tab(ViewTab::Ledger);
@@ -362,17 +372,204 @@ fn ledger_view_is_usable_at_80_by_24_and_drops_branch_when_tight() {
     assert!(app.left_panel_visible());
     let tight_screen = whole(&tight);
     assert!(tight_screen.contains("needs_approval"), "{tight_screen}");
-    assert!(!tight_screen.contains("BRANCH"), "{tight_screen}");
+    assert!(!tight_screen.contains("UPDATED"), "{tight_screen}");
     let buffer = render(&mut app, 80, 24);
     let screen = whole(&buffer);
     assert!(screen.contains("needs_approval"), "{screen}");
-    assert!(
-        screen.contains("BRANCH") && screen.contains("UPDATED"),
-        "{screen}"
-    );
+    assert!(screen.contains("SUMMARY"), "{screen}");
+    assert!(screen.contains("UPDATED"), "{screen}");
     assert!(screen.contains(" Attention 1 "), "{screen}");
     for y in 0..24 {
         let line = text(&buffer, Rect::new(0, y, 80, 1));
         assert!(line.chars().count() <= 80);
     }
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_some());
+    let doc_80 = render(&mut app, 80, 24);
+    assert!(whole(&doc_80).contains("Esc Back"));
+    for y in 0..24 {
+        let line = text(&doc_80, Rect::new(0, y, 80, 1));
+        assert!(line.chars().count() <= 80);
+    }
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_none());
+}
+
+fn make_decision_card(id: &str, title: &str, question: &str) -> DecisionCard {
+    let mut store = InboxStore::default();
+    store
+        .upsert_card(
+            DecisionInput {
+                id: id.into(),
+                title: title.into(),
+                question: question.into(),
+                current_state: "Waiting for operator choice.".into(),
+                why_it_matters: "Determines next execution stage.".into(),
+                recommendation: "approve — lowest risk".into(),
+                source_row: "M-001".into(),
+                owner_agent_id: "builder".into(),
+                owner_name: "Builder".into(),
+                project: "Agent-Command".into(),
+                group: "v0.3".into(),
+                readiness: DecisionReadiness::Ready,
+                alternatives: vec![
+                    DecisionOption {
+                        id: "approve".into(),
+                        label: "Approve rollout".into(),
+                    },
+                    DecisionOption {
+                        id: "defer".into(),
+                        label: "Defer rollout".into(),
+                    },
+                ],
+                kind: DecisionKind::Standard,
+                constraints: Some("Zero new dependencies.".into()),
+                example: None,
+                detail: None,
+                preparation: None,
+                canonical_sources: vec!["ledger-docs/active/M-001.md".into()],
+                is_current_blocker: true,
+                self_serve: None,
+                stuck: None,
+            },
+            1_700_000_000,
+        )
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn decision_inbox_modal_enforces_no_auto_open_explain_more_and_retire_at_80x24_and_120x40() {
+    let mut app = App::default();
+    app.decision_cards = vec![
+        make_decision_card("AC-INT-1", "Cache policy", "Enable local cache compaction?"),
+        make_decision_card(
+            "AC-INT-2",
+            "Archive cadence",
+            "Run weekly archive compaction?",
+        ),
+        make_decision_card("AC-INT-3", "Retry budget", "Keep bounded requeue at 1?"),
+    ];
+    app.set_view_tab(ViewTab::Inbox);
+    assert_eq!(app.inbox_count(), 3);
+
+    for (w, h) in [(120, 40), (80, 24)] {
+        let buf = render(&mut app, w, h);
+        let screen = whole(&buf);
+        assert!(screen.contains("AC-INT-1"), "{w}x{h}: {screen}");
+        for y in 0..h {
+            assert!(text(&buf, Rect::new(0, y, w, 1)).chars().count() <= usize::from(w));
+        }
+    }
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.inbox_modal.as_ref().map(|m| m.card_id.as_str()),
+        Some("AC-INT-1")
+    );
+    for (w, h) in [(120, 40), (80, 24)] {
+        let buf = render(&mut app, w, h);
+        let screen = whole(&buf);
+        assert!(screen.contains("Where things stand"), "{w}x{h}: {screen}");
+        assert!(screen.contains("Owner recommendation"), "{w}x{h}: {screen}");
+    }
+
+    press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(app.decision_filter_count(DecisionFilter::Drafts), 1);
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.inbox_modal.is_none());
+    assert_eq!(app.filtered_decision_cards().len(), 2);
+    assert_eq!(app.filtered_decision_cards()[0].id, "AC-INT-2");
+    assert_eq!(app.inbox_selected, 0);
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.inbox_modal.as_ref().map(|m| m.card_id.as_str()),
+        Some("AC-INT-2")
+    );
+    press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    for ch in "Clarify schedule".chars() {
+        press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.inbox_modal.is_none());
+    assert_eq!(app.filtered_decision_cards().len(), 1);
+    assert_eq!(app.filtered_decision_cards()[0].id, "AC-INT-3");
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    assert!(app.inbox_modal.is_none());
+    assert!(app.filtered_decision_cards().is_empty());
+    assert_eq!(app.past_decision_cards().len(), 2);
+}
+
+#[test]
+fn ledger_document_viewer_renders_persisted_markdown_at_80x24_and_120x40() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-command-ledger-int-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let ledger_path = root.join("ledger.json");
+    let mut disk_ledger = Ledger::default();
+    let id = disk_ledger.record(
+        TaskKind::Goal,
+        COMMANDER,
+        "Ship document linked ledger",
+        1_700_000_000,
+    );
+    let entry = disk_ledger.get(&id).unwrap().clone();
+    let doc = LedgerDocument::from_entry(&entry, "Ship document linked ledger");
+    disk_ledger.write_document(&root, &id, &doc).unwrap();
+    disk_ledger.save(&ledger_path).unwrap();
+    let reloaded = Ledger::load(&ledger_path);
+    let doc_text = reloaded
+        .read_document(&root, &id)
+        .expect("persisted ledger markdown document");
+    assert!(doc_text.contains("## Task Brief"), "{doc_text}");
+    assert!(
+        doc_text.contains("Ship document linked ledger"),
+        "{doc_text}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let mut app = App::default();
+    app.input = "/goal ship document linked ledger".into();
+    app.submit();
+    app.set_view_tab(ViewTab::Ledger);
+    assert_eq!(app.ledger_rows().len(), 1);
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_some());
+    let wide = render(&mut app, 120, 40);
+    let wide_text = whole(&wide);
+    assert!(wide_text.contains("Task Brief"), "{wide_text}");
+    assert!(wide_text.contains("Jump to thread"), "{wide_text}");
+    assert!(wide_text.contains("Esc Back"), "{wide_text}");
+    for y in 0..40 {
+        assert!(text(&wide, Rect::new(0, y, 120, 1)).chars().count() <= 120);
+    }
+
+    app.left_panel = LeftPanelMode::Hidden;
+    app.rail_open = false;
+    let split = render(&mut app, 120, 40);
+    let split_text = whole(&split);
+    assert!(split_text.contains("SUMMARY"), "{split_text}");
+    assert!(split_text.contains("Task Brief"), "{split_text}");
+    assert!(split_text.contains("Jump to thread"), "{split_text}");
+
+    let narrow = render(&mut app, 80, 24);
+    let narrow_text = whole(&narrow);
+    assert!(narrow_text.contains("Esc Back"), "{narrow_text}");
+    for y in 0..24 {
+        assert!(text(&narrow, Rect::new(0, y, 80, 1)).chars().count() <= 80);
+    }
+
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert!(app.ledger_viewer.is_none());
+    assert_eq!(app.view_tab, ViewTab::Chat);
+    assert_eq!(app.crew[app.selected].name, COMMANDER);
 }

@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -170,6 +171,8 @@ pub enum TranscriptEntry {
     UserMessage {
         text: String,
         timestamp: Option<String>,
+        #[serde(default)]
+        attachments: Vec<String>,
     },
     AssistantMarkdown {
         speaker: String,
@@ -218,6 +221,26 @@ pub enum TranscriptEntry {
         level: NoticeLevel,
         text: String,
     },
+    TableCard {
+        title: String,
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        #[serde(default)]
+        alignments: Vec<String>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+    InfoCard {
+        title: String,
+        #[serde(default)]
+        level: String,
+        #[serde(default)]
+        badge: Option<String>,
+        #[serde(default)]
+        fields: Vec<(String, String)>,
+        #[serde(default)]
+        body_markdown: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,6 +264,120 @@ pub enum TranscriptHitAction {
     SelectDelegation {
         worker: String,
     },
+    OpenLink {
+        target: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DocPos {
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionButton {
+    #[default]
+    Quote,
+    Copy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectionPopoverRects {
+    pub container: Rect,
+    pub quote: Rect,
+    pub copy: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: DocPos,
+    pub focus: DocPos,
+    pub dragging: bool,
+    pub popover_open: bool,
+    pub focused_button: SelectionButton,
+}
+
+impl TextSelection {
+    pub fn ordered(&self) -> (DocPos, DocPos) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.focus
+    }
+
+    pub fn toggle_button(&mut self) {
+        self.focused_button = match self.focused_button {
+            SelectionButton::Quote => SelectionButton::Copy,
+            SelectionButton::Copy => SelectionButton::Quote,
+        };
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedCell {
+    grapheme: String,
+    col_start: usize,
+    width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedLine {
+    cells: Vec<RenderedCell>,
+    soft_wrapped: bool,
+    copy_prefix_cols: usize,
+    copy_end_col: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LineLinkSpan {
+    col_start: usize,
+    col_width: usize,
+    target: String,
+}
+
+#[derive(Clone, Debug)]
+struct BuiltLine {
+    line: Line<'static>,
+    soft_wrapped: bool,
+    copy_prefix_cols: usize,
+    copy_end_col: Option<usize>,
+    links: Vec<LineLinkSpan>,
+}
+
+impl BuiltLine {
+    fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            soft_wrapped: false,
+            copy_prefix_cols: 0,
+            copy_end_col: None,
+            links: Vec::new(),
+        }
+    }
+
+    fn prepend_span(&mut self, span: Span<'static>, count_as_copy_prefix: bool) {
+        let shift = span.width();
+        self.line.spans.insert(0, span);
+        for link in &mut self.links {
+            link.col_start = link.col_start.saturating_add(shift);
+        }
+        if count_as_copy_prefix {
+            self.copy_prefix_cols = self.copy_prefix_cols.saturating_add(shift);
+        }
+        if let Some(end_col) = self.copy_end_col {
+            self.copy_end_col = Some(end_col.saturating_add(shift));
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.line.spans.iter().map(Span::width).sum()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,9 +422,19 @@ impl Transcript {
     }
 
     pub fn push_user(&mut self, text: impl Into<String>, timestamp: Option<String>) -> usize {
+        self.push_user_with_attachments(text, timestamp, Vec::new())
+    }
+
+    pub fn push_user_with_attachments(
+        &mut self,
+        text: impl Into<String>,
+        timestamp: Option<String>,
+        attachments: Vec<String>,
+    ) -> usize {
         self.push(TranscriptEntry::UserMessage {
             text: text.into(),
             timestamp,
+            attachments,
         })
     }
 
@@ -517,8 +664,14 @@ impl Transcript {
         let mut out = Vec::new();
         for entry in &self.entries {
             match entry {
-                TranscriptEntry::UserMessage { text, .. } => {
-                    out.push(format!("You:\n{text}"));
+                TranscriptEntry::UserMessage {
+                    text, attachments, ..
+                } => {
+                    if attachments.is_empty() {
+                        out.push(format!("You:\n{text}"));
+                    } else {
+                        out.push(format!("You [{}]:\n{text}", attachments.join(", ")));
+                    }
                 }
                 TranscriptEntry::AssistantMarkdown {
                     speaker, markdown, ..
@@ -568,6 +721,46 @@ impl Transcript {
                 TranscriptEntry::SystemNotice { text, .. } => {
                     out.push(format!("[System] {text}"));
                 }
+                TranscriptEntry::TableCard {
+                    title,
+                    headers,
+                    rows,
+                    caption,
+                    ..
+                } => {
+                    let mut block = vec![format!("[Table: {title}]")];
+                    if !headers.is_empty() {
+                        block.push(headers.join(" | "));
+                    }
+                    for row in rows {
+                        block.push(row.join(" | "));
+                    }
+                    if let Some(cap) = caption.as_deref().filter(|s| !s.trim().is_empty()) {
+                        block.push(cap.to_owned());
+                    }
+                    out.push(block.join("\n"));
+                }
+                TranscriptEntry::InfoCard {
+                    title,
+                    badge,
+                    fields,
+                    body_markdown,
+                    ..
+                } => {
+                    let badge_part = badge
+                        .as_deref()
+                        .filter(|b| !b.trim().is_empty())
+                        .map(|b| format!(" [{b}]"))
+                        .unwrap_or_default();
+                    let mut block = vec![format!("[{title}{badge_part}]")];
+                    for (k, v) in fields {
+                        block.push(format!("{k}: {v}"));
+                    }
+                    if !body_markdown.trim().is_empty() {
+                        block.push(body_markdown.clone());
+                    }
+                    out.push(block.join("\n"));
+                }
             }
         }
         out.join("\n\n")
@@ -598,6 +791,10 @@ pub struct ScrollState {
     viewport_height: usize,
     message_anchors: Vec<usize>,
     hit_rects: Vec<HitRect>,
+    content_area: Rect,
+    rendered_lines: Vec<RenderedLine>,
+    selection: Option<TextSelection>,
+    popover_rects: SelectionPopoverRects,
 }
 
 impl Default for ScrollState {
@@ -615,6 +812,10 @@ impl ScrollState {
             viewport_height: 0,
             message_anchors: Vec::new(),
             hit_rects: Vec::new(),
+            content_area: Rect::default(),
+            rendered_lines: Vec::new(),
+            selection: None,
+            popover_rects: SelectionPopoverRects::default(),
         }
     }
 
@@ -636,6 +837,227 @@ impl ScrollState {
 
     pub fn max_offset(&self) -> usize {
         self.total_lines.saturating_sub(self.viewport_height)
+    }
+
+    pub fn selection(&self) -> Option<&TextSelection> {
+        self.selection.as_ref()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.as_ref().is_some_and(|sel| !sel.is_empty())
+    }
+
+    pub fn popover_open(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|sel| sel.popover_open && !sel.is_empty())
+    }
+
+    pub fn popover_rects(&self) -> SelectionPopoverRects {
+        self.popover_rects
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.popover_rects = SelectionPopoverRects::default();
+    }
+
+    pub fn focus_popover_button(&mut self, button: SelectionButton) {
+        if let Some(sel) = &mut self.selection {
+            sel.focused_button = button;
+        }
+    }
+
+    pub fn toggle_popover_button(&mut self) {
+        if let Some(sel) = &mut self.selection {
+            sel.toggle_button();
+        }
+    }
+
+    pub fn set_selection(&mut self, anchor: DocPos, focus: DocPos, open_popover: bool) {
+        if self.rendered_lines.is_empty() {
+            self.clear_selection();
+            return;
+        }
+        let max_line = self.rendered_lines.len().saturating_sub(1);
+        let a = DocPos {
+            line: anchor.line.min(max_line),
+            col: anchor.col,
+        };
+        let f = DocPos {
+            line: focus.line.min(max_line),
+            col: focus.col,
+        };
+        if a == f {
+            self.clear_selection();
+            return;
+        }
+        self.selection = Some(TextSelection {
+            anchor: a,
+            focus: f,
+            dragging: false,
+            popover_open: open_popover,
+            focused_button: SelectionButton::Quote,
+        });
+    }
+
+    pub fn screen_to_doc(&self, col: u16, row: u16) -> Option<DocPos> {
+        if self.content_area.width == 0
+            || self.content_area.height == 0
+            || self.rendered_lines.is_empty()
+        {
+            return None;
+        }
+        let clamped_row = row.clamp(
+            self.content_area.y,
+            self.content_area.bottom().saturating_sub(1),
+        );
+        let clamped_col = col.clamp(
+            self.content_area.x,
+            self.content_area.right().saturating_sub(1),
+        );
+        let rel_row = (clamped_row - self.content_area.y) as usize;
+        let rel_col = (clamped_col - self.content_area.x) as usize;
+        let doc_line = (self.offset + rel_row).min(self.rendered_lines.len().saturating_sub(1));
+        Some(DocPos {
+            line: doc_line,
+            col: rel_col,
+        })
+    }
+
+    pub fn begin_selection(&mut self, col: u16, row: u16) -> bool {
+        if !rect_contains_point(self.content_area, col, row) {
+            return false;
+        }
+        let Some(pos) = self.screen_to_doc(col, row) else {
+            return false;
+        };
+        self.popover_rects = SelectionPopoverRects::default();
+        self.selection = Some(TextSelection {
+            anchor: pos,
+            focus: pos,
+            dragging: true,
+            popover_open: false,
+            focused_button: SelectionButton::Quote,
+        });
+        true
+    }
+
+    pub fn update_selection_drag(&mut self, col: u16, row: u16) -> bool {
+        let dragging = self.selection.as_ref().is_some_and(|sel| sel.dragging);
+        if !dragging || self.content_area.height == 0 {
+            return false;
+        }
+        if row <= self.content_area.y && self.offset > 0 {
+            self.scroll_up(1);
+        } else if row >= self.content_area.bottom().saturating_sub(1)
+            && self.offset < self.max_offset()
+        {
+            self.scroll_down(1);
+        }
+        let Some(pos) = self.screen_to_doc(col, row) else {
+            return false;
+        };
+        if let Some(sel) = &mut self.selection {
+            sel.focus = pos;
+            return true;
+        }
+        false
+    }
+
+    pub fn finish_selection(&mut self, col: u16, row: u16) -> bool {
+        let Some(mut sel) = self.selection.take() else {
+            return false;
+        };
+        if sel.dragging {
+            if let Some(pos) = self.screen_to_doc(col, row) {
+                sel.focus = pos;
+            }
+            sel.dragging = false;
+        }
+        if sel.is_empty() {
+            self.popover_rects = SelectionPopoverRects::default();
+            return false;
+        }
+        sel.popover_open = true;
+        self.selection = Some(sel);
+        if self.extract_selection_text().is_none() {
+            self.clear_selection();
+            return false;
+        }
+        true
+    }
+
+    pub fn hit_test_popover(&self, col: u16, row: u16) -> Option<SelectionButton> {
+        if !self.popover_open() {
+            return None;
+        }
+        if rect_contains_point(self.popover_rects.quote, col, row) {
+            return Some(SelectionButton::Quote);
+        }
+        if rect_contains_point(self.popover_rects.copy, col, row) {
+            return Some(SelectionButton::Copy);
+        }
+        None
+    }
+
+    pub fn extract_selection_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_empty() || self.rendered_lines.is_empty() {
+            return None;
+        }
+        let (start, end) = sel.ordered();
+        let last_valid = self.rendered_lines.len().saturating_sub(1);
+        let first_line = start.line.min(last_valid);
+        let last_line = end.line.min(last_valid);
+
+        let mut output = String::new();
+        for line_idx in first_line..=last_line {
+            let rendered = &self.rendered_lines[line_idx];
+            let (min_col, max_col) = selection_line_bounds(
+                rendered, line_idx, first_line, last_line, start.col, end.col,
+            );
+
+            let mut line_text = String::new();
+            for cell in &rendered.cells {
+                let cell_end = cell.col_start + cell.width.max(1);
+                let overlaps = cell_end > min_col && cell.col_start <= max_col;
+                if overlaps {
+                    line_text.push_str(&cell.grapheme);
+                }
+            }
+            let normalized = line_text.replace('\u{00a0}', " ");
+            let trimmed = normalized.trim_end();
+            if line_idx > first_line {
+                if rendered.soft_wrapped {
+                    if !output.is_empty()
+                        && !output.ends_with(char::is_whitespace)
+                        && !trimmed.starts_with(char::is_whitespace)
+                    {
+                        output.push(' ');
+                    }
+                } else {
+                    output.push('\n');
+                }
+            }
+            output.push_str(trimmed);
+        }
+        let final_text = output.trim_matches('\n').trim_end().to_owned();
+        if final_text.trim().is_empty() {
+            None
+        } else {
+            Some(final_text)
+        }
+    }
+
+    pub fn links_in_viewport(&self) -> Vec<(Rect, String)> {
+        self.hit_rects
+            .iter()
+            .filter_map(|hit| match &hit.action {
+                TranscriptHitAction::OpenLink { target } => Some((hit.area, target.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -763,6 +1185,70 @@ impl ScrollState {
     }
 }
 
+fn rect_contains_point(rect: Rect, col: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && col >= rect.x
+        && col < rect.right()
+        && row >= rect.y
+        && row < rect.bottom()
+}
+
+fn selection_line_bounds(
+    rendered: &RenderedLine,
+    line_idx: usize,
+    first_line: usize,
+    last_line: usize,
+    start_col: usize,
+    end_col: usize,
+) -> (usize, usize) {
+    let raw_start = if line_idx == first_line { start_col } else { 0 };
+    let min_col = if line_idx > first_line {
+        raw_start.max(rendered.copy_prefix_cols)
+    } else if first_line != last_line && raw_start < rendered.copy_prefix_cols {
+        rendered.copy_prefix_cols
+    } else {
+        raw_start
+    };
+    let mut max_col = if line_idx == last_line {
+        end_col
+    } else {
+        usize::MAX
+    };
+    if let Some(end_limit) = rendered.copy_end_col {
+        if end_limit > 0 {
+            if line_idx < last_line {
+                max_col = max_col.min(end_limit - 1);
+            } else if first_line != last_line && max_col >= end_limit {
+                max_col = end_limit - 1;
+            }
+        }
+    }
+    (min_col, max_col)
+}
+
+fn build_rendered_line(built: &BuiltLine) -> RenderedLine {
+    let mut cells = Vec::new();
+    let mut col = 0usize;
+    for span in &built.line.spans {
+        for g in span.content.as_ref().graphemes(true) {
+            let w = display_width(g);
+            cells.push(RenderedCell {
+                grapheme: g.to_owned(),
+                col_start: col,
+                width: w,
+            });
+            col += w;
+        }
+    }
+    RenderedLine {
+        cells,
+        soft_wrapped: built.soft_wrapped,
+        copy_prefix_cols: built.copy_prefix_cols,
+        copy_end_col: built.copy_end_col,
+    }
+}
+
 fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }
@@ -790,21 +1276,6 @@ fn truncate_str(text: &str, max_width: usize) -> String {
     out
 }
 
-fn pad_to_width(text: &str, width: usize, alignment: Alignment) -> String {
-    let clipped = truncate_str(text, width);
-    let w = display_width(&clipped);
-    let pad = width.saturating_sub(w);
-    match alignment {
-        Alignment::Right => format!("{}{}", " ".repeat(pad), clipped),
-        Alignment::Center => {
-            let left = pad / 2;
-            let right = pad - left;
-            format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
-        }
-        Alignment::None | Alignment::Left => format!("{}{}", clipped, " ".repeat(pad)),
-    }
-}
-
 fn format_duration(duration_ms: u64) -> String {
     if duration_ms < 1000 {
         format!("{duration_ms}ms")
@@ -814,13 +1285,45 @@ fn format_duration(duration_ms: u64) -> String {
 }
 
 #[derive(Clone, Debug)]
+struct RichSpan {
+    text: String,
+    style: Style,
+    link_target: Option<String>,
+}
+
+impl RichSpan {
+    fn plain(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link_target: None,
+        }
+    }
+
+    fn linked(text: impl Into<String>, style: Style, target: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link_target: Some(target.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct StyledPiece {
     text: String,
     style: Style,
     breakable: bool,
+    link_target: Option<String>,
 }
 
-fn push_piece(pieces: &mut Vec<StyledPiece>, text: String, style: Style, breakable: bool) {
+fn push_piece(
+    pieces: &mut Vec<StyledPiece>,
+    text: String,
+    style: Style,
+    breakable: bool,
+    link_target: Option<String>,
+) {
     if text.is_empty() {
         return;
     }
@@ -828,13 +1331,14 @@ fn push_piece(pieces: &mut Vec<StyledPiece>, text: String, style: Style, breakab
         text,
         style,
         breakable,
+        link_target,
     });
 }
 
-fn tokenize_for_wrap(spans: &[Span<'static>]) -> Vec<StyledPiece> {
+fn tokenize_rich_for_wrap(spans: &[RichSpan]) -> Vec<StyledPiece> {
     let mut pieces = Vec::new();
     for span in spans {
-        let content = span.content.as_ref();
+        let content = span.text.as_str();
         let style = span.style;
         let mut current = String::new();
         let mut in_space: Option<bool> = None;
@@ -842,7 +1346,13 @@ fn tokenize_for_wrap(spans: &[Span<'static>]) -> Vec<StyledPiece> {
             let is_space = g.chars().all(|c| c == ' ' || c == '\t');
             if let Some(prev_space) = in_space {
                 if prev_space != is_space {
-                    push_piece(&mut pieces, std::mem::take(&mut current), style, prev_space);
+                    push_piece(
+                        &mut pieces,
+                        std::mem::take(&mut current),
+                        style,
+                        prev_space,
+                        span.link_target.clone(),
+                    );
                 }
             }
             if is_space && g == "\t" {
@@ -853,7 +1363,13 @@ fn tokenize_for_wrap(spans: &[Span<'static>]) -> Vec<StyledPiece> {
             in_space = Some(is_space);
         }
         if let Some(prev_space) = in_space {
-            push_piece(&mut pieces, current, style, prev_space);
+            push_piece(
+                &mut pieces,
+                current,
+                style,
+                prev_space,
+                span.link_target.clone(),
+            );
         }
     }
     pieces
@@ -872,26 +1388,71 @@ fn push_span_merged(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
     spans.push(Span::styled(text.to_owned(), style));
 }
 
-fn wrap_spans_with_prefix(
-    spans: &[Span<'static>],
+fn record_link_span(
+    links: &mut Vec<LineLinkSpan>,
+    col_start: usize,
+    col_width: usize,
+    target: &str,
+) {
+    if col_width == 0 || target.is_empty() {
+        return;
+    }
+    if let Some(last) = links.last_mut() {
+        if last.target == target && last.col_start + last.col_width == col_start {
+            last.col_width += col_width;
+            return;
+        }
+    }
+    links.push(LineLinkSpan {
+        col_start,
+        col_width,
+        target: target.to_owned(),
+    });
+}
+
+fn wrap_rich_spans_with_prefix(
+    spans: &[RichSpan],
     width: usize,
     first_prefix: &[Span<'static>],
     cont_prefix: &[Span<'static>],
-) -> Vec<Line<'static>> {
+) -> Vec<BuiltLine> {
     let max_width = width.max(MIN_RENDER_WIDTH);
     let first_prefix_w: usize = first_prefix.iter().map(Span::width).sum();
     let cont_prefix_w: usize = cont_prefix.iter().map(Span::width).sum();
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut lines: Vec<BuiltLine> = Vec::new();
     let mut current: Vec<Span<'static>> = first_prefix.to_vec();
+    let mut current_links: Vec<LineLinkSpan> = Vec::new();
     let mut current_w = first_prefix_w;
     let mut at_line_content_start = true;
 
-    let pieces = tokenize_for_wrap(spans);
+    let pieces = tokenize_rich_for_wrap(spans);
     if pieces.is_empty() {
-        lines.push(Line::from(current));
+        lines.push(BuiltLine {
+            line: Line::from(current),
+            soft_wrapped: false,
+            copy_prefix_cols: first_prefix_w,
+            copy_end_col: None,
+            links: Vec::new(),
+        });
         return lines;
     }
+
+    let push_finished =
+        |lines: &mut Vec<BuiltLine>, current: Vec<Span<'static>>, links: Vec<LineLinkSpan>| {
+            let is_cont = !lines.is_empty();
+            lines.push(BuiltLine {
+                line: Line::from(current),
+                soft_wrapped: is_cont,
+                copy_prefix_cols: if is_cont {
+                    cont_prefix_w
+                } else {
+                    first_prefix_w
+                },
+                copy_end_col: None,
+                links,
+            });
+        };
 
     for piece in pieces {
         let piece_w = display_width(&piece.text);
@@ -900,22 +1461,34 @@ fn wrap_spans_with_prefix(
         }
         let avail_for_cont = max_width.saturating_sub(cont_prefix_w).max(1);
         if current_w + piece_w <= max_width {
+            if let Some(target) = piece.link_target.as_deref() {
+                record_link_span(&mut current_links, current_w, piece_w, target);
+            }
             push_span_merged(&mut current, &piece.text, piece.style);
             current_w += piece_w;
             at_line_content_start = false;
             continue;
         }
         if piece.breakable {
-            lines.push(Line::from(current));
-            current = cont_prefix.to_vec();
+            push_finished(
+                &mut lines,
+                std::mem::replace(&mut current, cont_prefix.to_vec()),
+                std::mem::take(&mut current_links),
+            );
             current_w = cont_prefix_w;
             at_line_content_start = true;
             continue;
         }
         if !at_line_content_start && piece_w <= avail_for_cont {
-            lines.push(Line::from(current));
-            current = cont_prefix.to_vec();
+            push_finished(
+                &mut lines,
+                std::mem::replace(&mut current, cont_prefix.to_vec()),
+                std::mem::take(&mut current_links),
+            );
             current_w = cont_prefix_w;
+            if let Some(target) = piece.link_target.as_deref() {
+                record_link_span(&mut current_links, current_w, piece_w, target);
+            }
             push_span_merged(&mut current, &piece.text, piece.style);
             current_w += piece_w;
             at_line_content_start = false;
@@ -924,9 +1497,15 @@ fn wrap_spans_with_prefix(
         for g in piece.text.graphemes(true) {
             let gw = display_width(g);
             if !at_line_content_start && current_w + gw > max_width {
-                lines.push(Line::from(current));
-                current = cont_prefix.to_vec();
+                push_finished(
+                    &mut lines,
+                    std::mem::replace(&mut current, cont_prefix.to_vec()),
+                    std::mem::take(&mut current_links),
+                );
                 current_w = cont_prefix_w;
+            }
+            if let Some(target) = piece.link_target.as_deref() {
+                record_link_span(&mut current_links, current_w, gw, target);
             }
             push_span_merged(&mut current, g, piece.style);
             current_w += gw;
@@ -935,55 +1514,1097 @@ fn wrap_spans_with_prefix(
     }
 
     if !current.is_empty() || lines.is_empty() {
-        lines.push(Line::from(current));
+        push_finished(&mut lines, current, current_links);
     }
     lines
 }
 
-fn wrap_preserving_indent(
+fn trim_trailing_link_punct(raw: &str) -> &str {
+    let mut end = raw.len();
+    loop {
+        let slice = &raw[..end];
+        let Some(last_ch) = slice.chars().next_back() else {
+            break;
+        };
+        let should_strip = match last_ch {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' => slice.matches(')').count() > slice.matches('(').count(),
+            ']' => slice.matches(']').count() > slice.matches('[').count(),
+            '}' => slice.matches('}').count() > slice.matches('{').count(),
+            _ => false,
+        };
+        if should_strip {
+            end -= last_ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &raw[..end]
+}
+
+fn strip_location_suffix_for_path_check(candidate: &str) -> &str {
+    let without_hash = if let Some((base, frag)) = candidate.rsplit_once("#L") {
+        let rest = frag
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == 'C' || c == '-' || c == 'L');
+        if rest.is_empty() && !frag.is_empty() && frag.starts_with(|c: char| c.is_ascii_digit()) {
+            base
+        } else {
+            candidate
+        }
+    } else {
+        candidate
+    };
+    let mut cur = without_hash;
+    for _ in 0..2 {
+        if let Some((head, tail)) = cur.rsplit_once(':') {
+            if !head.is_empty()
+                && !tail.is_empty()
+                && tail.chars().all(|c| c.is_ascii_digit())
+                && !(head.len() == 1 && head.chars().all(|c| c.is_ascii_alphabetic()))
+            {
+                cur = head;
+                continue;
+            }
+        }
+        break;
+    }
+    cur
+}
+
+fn is_known_root_filename(name: &str) -> bool {
+    matches!(
+        name,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "README.md"
+            | "Makefile"
+            | "Dockerfile"
+            | "package.json"
+            | "tsconfig.json"
+            | ".gitignore"
+            | "AGENTS.md"
+            | "CLAUDE.md"
+            | "TEAM.md"
+            | "REVIEW.md"
+    )
+}
+
+fn is_likely_file_path_token(candidate: &str) -> bool {
+    if candidate.is_empty()
+        || candidate.len() > 260
+        || candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+        || candidate.starts_with("mailto:")
+        || candidate.starts_with("//")
+        || candidate.starts_with("\\\\")
+    {
+        return false;
+    }
+    if candidate
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return false;
+    }
+    let base = strip_location_suffix_for_path_check(candidate);
+    if base.is_empty() {
+        return false;
+    }
+    if is_known_root_filename(base) {
+        return true;
+    }
+    let has_sep = base.contains('/') || base.contains('\\');
+    if !has_sep {
+        return false;
+    }
+    let trimmed = base.trim_end_matches(['/', '\\']);
+    let file_name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    if file_name.is_empty() || file_name == "." || file_name == ".." {
+        return false;
+    }
+    if is_known_root_filename(file_name) {
+        return true;
+    }
+    let Some((stem, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || ext.is_empty() || ext.len() > 10 {
+        return false;
+    }
+    ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && ext.chars().any(|c| c.is_ascii_alphabetic())
+        && stem
+            .chars()
+            .any(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_likely_url_token(candidate: &str) -> bool {
+    if let Some(rest) = candidate
+        .strip_prefix("https://")
+        .or_else(|| candidate.strip_prefix("http://"))
+    {
+        !rest.is_empty() && rest.chars().next().is_some_and(|c| !c.is_whitespace())
+    } else {
+        false
+    }
+}
+
+fn is_token_boundary_char(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\'' | '`' | '{' | '}'
+        )
+}
+
+fn split_autolinks(text: &str, base_style: Style, theme: &UiPalette) -> Vec<RichSpan> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let link_style = base_style.fg(theme.info).add_modifier(Modifier::UNDERLINED);
+    let mut out = Vec::new();
+    let mut plain_start = 0usize;
+    let mut idx = 0usize;
+    let bytes = text.as_bytes();
+
+    while idx < bytes.len() {
+        let rest = &text[idx..];
+        let ch = match rest.chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        if is_token_boundary_char(ch) {
+            idx += ch.len_utf8();
+            continue;
+        }
+        let token_start = idx;
+        let mut token_end = idx;
+        for (off, c) in rest.char_indices() {
+            if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`') {
+                break;
+            }
+            token_end = token_start + off + c.len_utf8();
+        }
+        let raw_token = &text[token_start..token_end];
+        let leading_trim_bytes: usize = raw_token
+            .chars()
+            .take_while(|c| matches!(c, '(' | '[' | '{'))
+            .map(char::len_utf8)
+            .sum();
+        let inner_start = token_start + leading_trim_bytes;
+        let candidate = trim_trailing_link_punct(&text[inner_start..token_end]);
+        let candidate_end = inner_start + candidate.len();
+
+        let is_link = is_likely_url_token(candidate) || is_likely_file_path_token(candidate);
+        if is_link && !candidate.is_empty() {
+            if inner_start > plain_start {
+                out.push(RichSpan::plain(&text[plain_start..inner_start], base_style));
+            }
+            out.push(RichSpan::linked(candidate, link_style, candidate));
+            plain_start = candidate_end;
+        }
+        idx = token_end;
+    }
+
+    if plain_start < text.len() {
+        out.push(RichSpan::plain(&text[plain_start..], base_style));
+    }
+    out
+}
+
+fn is_code_keyword(word: &str, lang: &str) -> bool {
+    match lang {
+        "rs" | "rust" => matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        ),
+        "py" | "python" => matches!(
+            word,
+            "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "nonlocal"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        "js" | "jsx" | "ts" | "tsx" | "javascript" | "typescript" => matches!(
+            word,
+            "async"
+                | "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "finally"
+                | "for"
+                | "from"
+                | "function"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "new"
+                | "of"
+                | "private"
+                | "protected"
+                | "public"
+                | "readonly"
+                | "return"
+                | "static"
+                | "switch"
+                | "throw"
+                | "try"
+                | "type"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "yield"
+        ),
+        "sh" | "bash" | "zsh" | "ps1" | "powershell" | "pwsh" => matches!(
+            word,
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "for"
+                | "do"
+                | "done"
+                | "while"
+                | "case"
+                | "esac"
+                | "in"
+                | "function"
+                | "local"
+                | "export"
+                | "return"
+                | "param"
+                | "foreach"
+                | "try"
+                | "catch"
+                | "finally"
+                | "throw"
+        ),
+        "sql" => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "INSERT"
+                | "INTO"
+                | "VALUES"
+                | "UPDATE"
+                | "SET"
+                | "DELETE"
+                | "CREATE"
+                | "TABLE"
+                | "INDEX"
+                | "JOIN"
+                | "LEFT"
+                | "RIGHT"
+                | "INNER"
+                | "ON"
+                | "GROUP"
+                | "ORDER"
+                | "BY"
+                | "LIMIT"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "AS"
+        ),
+        "go" => matches!(
+            word,
+            "break"
+                | "case"
+                | "chan"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "for"
+                | "func"
+                | "go"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
+        ),
+        _ => matches!(
+            word,
+            "fn" | "let"
+                | "const"
+                | "var"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "return"
+                | "struct"
+                | "class"
+                | "enum"
+                | "pub"
+                | "def"
+                | "function"
+                | "import"
+                | "export"
+                | "async"
+                | "await"
+                | "match"
+                | "use"
+                | "mod"
+        ),
+    }
+}
+
+fn is_code_constant(word: &str) -> bool {
+    matches!(
+        word,
+        "true"
+            | "false"
+            | "True"
+            | "False"
+            | "null"
+            | "nil"
+            | "None"
+            | "Some"
+            | "Ok"
+            | "Err"
+            | "self"
+            | "Self"
+            | "this"
+            | "undefined"
+            | "NULL"
+    )
+}
+
+fn is_code_type(word: &str, lang: &str) -> bool {
+    if matches!(
+        word,
+        "bool"
+            | "char"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "String"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Path"
+            | "PathBuf"
+            | "HashMap"
+            | "BTreeMap"
+            | "Arc"
+            | "Box"
+            | "number"
+            | "string"
+            | "boolean"
+            | "any"
+            | "unknown"
+            | "never"
+            | "int"
+            | "float"
+            | "dict"
+            | "list"
+    ) {
+        return true;
+    }
+    if matches!(lang, "sql" | "sh" | "bash" | "zsh" | "json") {
+        return false;
+    }
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_uppercase() && chars.any(|c| c.is_ascii_lowercase())
+}
+
+fn highlight_code_line(line: &str, lang: &str, theme: &UiPalette) -> Vec<Span<'static>> {
+    let norm_lang = lang.trim().to_ascii_lowercase();
+    let base = Style::default().fg(theme.fg).bg(theme.code_bg);
+    let comment_style = Style::default()
+        .fg(theme.subtle)
+        .bg(theme.code_bg)
+        .add_modifier(Modifier::ITALIC);
+    let string_style = Style::default().fg(theme.success).bg(theme.code_bg);
+    let keyword_style = Style::default()
+        .fg(theme.accent)
+        .bg(theme.code_bg)
+        .add_modifier(Modifier::BOLD);
+    let type_style = Style::default().fg(theme.info).bg(theme.code_bg);
+    let number_style = Style::default().fg(theme.warning).bg(theme.code_bg);
+    let macro_style = Style::default().fg(theme.user_accent).bg(theme.code_bg);
+
+    let hash_comments = matches!(
+        norm_lang.as_str(),
+        "py" | "python"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "ps1"
+            | "powershell"
+            | "pwsh"
+            | "toml"
+            | "yaml"
+            | "yml"
+    );
+    let slash_comments = matches!(
+        norm_lang.as_str(),
+        "" | "rs"
+            | "rust"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "javascript"
+            | "typescript"
+            | "go"
+            | "c"
+            | "cpp"
+            | "h"
+            | "java"
+            | "jsonc"
+    );
+    let sql_comments = norm_lang == "sql";
+    let is_rust = matches!(norm_lang.as_str(), "rs" | "rust");
+    let allow_backtick_str = matches!(
+        norm_lang.as_str(),
+        "js" | "jsx" | "ts" | "tsx" | "javascript" | "typescript" | "go" | "sh" | "bash"
+    );
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let rest = &line[i..];
+        if slash_comments && rest.starts_with("//") {
+            push_span_merged(&mut spans, rest, comment_style);
+            break;
+        }
+        if hash_comments && rest.starts_with('#') {
+            push_span_merged(&mut spans, rest, comment_style);
+            break;
+        }
+        if sql_comments && rest.starts_with("--") {
+            push_span_merged(&mut spans, rest, comment_style);
+            break;
+        }
+        if is_rust && rest.starts_with("#[") {
+            let mut end = i + 2;
+            let mut depth = 1usize;
+            while end < bytes.len() && depth > 0 {
+                match bytes[end] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            push_span_merged(&mut spans, &line[i..end], macro_style);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'"' || (allow_backtick_str && bytes[i] == b'`') {
+            let quote = bytes[i];
+            let mut end = i + 1;
+            let mut escaped = false;
+            while end < bytes.len() {
+                let b = bytes[end];
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == quote {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            let style = if norm_lang == "json" && line[end..].trim_start().starts_with(':') {
+                type_style
+            } else {
+                string_style
+            };
+            push_span_merged(&mut spans, &line[i..end], style);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if is_rust {
+                let tail = &line[i + 1..];
+                let mut chars = tail.chars();
+                let is_char_lit = match chars.next() {
+                    Some('\\') => chars.nth(1) == Some('\'') || tail.contains('\''),
+                    Some(_) => chars.next() == Some('\''),
+                    None => false,
+                };
+                if !is_char_lit {
+                    let mut end = i + 1;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    push_span_merged(&mut spans, &line[i..end], macro_style);
+                    i = end;
+                    continue;
+                }
+            }
+            let mut end = i + 1;
+            let mut escaped = false;
+            while end < bytes.len() {
+                let b = bytes[end];
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'\'' {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            push_span_merged(&mut spans, &line[i..end], string_style);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'@' && matches!(norm_lang.as_str(), "py" | "python" | "ts" | "tsx") {
+            let mut end = i + 1;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            push_span_merged(&mut spans, &line[i..end], macro_style);
+            i = end;
+            continue;
+        }
+        if bytes[i].is_ascii_digit() {
+            let mut end = i + 1;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            push_span_merged(&mut spans, &line[i..end], number_style);
+            i = end;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let word = &line[i..end];
+            if is_rust && end < bytes.len() && bytes[end] == b'!' {
+                push_span_merged(&mut spans, &line[i..end + 1], macro_style);
+                i = end + 1;
+                continue;
+            }
+            let style = if is_code_keyword(word, &norm_lang) {
+                keyword_style
+            } else if is_code_constant(word) || is_code_type(word, &norm_lang) {
+                type_style
+            } else {
+                base
+            };
+            push_span_merged(&mut spans, word, style);
+            i = end;
+            continue;
+        }
+        let ch = match rest.chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let next = i + ch.len_utf8();
+        push_span_merged(&mut spans, &line[i..next], base);
+        i = next;
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+fn wrap_styled_code_line(
+    spans: &[Span<'static>],
+    width: usize,
+    prefix: &[Span<'static>],
+    pad_bg: Option<Color>,
+) -> Vec<BuiltLine> {
+    let max_width = width.max(MIN_RENDER_WIDTH);
+    let prefix_w: usize = prefix.iter().map(Span::width).sum();
+    let content_budget = max_width.saturating_sub(prefix_w).max(1);
+
+    let mut out: Vec<BuiltLine> = Vec::new();
+    let mut current: Vec<Span<'static>> = prefix.to_vec();
+    let mut used = 0usize;
+
+    let finalize = |out: &mut Vec<BuiltLine>, mut line_spans: Vec<Span<'static>>, used_w: usize| {
+        if let Some(bg) = pad_bg {
+            let pad = content_budget.saturating_sub(used_w);
+            if pad > 0 {
+                line_spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+            }
+        }
+        let is_cont = !out.is_empty();
+        out.push(BuiltLine {
+            line: Line::from(line_spans),
+            soft_wrapped: is_cont,
+            copy_prefix_cols: prefix_w,
+            copy_end_col: None,
+            links: Vec::new(),
+        });
+    };
+
+    for span in spans {
+        let expanded = span.content.replace('\t', "    ");
+        for g in expanded.graphemes(true) {
+            let gw = display_width(g);
+            if used > 0 && used + gw > content_budget {
+                finalize(
+                    &mut out,
+                    std::mem::replace(&mut current, prefix.to_vec()),
+                    used,
+                );
+                used = 0;
+            }
+            push_span_merged(&mut current, g, span.style);
+            used += gw;
+        }
+    }
+
+    finalize(&mut out, current, used);
+    out
+}
+
+fn wrap_preserving_indent_built(
     text: &str,
     width: usize,
     style: Style,
     prefix: &[Span<'static>],
     pad_bg: Option<Color>,
-) -> Vec<Line<'static>> {
-    let max_width = width.max(MIN_RENDER_WIDTH);
-    let prefix_w: usize = prefix.iter().map(Span::width).sum();
-    let content_budget = max_width.saturating_sub(prefix_w).max(1);
-    let expanded = text.replace('\t', "    ");
+) -> Vec<BuiltLine> {
+    wrap_styled_code_line(
+        &[Span::styled(text.to_owned(), style)],
+        width,
+        prefix,
+        pad_bg,
+    )
+}
+
+fn rich_spans_width(spans: &[RichSpan]) -> usize {
+    spans.iter().map(|s| display_width(&s.text)).sum()
+}
+
+fn trim_rich_spans(spans: Vec<RichSpan>) -> Vec<RichSpan> {
+    let mut trimmed = spans;
+    while let Some(first) = trimmed.first_mut() {
+        let stripped = first.text.trim_start();
+        if stripped.is_empty() {
+            trimmed.remove(0);
+        } else {
+            if stripped.len() != first.text.len() {
+                first.text = stripped.to_owned();
+            }
+            break;
+        }
+    }
+    while let Some(last) = trimmed.last_mut() {
+        let stripped = last.text.trim_end();
+        if stripped.is_empty() {
+            trimmed.pop();
+        } else {
+            if stripped.len() != last.text.len() {
+                last.text = stripped.to_owned();
+            }
+            break;
+        }
+    }
+    trimmed
+}
+
+fn merge_cell_style(span_style: Style, base_style: Style) -> Style {
+    let mut style = base_style;
+    if let Some(fg) = span_style.fg {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = span_style.bg {
+        style = style.bg(bg);
+    }
+    style = style.add_modifier(span_style.add_modifier);
+    style
+}
+
+fn fit_rich_spans_in_cell(
+    cell: &[RichSpan],
+    width: usize,
+    alignment: Alignment,
+    base_style: Style,
+    col_offset: usize,
+) -> (Vec<Span<'static>>, Vec<LineLinkSpan>) {
+    if width == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let full_w = rich_spans_width(cell);
+    let mut clipped: Vec<(String, Style, Option<String>)> = Vec::new();
+    let used_w = if full_w <= width {
+        for sp in cell {
+            if !sp.text.is_empty() {
+                clipped.push((
+                    sp.text.clone(),
+                    merge_cell_style(sp.style, base_style),
+                    sp.link_target.clone(),
+                ));
+            }
+        }
+        full_w
+    } else {
+        let ellipsis_w = display_width("…");
+        let budget = width.saturating_sub(ellipsis_w);
+        let mut used = 0usize;
+        'outer: for sp in cell {
+            let mut chunk = String::new();
+            for g in sp.text.graphemes(true) {
+                let gw = display_width(g);
+                if used + gw > budget {
+                    if !chunk.is_empty() {
+                        clipped.push((
+                            chunk,
+                            merge_cell_style(sp.style, base_style),
+                            sp.link_target.clone(),
+                        ));
+                    }
+                    break 'outer;
+                }
+                chunk.push_str(g);
+                used += gw;
+            }
+            if !chunk.is_empty() {
+                clipped.push((
+                    chunk,
+                    merge_cell_style(sp.style, base_style),
+                    sp.link_target.clone(),
+                ));
+            }
+        }
+        clipped.push(("…".to_owned(), base_style, None));
+        used + ellipsis_w
+    };
+
+    let pad = width.saturating_sub(used_w);
+    let (left_pad, right_pad) = match alignment {
+        Alignment::Right => (pad, 0),
+        Alignment::Center => (pad / 2, pad - pad / 2),
+        Alignment::None | Alignment::Left => (0, pad),
+    };
+
+    let mut out_spans = Vec::new();
+    let mut out_links = Vec::new();
+    let mut cursor = col_offset;
+    if left_pad > 0 {
+        out_spans.push(Span::styled(" ".repeat(left_pad), base_style));
+        cursor += left_pad;
+    }
+    for (text, style, link) in clipped {
+        let w = display_width(&text);
+        if let Some(target) = link.as_deref() {
+            record_link_span(&mut out_links, cursor, w, target);
+        }
+        push_span_merged(&mut out_spans, &text, style);
+        cursor += w;
+    }
+    if right_pad > 0 {
+        out_spans.push(Span::styled(" ".repeat(right_pad), base_style));
+    }
+    (out_spans, out_links)
+}
+
+fn render_rich_table(
+    header: &[Vec<RichSpan>],
+    rows: &[Vec<Vec<RichSpan>>],
+    alignments: &[Alignment],
+    max_width: usize,
+    theme: &UiPalette,
+) -> Vec<BuiltLine> {
+    let col_count = header
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if col_count == 0 {
+        return Vec::new();
+    }
+
+    let mut widths = vec![1usize; col_count];
+    for (i, cell) in header.iter().enumerate() {
+        widths[i] = widths[i].max(rich_spans_width(cell));
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(rich_spans_width(cell));
+        }
+    }
+
+    let separators_w = col_count.saturating_sub(1) * 3 + 2;
+    let max_cells_w = max_width.saturating_sub(separators_w).max(col_count);
+    let total_cells_w: usize = widths.iter().sum();
+    if total_cells_w > max_cells_w {
+        let mut remaining = total_cells_w - max_cells_w;
+        while remaining > 0 {
+            if let Some((idx, &max_w)) = widths.iter().enumerate().max_by_key(|&(_, w)| *w) {
+                if max_w <= 3 {
+                    break;
+                }
+                widths[idx] -= 1;
+                remaining -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let border_style = Style::default().fg(theme.border);
+    let render_row = |cells: &[Vec<RichSpan>], row_style: Style| -> BuiltLine {
+        let mut spans = vec![Span::styled(" ", row_style)];
+        let mut links = Vec::new();
+        let mut col = 1usize;
+        for (idx, &col_w) in widths.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::styled(" │ ", border_style));
+                col += 3;
+            }
+            let cell = cells.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+            let align = alignments.get(idx).copied().unwrap_or(Alignment::Left);
+            let (cell_spans, cell_links) =
+                fit_rich_spans_in_cell(cell, col_w, align, row_style, col);
+            spans.extend(cell_spans);
+            links.extend(cell_links);
+            col += col_w;
+        }
+        BuiltLine {
+            line: Line::from(spans),
+            soft_wrapped: false,
+            copy_prefix_cols: 1,
+            copy_end_col: None,
+            links,
+        }
+    };
 
     let mut out = Vec::new();
-    let mut line_buf = String::new();
-    let mut used = 0usize;
+    if !header.is_empty() {
+        out.push(render_row(
+            header,
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let mut sep = String::from("─");
+        for (idx, &col_w) in widths.iter().enumerate() {
+            if idx > 0 {
+                sep.push_str("─┼─");
+            }
+            sep.push_str(&"─".repeat(col_w));
+        }
+        out.push(BuiltLine::plain(Line::from(Span::styled(
+            sep,
+            border_style,
+        ))));
+    }
+    for row in rows {
+        out.push(render_row(row, Style::default().fg(theme.fg)));
+    }
+    out
+}
 
-    for g in expanded.graphemes(true) {
-        let gw = display_width(g);
-        if used > 0 && used + gw > content_budget {
-            let mut spans = prefix.to_vec();
-            spans.push(Span::styled(std::mem::take(&mut line_buf), style));
-            if let Some(bg) = pad_bg {
-                let pad = content_budget.saturating_sub(used);
-                if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+fn parse_inline_markdown_spans(text: &str, base_style: Style, theme: &UiPalette) -> Vec<RichSpan> {
+    let options = Options::ENABLE_STRIKETHROUGH;
+    let parser = Parser::new_ext(text, options);
+    let mut style_stack = vec![base_style];
+    let mut link_stack: Vec<String> = Vec::new();
+    let mut out: Vec<RichSpan> = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Strong) => {
+                let next = style_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(base_style)
+                    .add_modifier(Modifier::BOLD);
+                style_stack.push(next);
+            }
+            Event::End(TagEnd::Strong) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
                 }
             }
-            out.push(Line::from(spans));
-            used = 0;
+            Event::Start(Tag::Emphasis) => {
+                let next = style_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(base_style)
+                    .add_modifier(Modifier::ITALIC);
+                style_stack.push(next);
+            }
+            Event::End(TagEnd::Emphasis) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let next = style_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(base_style)
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::CROSSED_OUT);
+                style_stack.push(next);
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                link_stack.push(dest_url.to_string());
+                let next = style_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(base_style)
+                    .fg(theme.info)
+                    .add_modifier(Modifier::UNDERLINED);
+                style_stack.push(next);
+            }
+            Event::End(TagEnd::Link) => {
+                if style_stack.len() > 1 {
+                    style_stack.pop();
+                }
+                link_stack.pop();
+            }
+            Event::Code(code) => {
+                let style = Style::default().fg(theme.warning).bg(theme.code_bg);
+                let link = link_stack.last().cloned().or_else(|| {
+                    let trimmed = code.trim();
+                    if is_likely_url_token(trimmed) || is_likely_file_path_token(trimmed) {
+                        Some(trimmed.to_owned())
+                    } else {
+                        None
+                    }
+                });
+                out.push(RichSpan {
+                    text: code.to_string(),
+                    style,
+                    link_target: link,
+                });
+            }
+            Event::Text(segment) => {
+                let style = style_stack.last().copied().unwrap_or(base_style);
+                if let Some(target) = link_stack.last() {
+                    out.push(RichSpan::linked(segment.to_string(), style, target.clone()));
+                } else {
+                    out.extend(split_autolinks(&segment, style, theme));
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                let style = style_stack.last().copied().unwrap_or(base_style);
+                out.push(RichSpan::plain(" ", style));
+            }
+            _ => {}
         }
-        line_buf.push_str(g);
-        used += gw;
     }
-
-    let mut spans = prefix.to_vec();
-    spans.push(Span::styled(line_buf, style));
-    if let Some(bg) = pad_bg {
-        let pad = content_budget.saturating_sub(used);
-        if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
-        }
-    }
-    out.push(Line::from(spans));
-    out
+    trim_rich_spans(out)
 }
 
 #[derive(Clone, Debug)]
@@ -995,10 +2616,10 @@ struct ListContext {
 #[derive(Default)]
 struct TableBuffer {
     alignments: Vec<Alignment>,
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
-    current_cell: String,
+    header: Vec<Vec<RichSpan>>,
+    rows: Vec<Vec<Vec<RichSpan>>>,
+    current_row: Vec<Vec<RichSpan>>,
+    current_cell: Vec<RichSpan>,
     in_head: bool,
     in_cell: bool,
 }
@@ -1006,8 +2627,8 @@ struct TableBuffer {
 struct MarkdownRenderer<'a> {
     width: usize,
     theme: &'a UiPalette,
-    lines: Vec<Line<'static>>,
-    pending_spans: Vec<Span<'static>>,
+    lines: Vec<BuiltLine>,
+    pending_spans: Vec<RichSpan>,
     style_stack: Vec<Style>,
     quote_depth: usize,
     list_stack: Vec<ListContext>,
@@ -1088,15 +2709,21 @@ impl<'a> MarkdownRenderer<'a> {
 
     fn ensure_blank_line(&mut self) {
         if let Some(last) = self.lines.last() {
-            let is_empty = last.spans.iter().all(|s| s.content.trim().is_empty());
+            let is_empty = last.line.spans.iter().all(|s| s.content.trim().is_empty());
             if !is_empty {
                 if self.quote_depth > 0 {
                     let bars: Vec<Span<'static>> = (0..self.quote_depth)
                         .map(|_| Span::styled("│ ", Style::default().fg(self.theme.accent)))
                         .collect();
-                    self.lines.push(Line::from(bars));
+                    self.lines.push(BuiltLine {
+                        line: Line::from(bars),
+                        soft_wrapped: false,
+                        copy_prefix_cols: self.quote_depth * 2,
+                        copy_end_col: None,
+                        links: Vec::new(),
+                    });
                 } else {
-                    self.lines.push(Line::default());
+                    self.lines.push(BuiltLine::plain(Line::default()));
                 }
             }
         }
@@ -1108,7 +2735,7 @@ impl<'a> MarkdownRenderer<'a> {
         }
         let spans = std::mem::take(&mut self.pending_spans);
         let (first_prefix, cont_prefix) = self.build_prefixes();
-        let wrapped = wrap_spans_with_prefix(&spans, self.width, &first_prefix, &cont_prefix);
+        let wrapped = wrap_rich_spans_with_prefix(&spans, self.width, &first_prefix, &cont_prefix);
         self.lines.extend(wrapped);
     }
 
@@ -1140,7 +2767,7 @@ impl<'a> MarkdownRenderer<'a> {
             format!("{header_prefix}{}", "─".repeat(header_fill)),
             Style::default().fg(self.theme.muted).bg(self.theme.code_bg),
         ));
-        self.lines.push(Line::from(header_spans));
+        self.lines.push(BuiltLine::plain(Line::from(header_spans)));
 
         let mut code_line_prefix = quote_prefix.clone();
         code_line_prefix.push(Span::styled(
@@ -1152,7 +2779,7 @@ impl<'a> MarkdownRenderer<'a> {
         let code_style = Style::default().fg(self.theme.fg).bg(self.theme.code_bg);
 
         if trimmed_code.is_empty() {
-            let wrapped = wrap_preserving_indent(
+            let wrapped = wrap_preserving_indent_built(
                 "",
                 self.width,
                 code_style,
@@ -1163,10 +2790,10 @@ impl<'a> MarkdownRenderer<'a> {
         } else {
             for raw_line in trimmed_code.split('\n') {
                 let clean_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-                let wrapped = wrap_preserving_indent(
-                    clean_line,
+                let highlighted = highlight_code_line(clean_line, &lang, self.theme);
+                let wrapped = wrap_styled_code_line(
+                    &highlighted,
                     self.width,
-                    code_style,
                     &code_line_prefix,
                     Some(self.theme.code_bg),
                 );
@@ -1181,88 +2808,19 @@ impl<'a> MarkdownRenderer<'a> {
                 .fg(self.theme.border)
                 .bg(self.theme.code_bg),
         ));
-        self.lines.push(Line::from(footer_spans));
+        self.lines.push(BuiltLine::plain(Line::from(footer_spans)));
     }
 
     fn flush_table(&mut self) {
         let table = std::mem::take(&mut self.table);
-        let col_count = table
-            .header
-            .len()
-            .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
-        if col_count == 0 {
-            return;
-        }
-        let mut widths = vec![1usize; col_count];
-        for (i, cell) in table.header.iter().enumerate() {
-            widths[i] = widths[i].max(display_width(cell));
-        }
-        for row in &table.rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(display_width(cell));
-            }
-        }
-
-        let separators_w = col_count.saturating_sub(1) * 3 + 2;
-        let max_cells_w = self.width.saturating_sub(separators_w).max(col_count);
-        let total_cells_w: usize = widths.iter().sum();
-        if total_cells_w > max_cells_w {
-            let mut remaining = total_cells_w - max_cells_w;
-            while remaining > 0 {
-                if let Some((idx, &max_w)) = widths.iter().enumerate().max_by_key(|&(_, w)| *w) {
-                    if max_w <= 3 {
-                        break;
-                    }
-                    widths[idx] -= 1;
-                    remaining -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        let render_row = |cells: &[String], style: Style, border_style: Style| -> Line<'static> {
-            let mut spans = vec![Span::styled(" ", style)];
-            for (idx, &col_w) in widths.iter().enumerate() {
-                if idx > 0 {
-                    spans.push(Span::styled(" │ ", border_style));
-                }
-                let text = cells.get(idx).map(String::as_str).unwrap_or("");
-                let align = table
-                    .alignments
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(Alignment::Left);
-                spans.push(Span::styled(pad_to_width(text, col_w, align), style));
-            }
-            Line::from(spans)
-        };
-
-        let border_style = Style::default().fg(self.theme.border);
-        if !table.header.is_empty() {
-            self.lines.push(render_row(
-                &table.header,
-                Style::default()
-                    .fg(self.theme.accent_soft)
-                    .add_modifier(Modifier::BOLD),
-                border_style,
-            ));
-            let mut sep = String::from("─");
-            for (idx, &col_w) in widths.iter().enumerate() {
-                if idx > 0 {
-                    sep.push_str("─┼─");
-                }
-                sep.push_str(&"─".repeat(col_w));
-            }
-            self.lines.push(Line::from(Span::styled(sep, border_style)));
-        }
-        for row in &table.rows {
-            self.lines.push(render_row(
-                row,
-                Style::default().fg(self.theme.fg),
-                border_style,
-            ));
-        }
+        let built = render_rich_table(
+            &table.header,
+            &table.rows,
+            &table.alignments,
+            self.width,
+            self.theme,
+        );
+        self.lines.extend(built);
     }
 
     fn process(&mut self, event: Event<'_>) {
@@ -1301,17 +2859,86 @@ impl<'a> MarkdownRenderer<'a> {
                 Event::Start(Tag::TableCell) => {
                     self.table.in_cell = true;
                     self.table.current_cell.clear();
+                    self.style_stack.truncate(1);
+                    self.link_url_stack.clear();
                 }
                 Event::End(TagEnd::TableCell) => {
-                    let cell = std::mem::take(&mut self.table.current_cell);
-                    self.table.current_row.push(cell.trim().to_owned());
+                    let cell = trim_rich_spans(std::mem::take(&mut self.table.current_cell));
+                    self.table.current_row.push(cell);
                     self.table.in_cell = false;
+                    self.style_stack.truncate(1);
+                    self.link_url_stack.clear();
                 }
-                Event::Text(text) | Event::Code(text) if self.table.in_cell => {
-                    self.table.current_cell.push_str(&text);
+                Event::Start(Tag::Strong) if self.table.in_cell => {
+                    self.push_style_mod(|s| s.add_modifier(Modifier::BOLD));
+                }
+                Event::End(TagEnd::Strong) if self.table.in_cell => {
+                    self.pop_style();
+                }
+                Event::Start(Tag::Emphasis) if self.table.in_cell => {
+                    self.push_style_mod(|s| s.add_modifier(Modifier::ITALIC));
+                }
+                Event::End(TagEnd::Emphasis) if self.table.in_cell => {
+                    self.pop_style();
+                }
+                Event::Start(Tag::Strikethrough) if self.table.in_cell => {
+                    self.push_style_mod(|s| {
+                        s.fg(self.theme.muted).add_modifier(Modifier::CROSSED_OUT)
+                    });
+                }
+                Event::End(TagEnd::Strikethrough) if self.table.in_cell => {
+                    self.pop_style();
+                }
+                Event::Start(Tag::Link { dest_url, .. }) if self.table.in_cell => {
+                    self.link_url_stack.push(dest_url.to_string());
+                    self.push_style_mod(|s| {
+                        s.fg(self.theme.info).add_modifier(Modifier::UNDERLINED)
+                    });
+                }
+                Event::End(TagEnd::Link) if self.table.in_cell => {
+                    self.pop_style();
+                    self.link_url_stack.pop();
+                }
+                Event::Code(text) if self.table.in_cell => {
+                    let style = Style::default()
+                        .fg(self.theme.warning)
+                        .bg(self.theme.code_bg);
+                    let link = self.link_url_stack.last().cloned().or_else(|| {
+                        let trimmed = text.trim();
+                        if is_likely_url_token(trimmed) || is_likely_file_path_token(trimmed) {
+                            Some(trimmed.to_owned())
+                        } else {
+                            None
+                        }
+                    });
+                    self.table.current_cell.push(RichSpan {
+                        text: text.to_string(),
+                        style,
+                        link_target: link,
+                    });
+                }
+                Event::Text(text) if self.table.in_cell => {
+                    let cell_style = if self.style_stack.len() > 1 {
+                        self.current_style()
+                    } else {
+                        Style::default()
+                    };
+                    if let Some(target) = self.link_url_stack.last() {
+                        self.table.current_cell.push(RichSpan::linked(
+                            text.to_string(),
+                            cell_style,
+                            target.clone(),
+                        ));
+                    } else {
+                        self.table
+                            .current_cell
+                            .extend(split_autolinks(&text, cell_style, self.theme));
+                    }
                 }
                 Event::SoftBreak | Event::HardBreak if self.table.in_cell => {
-                    self.table.current_cell.push(' ');
+                    self.table
+                        .current_cell
+                        .push(RichSpan::plain(" ", Style::default()));
                 }
                 Event::End(TagEnd::Table) => {
                     self.in_table = false;
@@ -1349,7 +2976,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 if !marker.is_empty() {
                     self.pending_spans
-                        .push(Span::styled(marker.to_owned(), self.current_style()));
+                        .push(RichSpan::plain(marker, self.current_style()));
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
@@ -1419,8 +3046,7 @@ impl<'a> MarkdownRenderer<'a> {
                 } else {
                     Style::default().fg(self.theme.muted)
                 };
-                self.pending_spans
-                    .push(Span::styled(marker.to_owned(), style));
+                self.pending_spans.push(RichSpan::plain(marker, style));
             }
             Event::Start(Tag::Strong) => {
                 self.push_style_mod(|s| s.add_modifier(Modifier::BOLD));
@@ -1450,11 +3076,12 @@ impl<'a> MarkdownRenderer<'a> {
                     let already_shown = self
                         .pending_spans
                         .last()
-                        .is_some_and(|s| s.content.as_ref() == url);
+                        .is_some_and(|s| s.text.as_str() == url);
                     if !url.is_empty() && !already_shown {
-                        self.pending_spans.push(Span::styled(
+                        self.pending_spans.push(RichSpan::linked(
                             format!(" ({url})"),
                             Style::default().fg(self.theme.muted),
+                            url,
                         ));
                     }
                 }
@@ -1470,19 +3097,43 @@ impl<'a> MarkdownRenderer<'a> {
             }
             Event::Text(text) => {
                 let style = self.current_style();
-                self.pending_spans
-                    .push(Span::styled(text.to_string(), style));
+                if let Some(target) = self.link_url_stack.last() {
+                    self.pending_spans.push(RichSpan::linked(
+                        text.to_string(),
+                        style,
+                        target.clone(),
+                    ));
+                } else {
+                    self.pending_spans
+                        .extend(split_autolinks(&text, style, self.theme));
+                }
             }
             Event::Code(code) => {
                 let style = Style::default()
                     .fg(self.theme.warning)
                     .bg(self.theme.code_bg);
-                self.pending_spans
-                    .push(Span::styled(format!(" {code} "), style));
+                let link = self.link_url_stack.last().cloned().or_else(|| {
+                    let trimmed = code.trim();
+                    if is_likely_url_token(trimmed) || is_likely_file_path_token(trimmed) {
+                        Some(trimmed.to_owned())
+                    } else {
+                        None
+                    }
+                });
+                self.pending_spans.push(RichSpan {
+                    text: format!(" {code} "),
+                    style,
+                    link_target: link,
+                });
             }
             Event::SoftBreak => {
                 let style = self.current_style();
-                self.pending_spans.push(Span::styled(" ".to_owned(), style));
+                let link = self.link_url_stack.last().cloned();
+                self.pending_spans.push(RichSpan {
+                    text: " ".to_owned(),
+                    style,
+                    link_target: link,
+                });
             }
             Event::HardBreak => {
                 self.flush_pending();
@@ -1490,17 +3141,17 @@ impl<'a> MarkdownRenderer<'a> {
             Event::Rule => {
                 self.flush_pending();
                 self.ensure_blank_line();
-                self.lines.push(Line::from(Span::styled(
+                self.lines.push(BuiltLine::plain(Line::from(Span::styled(
                     "─".repeat(self.width),
                     Style::default().fg(self.theme.border),
-                )));
+                ))));
                 self.ensure_blank_line();
             }
             _ => {}
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> Vec<BuiltLine> {
         if self.in_code_block {
             self.in_code_block = false;
             self.flush_code_block();
@@ -1513,7 +3164,7 @@ impl<'a> MarkdownRenderer<'a> {
         while self
             .lines
             .last()
-            .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+            .is_some_and(|l| l.line.spans.iter().all(|s| s.content.trim().is_empty()))
         {
             self.lines.pop();
         }
@@ -1521,7 +3172,7 @@ impl<'a> MarkdownRenderer<'a> {
     }
 }
 
-pub fn render_markdown(md: &str, width: usize, theme: &UiPalette) -> Vec<Line<'static>> {
+fn render_markdown_rich(md: &str, width: usize, theme: &UiPalette) -> Vec<BuiltLine> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(md, options);
@@ -1532,7 +3183,14 @@ pub fn render_markdown(md: &str, width: usize, theme: &UiPalette) -> Vec<Line<'s
     renderer.finish()
 }
 
-pub fn render_unified_diff(diff: &str, width: usize, theme: &UiPalette) -> Vec<Line<'static>> {
+pub fn render_markdown(md: &str, width: usize, theme: &UiPalette) -> Vec<Line<'static>> {
+    render_markdown_rich(md, width, theme)
+        .into_iter()
+        .map(|b| b.line)
+        .collect()
+}
+
+fn render_unified_diff_built(diff: &str, width: usize, theme: &UiPalette) -> Vec<BuiltLine> {
     let max_width = width.max(MIN_RENDER_WIDTH);
     let mut lines = Vec::new();
     for raw_line in diff.split('\n') {
@@ -1575,9 +3233,22 @@ pub fn render_unified_diff(diff: &str, width: usize, theme: &UiPalette) -> Vec<L
         } else {
             (Style::default().fg(theme.muted), None)
         };
-        lines.extend(wrap_preserving_indent(line, max_width, style, &[], pad_bg));
+        lines.extend(wrap_preserving_indent_built(
+            line,
+            max_width,
+            style,
+            &[],
+            pad_bg,
+        ));
     }
     lines
+}
+
+pub fn render_unified_diff(diff: &str, width: usize, theme: &UiPalette) -> Vec<Line<'static>> {
+    render_unified_diff_built(diff, width, theme)
+        .into_iter()
+        .map(|b| b.line)
+        .collect()
 }
 
 fn looks_like_unified_diff(text: &str) -> bool {
@@ -1594,7 +3265,13 @@ fn build_transcript_lines(
     width: usize,
     theme: &UiPalette,
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<LineHitRegion>) {
-    build_transcript_lines_with_activity(transcript, width, theme, None)
+    let (built, anchors, regions) =
+        build_transcript_lines_with_activity(transcript, width, theme, None);
+    (
+        built.into_iter().map(|b| b.line).collect(),
+        anchors,
+        regions,
+    )
 }
 
 fn build_transcript_lines_with_activity(
@@ -1602,9 +3279,9 @@ fn build_transcript_lines_with_activity(
     width: usize,
     theme: &UiPalette,
     activity: Option<&LiveActivity>,
-) -> (Vec<Line<'static>>, Vec<usize>, Vec<LineHitRegion>) {
+) -> (Vec<BuiltLine>, Vec<usize>, Vec<LineHitRegion>) {
     let max_width = width.max(MIN_RENDER_WIDTH);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut lines: Vec<BuiltLine> = Vec::new();
     let mut message_anchors: Vec<usize> = Vec::new();
     let mut hit_regions: Vec<LineHitRegion> = Vec::new();
     let active_spinner = activity.map(|act| act.spinner);
@@ -1637,7 +3314,7 @@ fn build_transcript_lines_with_activity(
                 )
             );
             if !(prev_is_compact && curr_is_compact) {
-                lines.push(Line::default());
+                lines.push(BuiltLine::plain(Line::default()));
             }
         }
 
@@ -1683,14 +3360,14 @@ fn build_transcript_lines_with_activity(
                 max_width,
             );
             let line_index = lines.len();
-            lines.push(Line::from(Span::styled(
+            lines.push(BuiltLine::plain(Line::from(Span::styled(
                 header_text,
                 Style::default().fg(if any_running {
                     theme.warning
                 } else {
                     theme.muted
                 }),
-            )));
+            ))));
             hit_regions.push(LineHitRegion {
                 line_index,
                 col_start: 0,
@@ -1730,10 +3407,10 @@ fn build_transcript_lines_with_activity(
 
     if let Some(act) = activity {
         if !lines.is_empty() {
-            lines.push(Line::default());
+            lines.push(BuiltLine::plain(Line::default()));
         }
         let label = truncate_str(&act.label, max_width.saturating_sub(4).max(1));
-        lines.push(Line::from(vec![
+        lines.push(BuiltLine::plain(Line::from(vec![
             Span::styled(
                 format!("  {} ", act.spinner),
                 Style::default()
@@ -1741,10 +3418,50 @@ fn build_transcript_lines_with_activity(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(label, Style::default().fg(theme.accent_soft)),
-        ]));
+        ])));
+    }
+
+    for (line_index, built) in lines.iter().enumerate() {
+        for link in &built.links {
+            hit_regions.push(LineHitRegion {
+                line_index,
+                col_start: link.col_start,
+                col_width: link.col_width,
+                action: TranscriptHitAction::OpenLink {
+                    target: link.target.clone(),
+                },
+            });
+        }
     }
 
     (lines, message_anchors, hit_regions)
+}
+
+fn frame_card_line(mut line: BuiltLine, inner_w: usize, border_color: Color) -> BuiltLine {
+    let line_w = line.width();
+    let pad = inner_w.saturating_sub(line_w);
+    line.prepend_span(
+        Span::styled("  │ ", Style::default().fg(border_color)),
+        true,
+    );
+    if pad > 0 {
+        line.line.spans.push(Span::raw(" ".repeat(pad)));
+    }
+    line.copy_end_col = Some(4 + inner_w);
+    line.line
+        .spans
+        .push(Span::styled(" │", Style::default().fg(border_color)));
+    line
+}
+
+fn attachment_display_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed);
+    truncate_str(base, 36)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1754,12 +3471,16 @@ fn render_single_entry(
     max_width: usize,
     theme: &UiPalette,
     active_spinner: Option<&str>,
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<BuiltLine>,
     message_anchors: &mut Vec<usize>,
     hit_regions: &mut Vec<LineHitRegion>,
 ) {
     match entry {
-        TranscriptEntry::UserMessage { text, timestamp } => {
+        TranscriptEntry::UserMessage {
+            text,
+            timestamp,
+            attachments,
+        } => {
             message_anchors.push(lines.len());
             let mut header_spans = vec![Span::styled(
                 "  You",
@@ -1773,16 +3494,68 @@ fn render_single_entry(
                     Style::default().fg(theme.subtle),
                 ));
             }
-            lines.push(Line::from(header_spans));
+            lines.push(BuiltLine::plain(Line::from(header_spans)));
             let body_prefix = [Span::styled("  ", Style::default().fg(theme.fg))];
+            let quote_prefix = [
+                Span::raw("  "),
+                Span::styled("│ ", Style::default().fg(theme.accent)),
+            ];
+            let quote_style = Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC);
+            let text_style = Style::default().fg(theme.fg);
             for raw in text.split('\n') {
-                let wrapped = wrap_spans_with_prefix(
-                    &[Span::styled(raw.to_owned(), Style::default().fg(theme.fg))],
+                let clean = raw.strip_suffix('\r').unwrap_or(raw);
+                if let Some(quoted) = clean
+                    .strip_prefix("> ")
+                    .or_else(|| (clean == ">").then_some(""))
+                {
+                    let spans = split_autolinks(quoted, quote_style, theme);
+                    lines.extend(wrap_rich_spans_with_prefix(
+                        &spans,
+                        max_width,
+                        &quote_prefix,
+                        &quote_prefix,
+                    ));
+                } else {
+                    let spans = split_autolinks(clean, text_style, theme);
+                    lines.extend(wrap_rich_spans_with_prefix(
+                        &spans,
+                        max_width,
+                        &body_prefix,
+                        &body_prefix,
+                    ));
+                }
+            }
+            if !attachments.is_empty() {
+                let pill_style = Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.info)
+                    .add_modifier(Modifier::BOLD);
+                let mut pill_spans = Vec::new();
+                for (idx, att) in attachments.iter().enumerate() {
+                    if idx > 0 {
+                        pill_spans.push(RichSpan::plain(" ", Style::default()));
+                    }
+                    let label = format!(" [img] {} ", attachment_display_label(att));
+                    let link_target = if is_likely_url_token(att) || is_likely_file_path_token(att)
+                    {
+                        Some(att.clone())
+                    } else {
+                        None
+                    };
+                    pill_spans.push(RichSpan {
+                        text: label,
+                        style: pill_style,
+                        link_target,
+                    });
+                }
+                lines.extend(wrap_rich_spans_with_prefix(
+                    &pill_spans,
                     max_width,
                     &body_prefix,
                     &body_prefix,
-                );
-                lines.extend(wrapped);
+                ));
             }
         }
         TranscriptEntry::AssistantMarkdown {
@@ -1800,10 +3573,10 @@ fn render_single_entry(
             if *streaming {
                 header_spans.push(Span::styled("  ●", Style::default().fg(theme.warning)));
             }
-            lines.push(Line::from(header_spans));
+            lines.push(BuiltLine::plain(Line::from(header_spans)));
             let content_w = max_width.saturating_sub(2).max(MIN_RENDER_WIDTH);
-            for mut line in render_markdown(markdown, content_w, theme) {
-                line.spans.insert(0, Span::raw("  "));
+            for mut line in render_markdown_rich(markdown, content_w, theme) {
+                line.prepend_span(Span::raw("  "), true);
                 lines.push(line);
             }
         }
@@ -1819,40 +3592,48 @@ fn render_single_entry(
                     &format!("  ▸ Thought for {duration} (Ctrl+E to expand)"),
                     max_width,
                 );
-                lines.push(Line::from(Span::styled(
+                lines.push(BuiltLine::plain(Line::from(Span::styled(
                     summary,
                     Style::default()
                         .fg(theme.subtle)
                         .add_modifier(Modifier::ITALIC),
-                )));
+                ))));
             } else {
                 let header = truncate_str(&format!("  ▾ Thought for {duration}"), max_width);
-                lines.push(Line::from(Span::styled(
+                lines.push(BuiltLine::plain(Line::from(Span::styled(
                     header,
                     Style::default()
                         .fg(theme.muted)
                         .add_modifier(Modifier::ITALIC),
-                )));
+                ))));
                 let body_w = max_width.saturating_sub(4).max(MIN_RENDER_WIDTH);
                 let rendered = if text.trim().is_empty() {
                     Vec::new()
                 } else {
-                    render_markdown(text, body_w, theme)
+                    render_markdown_rich(text, body_w, theme)
                 };
                 if rendered.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("  │ ", Style::default().fg(theme.border)),
-                        Span::styled(
-                            truncate_str("(No reasoning text streamed by provider)", body_w),
-                            Style::default()
-                                .fg(theme.subtle)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
+                    lines.push(BuiltLine {
+                        line: Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(theme.border)),
+                            Span::styled(
+                                truncate_str("(No reasoning text streamed by provider)", body_w),
+                                Style::default()
+                                    .fg(theme.subtle)
+                                    .add_modifier(Modifier::ITALIC),
+                            ),
+                        ]),
+                        soft_wrapped: false,
+                        copy_prefix_cols: 4,
+                        copy_end_col: None,
+                        links: Vec::new(),
+                    });
                 } else {
                     for mut line in rendered {
-                        line.spans
-                            .insert(0, Span::styled("  │ ", Style::default().fg(theme.border)));
+                        line.prepend_span(
+                            Span::styled("  │ ", Style::default().fg(theme.border)),
+                            true,
+                        );
                         lines.push(line);
                     }
                 }
@@ -1918,10 +3699,10 @@ fn render_single_entry(
                 &format!("  ▸ Delegated → {worker} [{meta}] {badge}"),
                 max_width,
             );
-            lines.push(Line::from(Span::styled(
+            lines.push(BuiltLine::plain(Line::from(Span::styled(
                 text,
                 Style::default().fg(status_color),
-            )));
+            ))));
             hit_regions.push(LineHitRegion {
                 line_index,
                 col_start: 0,
@@ -1932,10 +3713,10 @@ fn render_single_entry(
             });
             if !summary.is_empty() {
                 let sub = truncate_str(&format!("    └ {summary}"), max_width);
-                lines.push(Line::from(Span::styled(
+                lines.push(BuiltLine::plain(Line::from(Span::styled(
                     sub,
                     Style::default().fg(theme.muted),
-                )));
+                ))));
             }
         }
         TranscriptEntry::InlineConnectCard {
@@ -2005,14 +3786,243 @@ fn render_single_entry(
                     .add_modifier(Modifier::BOLD),
             )];
             let cont = [Span::raw(cont_str)];
-            lines.extend(wrap_spans_with_prefix(
-                &[Span::styled(text.clone(), Style::default().fg(text_color))],
-                max_width,
-                &prefix,
-                &cont,
+            let spans = split_autolinks(text, Style::default().fg(text_color), theme);
+            lines.extend(wrap_rich_spans_with_prefix(
+                &spans, max_width, &prefix, &cont,
             ));
         }
+        TranscriptEntry::TableCard {
+            title,
+            headers,
+            rows,
+            alignments,
+            caption,
+        } => {
+            render_table_card(
+                title,
+                headers,
+                rows,
+                alignments,
+                caption.as_deref(),
+                max_width,
+                theme,
+                lines,
+            );
+        }
+        TranscriptEntry::InfoCard {
+            title,
+            level,
+            badge,
+            fields,
+            body_markdown,
+        } => {
+            render_info_card(
+                title,
+                level,
+                badge.as_deref(),
+                fields,
+                body_markdown,
+                max_width,
+                theme,
+                lines,
+            );
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_table_card(
+    title: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+    alignments: &[String],
+    caption: Option<&str>,
+    max_width: usize,
+    theme: &UiPalette,
+    lines: &mut Vec<BuiltLine>,
+) {
+    let box_w = max_width.saturating_sub(2).max(16);
+    let inner_w = box_w.saturating_sub(4).max(8);
+    let header_title = if title.trim().is_empty() {
+        "╭─ Table ".to_owned()
+    } else {
+        format!("╭─ {} ", title.trim())
+    };
+    let clipped_hdr = truncate_str(&header_title, box_w.saturating_sub(2));
+    let fill = box_w.saturating_sub(display_width(&clipped_hdr) + 1);
+    lines.push(BuiltLine::plain(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            clipped_hdr,
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}╮", "─".repeat(fill)),
+            Style::default().fg(theme.border),
+        ),
+    ])));
+
+    let parsed_alignments: Vec<Alignment> = alignments
+        .iter()
+        .map(|a| match a.trim().to_ascii_lowercase().as_str() {
+            "right" => Alignment::Right,
+            "center" => Alignment::Center,
+            _ => Alignment::Left,
+        })
+        .collect();
+    let parsed_headers: Vec<Vec<RichSpan>> = headers
+        .iter()
+        .map(|h| parse_inline_markdown_spans(h, Style::default(), theme))
+        .collect();
+    let parsed_rows: Vec<Vec<Vec<RichSpan>>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| parse_inline_markdown_spans(c, Style::default(), theme))
+                .collect()
+        })
+        .collect();
+
+    let table_lines = render_rich_table(
+        &parsed_headers,
+        &parsed_rows,
+        &parsed_alignments,
+        inner_w,
+        theme,
+    );
+    if table_lines.is_empty() {
+        let empty = BuiltLine::plain(Line::from(Span::styled(
+            "(empty table)",
+            Style::default().fg(theme.subtle),
+        )));
+        lines.push(frame_card_line(empty, inner_w, theme.border));
+    } else {
+        for tline in table_lines {
+            lines.push(frame_card_line(tline, inner_w, theme.border));
+        }
+    }
+
+    if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+        let cap_spans = parse_inline_markdown_spans(
+            cap,
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+            theme,
+        );
+        for cline in wrap_rich_spans_with_prefix(&cap_spans, inner_w, &[], &[]) {
+            lines.push(frame_card_line(cline, inner_w, theme.border));
+        }
+    }
+
+    lines.push(BuiltLine::plain(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))),
+            Style::default().fg(theme.border),
+        ),
+    ])));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_info_card(
+    title: &str,
+    level: &str,
+    badge: Option<&str>,
+    fields: &[(String, String)],
+    body_markdown: &str,
+    max_width: usize,
+    theme: &UiPalette,
+    lines: &mut Vec<BuiltLine>,
+) {
+    let accent_color = match level.trim().to_ascii_lowercase().as_str() {
+        "success" | "ok" => theme.success,
+        "warning" | "warn" => theme.warning,
+        "error" | "danger" => theme.danger,
+        "accent" => theme.accent,
+        _ => theme.info,
+    };
+
+    let box_w = max_width.saturating_sub(2).max(16);
+    let inner_w = box_w.saturating_sub(4).max(8);
+    let badge_suffix = badge
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| format!(" [{b}] ─╮"))
+        .unwrap_or_else(|| "╮".to_owned());
+    let header_title = format!("╭─ {} ", title.trim());
+    let max_left = box_w
+        .saturating_sub(display_width(&badge_suffix) + 1)
+        .max(4);
+    let clipped_hdr = truncate_str(&header_title, max_left);
+    let fill = box_w.saturating_sub(display_width(&clipped_hdr) + display_width(&badge_suffix));
+    lines.push(BuiltLine::plain(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            clipped_hdr,
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(fill), Style::default().fg(accent_color)),
+        Span::styled(
+            badge_suffix,
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])));
+
+    if !fields.is_empty() {
+        let key_w = fields
+            .iter()
+            .map(|(k, _)| display_width(k))
+            .max()
+            .unwrap_or(0)
+            .min(inner_w / 3);
+        let cont_indent = " ".repeat(key_w + 2);
+        for (key, value) in fields {
+            let key_label = format!("{:<width$}: ", truncate_str(key, key_w), width = key_w);
+            let mut spans = vec![RichSpan::plain(
+                key_label,
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(parse_inline_markdown_spans(
+                value,
+                Style::default().fg(theme.fg),
+                theme,
+            ));
+            let cont = [Span::raw(cont_indent.clone())];
+            for fline in wrap_rich_spans_with_prefix(&spans, inner_w, &[], &cont) {
+                lines.push(frame_card_line(fline, inner_w, accent_color));
+            }
+        }
+    }
+
+    if !body_markdown.trim().is_empty() {
+        if !fields.is_empty() {
+            let divider = BuiltLine::plain(Line::from(Span::styled(
+                "─".repeat(inner_w),
+                Style::default().fg(theme.border),
+            )));
+            lines.push(frame_card_line(divider, inner_w, accent_color));
+        }
+        for mline in render_markdown_rich(body_markdown, inner_w, theme) {
+            lines.push(frame_card_line(mline, inner_w, accent_color));
+        }
+    }
+
+    lines.push(BuiltLine::plain(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))),
+            Style::default().fg(accent_color),
+        ),
+    ])));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2029,7 +4039,7 @@ fn render_tool_call_card(
     max_width: usize,
     theme: &UiPalette,
     active_spinner: Option<&str>,
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<BuiltLine>,
     hit_regions: &mut Vec<LineHitRegion>,
 ) {
     let spinner = active_spinner.unwrap_or("⠋");
@@ -2082,11 +4092,11 @@ fn render_tool_call_card(
         let gap = max_width
             .saturating_sub(display_width(&left) + display_width(&status_text) + 1)
             .max(1);
-        lines.push(Line::from(vec![
+        lines.push(BuiltLine::plain(Line::from(vec![
             Span::styled(left, Style::default().fg(left_fg)),
             Span::raw(" ".repeat(gap)),
             Span::styled(status_text, Style::default().fg(status_color)),
-        ]));
+        ])));
         hit_regions.push(LineHitRegion {
             line_index,
             col_start: 0,
@@ -2099,10 +4109,10 @@ fn render_tool_call_card(
                     &format!("    └ {}", err_line.trim()),
                     max_width.min(COLLAPSED_ERROR_PREVIEW_CHARS),
                 );
-                lines.push(Line::from(Span::styled(
+                lines.push(BuiltLine::plain(Line::from(Span::styled(
                     preview,
                     Style::default().fg(theme.danger),
-                )));
+                ))));
             }
         }
         return;
@@ -2126,12 +4136,12 @@ fn render_tool_call_card(
     let actual_fill = box_w
         .saturating_sub(display_width(&clipped_left) + display_width(&header_right))
         .max(fill.min(1));
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(clipped_left, Style::default().fg(theme.accent_soft)),
         Span::styled("─".repeat(actual_fill), Style::default().fg(theme.border)),
         Span::styled(header_right, Style::default().fg(status_color)),
-    ]));
+    ])));
     hit_regions.push(LineHitRegion {
         line_index,
         col_start: 2,
@@ -2140,17 +4150,17 @@ fn render_tool_call_card(
     });
 
     let body_lines = if output.is_empty() {
-        vec![Line::from(Span::styled(
+        vec![BuiltLine::plain(Line::from(Span::styled(
             "(no output)",
             Style::default().fg(theme.subtle),
-        ))]
+        )))]
     } else if looks_like_unified_diff(output) {
-        render_unified_diff(output, inner_w, theme)
+        render_unified_diff_built(output, inner_w, theme)
     } else {
         let mut rendered = Vec::new();
         for raw in output.split('\n') {
             let clean = raw.strip_suffix('\r').unwrap_or(raw);
-            rendered.extend(wrap_preserving_indent(
+            rendered.extend(wrap_preserving_indent_built(
                 clean,
                 inner_w,
                 Style::default().fg(theme.fg),
@@ -2161,28 +4171,17 @@ fn render_tool_call_card(
         rendered
     };
 
-    for mut bline in body_lines {
-        let line_w: usize = bline.spans.iter().map(Span::width).sum();
-        let pad = inner_w.saturating_sub(line_w);
-        bline
-            .spans
-            .insert(0, Span::styled("  │ ", Style::default().fg(theme.border)));
-        if pad > 0 {
-            bline.spans.push(Span::raw(" ".repeat(pad)));
-        }
-        bline
-            .spans
-            .push(Span::styled(" │", Style::default().fg(theme.border)));
-        lines.push(bline);
+    for bline in body_lines {
+        lines.push(frame_card_line(bline, inner_w, theme.border));
     }
 
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))),
             Style::default().fg(theme.border),
         ),
-    ]));
+    ])));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2194,15 +4193,15 @@ fn render_inline_connect_card(
     resolved: bool,
     max_width: usize,
     theme: &UiPalette,
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<BuiltLine>,
     hit_regions: &mut Vec<LineHitRegion>,
 ) {
     if resolved {
         let text = truncate_str(&format!("  ✓ Connected: {title}"), max_width);
-        lines.push(Line::from(Span::styled(
+        lines.push(BuiltLine::plain(Line::from(Span::styled(
             text,
             Style::default().fg(theme.success),
-        )));
+        ))));
         return;
     }
 
@@ -2211,7 +4210,7 @@ fn render_inline_connect_card(
     let header_title = format!("╭─ Connect: {title} ");
     let clipped_hdr = truncate_str(&header_title, box_w.saturating_sub(2));
     let fill = box_w.saturating_sub(display_width(&clipped_hdr) + 1);
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             clipped_hdr,
@@ -2223,28 +4222,11 @@ fn render_inline_connect_card(
             format!("{}╮", "─".repeat(fill)),
             Style::default().fg(theme.warning),
         ),
-    ]));
+    ])));
 
-    let wrapped = wrap_spans_with_prefix(
-        &[Span::styled(
-            detail.to_owned(),
-            Style::default().fg(theme.fg),
-        )],
-        inner_w,
-        &[],
-        &[],
-    );
-    for mut line in wrapped {
-        let lw: usize = line.spans.iter().map(Span::width).sum();
-        let pad = inner_w.saturating_sub(lw);
-        line.spans
-            .insert(0, Span::styled("  │ ", Style::default().fg(theme.warning)));
-        if pad > 0 {
-            line.spans.push(Span::raw(" ".repeat(pad)));
-        }
-        line.spans
-            .push(Span::styled(" │", Style::default().fg(theme.warning)));
-        lines.push(line);
+    let spans = split_autolinks(detail, Style::default().fg(theme.fg), theme);
+    for line in wrap_rich_spans_with_prefix(&spans, inner_w, &[], &[]) {
+        lines.push(frame_card_line(line, inner_w, theme.warning));
     }
 
     let btn_line_index = lines.len();
@@ -2256,7 +4238,7 @@ fn render_inline_connect_card(
     let dismiss_w = display_width(dismiss_label);
     let used_btns = connect_w + 2 + dismiss_w;
     let pad = inner_w.saturating_sub(used_btns);
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::styled("  │ ", Style::default().fg(theme.warning)),
         Span::styled(
             connect_label,
@@ -2272,7 +4254,7 @@ fn render_inline_connect_card(
         ),
         Span::raw(" ".repeat(pad)),
         Span::styled(" │", Style::default().fg(theme.warning)),
-    ]));
+    ])));
     hit_regions.push(LineHitRegion {
         line_index: btn_line_index,
         col_start: connect_col,
@@ -2291,13 +4273,13 @@ fn render_inline_connect_card(
         },
     });
 
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))),
             Style::default().fg(theme.warning),
         ),
-    ]));
+    ])));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2309,15 +4291,15 @@ fn render_prod_gate_card(
     resolved: bool,
     max_width: usize,
     theme: &UiPalette,
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<BuiltLine>,
     hit_regions: &mut Vec<LineHitRegion>,
 ) {
     if resolved {
         let text = truncate_str(&format!("  ✓ ProdGate resolved: {tool}"), max_width);
-        lines.push(Line::from(Span::styled(
+        lines.push(BuiltLine::plain(Line::from(Span::styled(
             text,
             Style::default().fg(theme.muted),
-        )));
+        ))));
         return;
     }
 
@@ -2326,7 +4308,7 @@ fn render_prod_gate_card(
     let header_title = format!("╭─ ProdGate Approval: {tool} ");
     let clipped_hdr = truncate_str(&header_title, box_w.saturating_sub(2));
     let fill = box_w.saturating_sub(display_width(&clipped_hdr) + 1);
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             clipped_hdr,
@@ -2338,7 +4320,7 @@ fn render_prod_gate_card(
             format!("{}╮", "─".repeat(fill)),
             Style::default().fg(theme.danger),
         ),
-    ]));
+    ])));
 
     for (label, value, value_style) in [
         (
@@ -2348,26 +4330,17 @@ fn render_prod_gate_card(
         ),
         ("Reason:  ", reason, Style::default().fg(theme.fg)),
     ] {
-        let wrapped = wrap_spans_with_prefix(
+        let wrapped = wrap_rich_spans_with_prefix(
             &[
-                Span::styled(label.to_owned(), Style::default().fg(theme.muted)),
-                Span::styled(value.to_owned(), value_style),
+                RichSpan::plain(label, Style::default().fg(theme.muted)),
+                RichSpan::plain(value, value_style),
             ],
             inner_w,
             &[],
             &[Span::raw("         ")],
         );
-        for mut line in wrapped {
-            let lw: usize = line.spans.iter().map(Span::width).sum();
-            let pad = inner_w.saturating_sub(lw);
-            line.spans
-                .insert(0, Span::styled("  │ ", Style::default().fg(theme.danger)));
-            if pad > 0 {
-                line.spans.push(Span::raw(" ".repeat(pad)));
-            }
-            line.spans
-                .push(Span::styled(" │", Style::default().fg(theme.danger)));
-            lines.push(line);
+        for line in wrapped {
+            lines.push(frame_card_line(line, inner_w, theme.danger));
         }
     }
 
@@ -2380,7 +4353,7 @@ fn render_prod_gate_card(
     let deny_w = display_width(deny_label);
     let used_btns = allow_w + 2 + deny_w;
     let pad = inner_w.saturating_sub(used_btns);
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::styled("  │ ", Style::default().fg(theme.danger)),
         Span::styled(
             allow_label,
@@ -2399,7 +4372,7 @@ fn render_prod_gate_card(
         ),
         Span::raw(" ".repeat(pad)),
         Span::styled(" │", Style::default().fg(theme.danger)),
-    ]));
+    ])));
     hit_regions.push(LineHitRegion {
         line_index: btn_line_index,
         col_start: allow_col,
@@ -2417,13 +4390,187 @@ fn render_prod_gate_card(
         },
     });
 
-    lines.push(Line::from(vec![
+    lines.push(BuiltLine::plain(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))),
             Style::default().fg(theme.danger),
         ),
-    ]));
+    ])));
+}
+
+fn paint_selection_highlight(
+    buffer: &mut Buffer,
+    content_area: Rect,
+    scroll: &ScrollState,
+    theme: &UiPalette,
+) {
+    let Some(sel) = scroll.selection() else {
+        return;
+    };
+    if sel.is_empty() || scroll.rendered_lines.is_empty() {
+        return;
+    }
+    let (start, end) = sel.ordered();
+    let last_valid = scroll.rendered_lines.len().saturating_sub(1);
+    let first_line = start.line.min(last_valid);
+    let last_line = end.line.min(last_valid);
+
+    for rel_y in 0..content_area.height as usize {
+        let doc_line = scroll.offset() + rel_y;
+        if doc_line < first_line || doc_line > last_line {
+            continue;
+        }
+        let Some(rendered) = scroll.rendered_lines.get(doc_line) else {
+            continue;
+        };
+        let (min_col, max_col) = selection_line_bounds(
+            rendered, doc_line, first_line, last_line, start.col, end.col,
+        );
+        let y = content_area.y + rel_y as u16;
+        for cell in &rendered.cells {
+            let cell_w = cell.width.max(1);
+            let cell_end = cell.col_start + cell_w;
+            if cell_end <= min_col || cell.col_start > max_col {
+                continue;
+            }
+            for dx in 0..cell_w {
+                let rel_col = cell.col_start + dx;
+                if rel_col < content_area.width as usize {
+                    let x = content_area.x + rel_col as u16;
+                    buffer[(x, y)]
+                        .set_bg(theme.selection_bg)
+                        .set_fg(theme.selection_fg);
+                }
+            }
+        }
+    }
+}
+
+pub fn render_selection_popover(
+    frame: &mut Frame,
+    bounds: Rect,
+    scroll: &mut ScrollState,
+    theme: &UiPalette,
+) {
+    scroll.popover_rects = SelectionPopoverRects::default();
+    let Some(sel) = scroll.selection().cloned() else {
+        return;
+    };
+    if !sel.popover_open || sel.is_empty() || bounds.width < 12 || bounds.height == 0 {
+        return;
+    }
+
+    let (start, end) = sel.ordered();
+    let view_start = scroll.offset();
+    let view_end = view_start + scroll.viewport_height();
+    if end.line < view_start || start.line >= view_end {
+        return;
+    }
+
+    let vis_start_rel = start.line.saturating_sub(view_start);
+    let vis_end_rel = end
+        .line
+        .saturating_sub(view_start)
+        .min(bounds.height.saturating_sub(1) as usize);
+    let vis_start_row = bounds.y + vis_start_rel as u16;
+    let vis_end_row = bounds.y + vis_end_rel as u16;
+
+    let boxed = bounds.height >= 4 && bounds.width >= 27;
+    let (quote_label, copy_label, pop_w, pop_h) = if boxed {
+        (" Quote (q) ", " Copy (c) ", 27u16, 3u16)
+    } else {
+        let q = " Quote ";
+        let c = " Copy ";
+        let w = (display_width(q) + 1 + display_width(c)) as u16;
+        (q, c, w.min(bounds.width), 1u16)
+    };
+    if pop_w > bounds.width || pop_h > bounds.height {
+        return;
+    }
+
+    let below_y = vis_end_row.saturating_add(1);
+    let pop_y = if below_y.saturating_add(pop_h) <= bounds.bottom() {
+        below_y
+    } else if vis_start_row >= bounds.y.saturating_add(pop_h) {
+        vis_start_row - pop_h
+    } else {
+        bounds.bottom().saturating_sub(pop_h).max(bounds.y)
+    };
+
+    let anchor_col = bounds
+        .x
+        .saturating_add((end.col as u16).min(bounds.width.saturating_sub(1)));
+    let ideal_x = anchor_col.saturating_sub(pop_w / 2);
+    let max_x = bounds.right().saturating_sub(pop_w);
+    let pop_x = ideal_x.clamp(bounds.x, max_x.max(bounds.x));
+
+    let container = Rect::new(pop_x, pop_y, pop_w, pop_h);
+    frame.render_widget(Clear, container);
+
+    let focused_style = Style::default()
+        .fg(theme.bg)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let unfocused_style = Style::default().fg(theme.fg).bg(theme.surface_alt);
+    let (quote_style, copy_style) = match sel.focused_button {
+        SelectionButton::Quote => (focused_style, unfocused_style),
+        SelectionButton::Copy => (unfocused_style, focused_style),
+    };
+
+    let quote_w = display_width(quote_label) as u16;
+    let copy_w = display_width(copy_label) as u16;
+
+    if boxed {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.surface));
+        let inner = block.inner(container);
+        frame.render_widget(block, container);
+        let row = Line::from(vec![
+            Span::styled(" ", Style::default().bg(theme.surface)),
+            Span::styled(quote_label, quote_style),
+            Span::styled("  ", Style::default().bg(theme.surface)),
+            Span::styled(copy_label, copy_style),
+            Span::styled(" ", Style::default().bg(theme.surface)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(row).style(Style::default().bg(theme.surface)),
+            inner,
+        );
+        scroll.popover_rects = SelectionPopoverRects {
+            container,
+            quote: Rect::new(inner.x + 1, inner.y, quote_w.min(inner.width), 1),
+            copy: Rect::new(
+                inner.x + 1 + quote_w + 2,
+                inner.y,
+                copy_w.min(inner.width.saturating_sub(1 + quote_w + 2)),
+                1,
+            ),
+        };
+    } else {
+        let row = Line::from(vec![
+            Span::styled(quote_label, quote_style),
+            Span::styled(" ", Style::default().bg(theme.surface)),
+            Span::styled(copy_label, copy_style),
+        ]);
+        frame.render_widget(
+            Paragraph::new(row).style(Style::default().bg(theme.surface)),
+            container,
+        );
+        scroll.popover_rects = SelectionPopoverRects {
+            container,
+            quote: Rect::new(container.x, container.y, quote_w.min(container.width), 1),
+            copy: Rect::new(
+                container.x + quote_w + 1,
+                container.y,
+                copy_w.min(container.width.saturating_sub(quote_w + 1)),
+                1,
+            ),
+        };
+    }
 }
 
 pub fn render_transcript(
@@ -2445,7 +4592,10 @@ pub fn render_transcript_with_activity(
     activity: Option<&LiveActivity>,
 ) {
     scroll.hit_rects.clear();
+    scroll.popover_rects = SelectionPopoverRects::default();
     if area.width == 0 || area.height == 0 {
+        scroll.content_area = Rect::default();
+        scroll.rendered_lines.clear();
         scroll.sync_metrics(0, 0, Vec::new());
         return;
     }
@@ -2454,20 +4604,28 @@ pub fn render_transcript_with_activity(
     let (mut all_lines, anchors, regions) =
         build_transcript_lines_with_activity(transcript, content_width, theme, activity);
     if !all_lines.is_empty() {
-        all_lines.push(Line::default());
+        all_lines.push(BuiltLine::plain(Line::default()));
     }
     let viewport_h = area.height as usize;
     scroll.sync_metrics(all_lines.len(), viewport_h, anchors);
 
+    let content_area = Rect::new(area.x, area.y, content_width as u16, area.height);
+    scroll.content_area = content_area;
+    scroll.rendered_lines = all_lines.iter().map(build_rendered_line).collect();
+
     let start = scroll.offset();
     let end = (start + viewport_h).min(all_lines.len());
-    let visible: Vec<Line<'static>> = all_lines[start..end].to_vec();
+    let visible: Vec<Line<'static>> = all_lines[start..end]
+        .iter()
+        .map(|b| b.line.clone())
+        .collect();
 
-    let content_area = Rect::new(area.x, area.y, content_width as u16, area.height);
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().bg(theme.bg).fg(theme.fg)),
         content_area,
     );
+
+    paint_selection_highlight(frame.buffer_mut(), content_area, scroll, theme);
 
     for region in regions {
         if region.line_index >= start && region.line_index < end {
@@ -2539,6 +4697,8 @@ pub fn render_transcript_with_activity(
             );
         }
     }
+
+    render_selection_popover(frame, content_area, scroll, theme);
 }
 
 #[cfg(test)]
@@ -2857,8 +5017,9 @@ diff --git a/src/lib.rs b/src/lib.rs
             label: "Working… 4.2s · Write C:\\Users\\j\\gridfall.html".into(),
             elapsed_ms: 4200,
         };
-        let (live_lines, _, _) =
+        let (live_built, _, _) =
             build_transcript_lines_with_activity(&transcript, 80, &theme, Some(&activity));
+        let live_lines: Vec<Line<'static>> = live_built.into_iter().map(|b| b.line).collect();
         let live_text = lines_to_string(&live_lines);
         assert!(live_text.contains("⠙ Write · C:\\Users\\j\\gridfall.html"));
         assert!(live_text.contains("running…"));
@@ -2875,6 +5036,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             TranscriptEntry::UserMessage {
                 text: "Build gridfall".into(),
                 timestamp: Some("01:20:00".into()),
+                attachments: Vec::new(),
             },
             TranscriptEntry::ThinkingBlock {
                 text: "Plan HTML5 canvas layout".into(),
@@ -2927,6 +5089,18 @@ diff --git a/src/lib.rs b/src/lib.rs
             }
         ));
 
+        let legacy_user_json =
+            r#"{"type":"user_message","text":"Legacy prompt","timestamp":"01:00:00"}"#;
+        let legacy: TranscriptEntry = serde_json::from_str(legacy_user_json).unwrap();
+        assert!(matches!(
+            legacy,
+            TranscriptEntry::UserMessage {
+                ref text,
+                ref attachments,
+                ..
+            } if text == "Legacy prompt" && attachments.is_empty()
+        ));
+
         let theme = UiPalette::dark_deck();
         let mut transcript = Transcript::new();
         transcript.entries = normalized;
@@ -2938,5 +5112,348 @@ diff --git a/src/lib.rs b/src/lib.rs
             rendered.contains("ℹ  Override → claude/default"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn character_selection_highlight_popover_flip_and_hit_testing_at_80x24_and_120x40() {
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.push_user("Inspect chat selection behavior", None);
+        transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "Alpha bravo charlie delta echo foxtrot.".into(),
+            streaming: false,
+        });
+
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut scroll = ScrollState::new();
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+                .unwrap();
+
+            let buf = terminal.backend().buffer().clone();
+            let target_row = (0..h)
+                .find(|&y| {
+                    let row_text: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+                    row_text.contains("Alpha bravo charlie")
+                })
+                .expect("assistant line visible");
+            let row_text: String = (0..w).map(|x| buf[(x, target_row)].symbol()).collect();
+            let bravo_col = row_text.find("bravo").expect("bravo col") as u16;
+            let end_col = bravo_col + "bravo charlie".len() as u16 - 1;
+
+            assert!(scroll.begin_selection(bravo_col, target_row));
+            assert!(scroll.update_selection_drag(end_col, target_row));
+            assert!(scroll.finish_selection(end_col, target_row));
+            assert_eq!(
+                scroll.extract_selection_text().as_deref(),
+                Some("bravo charlie")
+            );
+            assert!(scroll.popover_open());
+
+            terminal
+                .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+                .unwrap();
+            let highlighted = terminal.backend().buffer().clone();
+            assert_eq!(highlighted[(bravo_col, target_row)].bg, theme.selection_bg);
+            assert_eq!(highlighted[(bravo_col, target_row)].fg, theme.selection_fg);
+
+            let rects = scroll.popover_rects();
+            assert!(rects.container.width > 0);
+            assert!(rects.container.right() <= w);
+            assert!(rects.container.bottom() <= h);
+            assert_eq!(
+                scroll.hit_test_popover(rects.quote.x + 1, rects.quote.y),
+                Some(SelectionButton::Quote)
+            );
+            assert_eq!(
+                scroll.hit_test_popover(rects.copy.x + 1, rects.copy.y),
+                Some(SelectionButton::Copy)
+            );
+            scroll.toggle_popover_button();
+            assert_eq!(
+                scroll.selection().map(|s| s.focused_button),
+                Some(SelectionButton::Copy)
+            );
+        }
+
+        let mut tall = Transcript::new();
+        for idx in 0..25 {
+            tall.push_user(format!("Line item {idx} near viewport edge"), None);
+        }
+        let mut scroll = ScrollState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &tall, &mut scroll, &theme))
+            .unwrap();
+        let bottom_text_row = 22u16;
+        assert!(scroll.begin_selection(2, bottom_text_row));
+        assert!(scroll.finish_selection(15, bottom_text_row));
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &tall, &mut scroll, &theme))
+            .unwrap();
+        let rects = scroll.popover_rects();
+        assert!(rects.container.width > 0);
+        assert!(
+            rects.container.bottom() <= bottom_text_row,
+            "expected popover to flip above bottom row {bottom_text_row}, got {:?}",
+            rects.container
+        );
+    }
+
+    #[test]
+    fn table_markdown_and_table_card_support_selection_quoting_inline_styles_and_links() {
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "| File | Status | Link |\n| --- | --- | --- |\n| src/editor.rs:42 | **ready** | [docs](https://example.com) |".into(),
+            streaming: false,
+        });
+        transcript.push(TranscriptEntry::TableCard {
+            title: "Build Matrix".into(),
+            headers: vec!["Target".into(), "Owner".into(), "Source".into()],
+            rows: vec![
+                vec![
+                    "Windows".into(),
+                    "**green**".into(),
+                    "src/clipboard/windows.rs:12".into(),
+                ],
+                vec![
+                    "Linux".into(),
+                    "`passing`".into(),
+                    "src/clipboard/unix.rs:8".into(),
+                ],
+            ],
+            alignments: vec!["left".into(), "center".into(), "left".into()],
+            caption: Some("All targets verified".into()),
+        });
+
+        let mut scroll = ScrollState::new();
+        let mut terminal = Terminal::new(TestBackend::new(96, 28)).unwrap();
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let md_row = (0..28u16)
+            .find(|&y| {
+                let text: String = (0..96u16).map(|x| buf[(x, y)].symbol()).collect();
+                text.contains("src/editor.rs:42")
+            })
+            .expect("markdown table row");
+        let ready_col = (0..90u16)
+            .find(|&x| {
+                let slice: String = (0..5u16).map(|d| buf[(x + d, md_row)].symbol()).collect();
+                slice == "ready"
+            })
+            .expect("ready col");
+        assert!(buf[(ready_col, md_row)].modifier.contains(Modifier::BOLD));
+
+        let links = scroll.links_in_viewport();
+        assert!(
+            links.iter().any(|(_, target)| target == "src/editor.rs:42"),
+            "{links:?}"
+        );
+        assert!(
+            links
+                .iter()
+                .any(|(_, target)| target == "https://example.com"),
+            "{links:?}"
+        );
+        assert!(
+            links
+                .iter()
+                .any(|(_, target)| target == "src/clipboard/windows.rs:12"),
+            "{links:?}"
+        );
+
+        let card_row1 = (0..28u16)
+            .find(|&y| {
+                let text: String = (0..96u16).map(|x| buf[(x, y)].symbol()).collect();
+                text.contains("Windows") && text.contains("green")
+            })
+            .expect("table card row 1");
+        let card_row2 = card_row1 + 1;
+        let win_col = (0..88u16)
+            .find(|&x| {
+                let slice: String = (0..7u16)
+                    .map(|d| buf[(x + d, card_row1)].symbol())
+                    .collect();
+                slice == "Windows"
+            })
+            .expect("Windows col");
+        assert!(scroll.begin_selection(win_col, card_row1));
+        assert!(scroll.finish_selection(win_col + 6, card_row1));
+        assert_eq!(scroll.extract_selection_text().as_deref(), Some("Windows"));
+
+        assert!(scroll.begin_selection(win_col, card_row1));
+        assert!(scroll.finish_selection(win_col + 14, card_row2));
+        let multi = scroll
+            .extract_selection_text()
+            .expect("multi-row table card selection");
+        assert!(multi.contains("Windows"), "{multi}");
+        assert!(multi.contains("Linux"), "{multi}");
+        assert!(!multi.ends_with('│'), "right box border leaked: {multi}");
+    }
+
+    #[test]
+    fn soft_wrapped_paragraph_selection_joins_lines_without_spurious_newlines() {
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "One two three four five six seven eight nine ten eleven twelve.\n\nSecond paragraph starts here.".into(),
+            streaming: false,
+        });
+        let mut scroll = ScrollState::new();
+        let mut terminal = Terminal::new(TestBackend::new(36, 16)).unwrap();
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let first_row = (0..16u16)
+            .find(|&y| {
+                let text: String = (0..36u16).map(|x| buf[(x, y)].symbol()).collect();
+                text.contains("One two three")
+            })
+            .expect("first wrapped row");
+        assert!(scroll.begin_selection(2, first_row));
+        assert!(scroll.finish_selection(30, first_row + 1));
+        let selected = scroll.extract_selection_text().expect("wrapped selection");
+        assert!(
+            !selected.contains('\n'),
+            "soft wrap inserted hard newline: {selected:?}"
+        );
+        assert!(selected.contains("One two three"), "{selected:?}");
+        assert!(
+            selected.contains("eight") || selected.contains("seven"),
+            "{selected:?}"
+        );
+    }
+
+    #[test]
+    fn clickable_links_track_markdown_bare_urls_and_file_paths_across_wraps() {
+        let theme = UiPalette::dark_deck();
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptEntry::AssistantMarkdown {
+            speaker: "Commander".into(),
+            markdown: "Visit https://example.com/very/long/path/that/wraps/across/lines and check src/markdown.rs#L10-L20 plus `src/mission.rs:88`.".into(),
+            streaming: false,
+        });
+        let mut scroll = ScrollState::new();
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+            .unwrap();
+
+        let links = scroll.links_in_viewport();
+        let url_hits: Vec<_> = links
+            .iter()
+            .filter(|(_, t)| t == "https://example.com/very/long/path/that/wraps/across/lines")
+            .collect();
+        assert!(
+            url_hits.len() >= 2,
+            "expected wrapped URL hit regions across >=2 rows, got {url_hits:?}"
+        );
+        assert!(
+            links.iter().any(|(_, t)| t == "src/markdown.rs#L10-L20"),
+            "{links:?}"
+        );
+        assert!(
+            links.iter().any(|(_, t)| t == "src/mission.rs:88"),
+            "{links:?}"
+        );
+
+        let (rect, target) = &url_hits[0];
+        assert_eq!(
+            scroll.hit_test(rect.x, rect.y),
+            Some(&TranscriptHitAction::OpenLink {
+                target: target.clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn code_blocks_syntax_highlight_and_info_card_and_user_quotes_attachments_render_cleanly() {
+        let theme = UiPalette::dark_deck();
+        let code_lines = render_markdown(
+            "```rust\npub fn compute(x: usize) -> usize {\n    let msg = \"ok\";\n    x + 42\n}\n```",
+            72,
+            &theme,
+        );
+        let fn_line = code_lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "fn"))
+            .expect("fn keyword span");
+        let fn_span = fn_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "fn")
+            .unwrap();
+        assert_eq!(fn_span.style.fg, Some(theme.accent));
+        assert!(fn_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let str_line = code_lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("\"ok\"")))
+            .expect("string literal span");
+        let str_span = str_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("\"ok\""))
+            .unwrap();
+        assert_eq!(str_span.style.fg, Some(theme.success));
+
+        let num_line = code_lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "42"))
+            .expect("number literal span");
+        let num_span = num_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "42")
+            .unwrap();
+        assert_eq!(num_span.style.fg, Some(theme.warning));
+
+        let mut transcript = Transcript::new();
+        transcript.push_user_with_attachments(
+            "> Quoted excerpt from assistant\n\nPlease inspect src/editor.rs",
+            Some("12:34".into()),
+            vec!["C:\\tmp\\shot.png".into()],
+        );
+        transcript.push(TranscriptEntry::InfoCard {
+            title: "Vault Status".into(),
+            level: "success".into(),
+            badge: Some("CONNECTED".into()),
+            fields: vec![
+                ("Endpoint".into(), "https://api.example.com".into()),
+                ("Config".into(), "src/mission.rs:12".into()),
+            ],
+            body_markdown: "All **credentials** sealed cleanly.".into(),
+        });
+
+        let mut scroll = ScrollState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_transcript(f, f.area(), &transcript, &mut scroll, &theme))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer(), Rect::new(0, 0, 80, 24));
+        assert!(text.contains("│ Quoted excerpt from assistant"), "{text}");
+        assert!(text.contains("[img] shot.png"), "{text}");
+        assert!(text.contains("Vault Status"), "{text}");
+        assert!(text.contains("[CONNECTED]"), "{text}");
+        assert!(text.contains("credentials"), "{text}");
+        let links = scroll.links_in_viewport();
+        assert!(
+            links.iter().any(|(_, t)| t == "https://api.example.com"),
+            "{links:?}"
+        );
+        assert!(
+            links.iter().any(|(_, t)| t == "src/mission.rs:12"),
+            "{links:?}"
+        );
+        assert!(links.iter().any(|(_, t)| t == "src/editor.rs"), "{links:?}");
     }
 }
