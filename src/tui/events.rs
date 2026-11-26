@@ -137,10 +137,7 @@ pub fn spawn_startup_probes(
 
 pub fn spawn_update_check(tx: Sender<AppEvent>) {
     thread::spawn(move || {
-        let rx = update::check_now();
-        if let Ok(state) = rx.recv() {
-            let _ = tx.send(AppEvent::UpdateChecked(state));
-        }
+        let _ = tx.send(AppEvent::UpdateChecked(update::check_latest()));
     });
 }
 

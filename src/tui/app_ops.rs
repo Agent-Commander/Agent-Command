@@ -28,6 +28,7 @@ use crate::{
 };
 
 const ARM_WINDOW: Duration = Duration::from_secs(2);
+pub(crate) const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_SHELL_CONTEXT_SNIPPETS: usize = 4;
 const MAX_SHELL_SNIPPET_CHARS: usize = 2000;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -415,6 +416,54 @@ impl App {
         self.git_snapshot.files.clone()
     }
 
+    pub(crate) fn automatic_update_check_enabled(&self) -> bool {
+        !cfg!(debug_assertions) && self.launch_update_check()
+    }
+
+    pub(crate) fn periodic_update_check_due_at(&self, now: Instant) -> bool {
+        self.bg_tx.is_some()
+            && self.launch_update_check()
+            && !self.update_check_in_flight
+            && self.update_receiver.is_none()
+            && !matches!(
+                self.update_state,
+                UpdateState::Checking | UpdateState::Downloading { .. }
+            )
+            && self
+                .last_update_check
+                .is_some_and(|last| now.saturating_duration_since(last) >= UPDATE_POLL_INTERVAL)
+    }
+
+    pub(crate) fn begin_periodic_update_check(
+        &mut self,
+        now: Instant,
+        spawn: impl FnOnce(mpsc::Sender<AppEvent>),
+    ) -> bool {
+        if !self.periodic_update_check_due_at(now) {
+            return false;
+        }
+        let Some(tx) = self.bg_tx.clone() else {
+            return false;
+        };
+        self.last_update_check = Some(now);
+        self.update_check_in_flight = true;
+        self.manual_update_check = false;
+        if !matches!(self.update_state, UpdateState::Available { .. })
+            && self.update_available.is_none()
+        {
+            self.update_state = UpdateState::Checking;
+        }
+        spawn(tx);
+        true
+    }
+
+    pub(crate) fn maybe_poll_periodic_update(&mut self, now: Instant) -> bool {
+        if !self.automatic_update_check_enabled() {
+            return false;
+        }
+        self.begin_periodic_update_check(now, events::spawn_update_check)
+    }
+
     pub fn start_background_probes(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.bg_tx = Some(tx.clone());
@@ -428,25 +477,49 @@ impl App {
             .live
             .as_ref()
             .and_then(|live| live.profile_root.clone());
-        let check_updates = self.launch_update_check();
+        let check_updates = self.automatic_update_check_enabled();
+        self.last_update_check = Some(Instant::now());
         if check_updates {
-            self.update_state = UpdateState::Checking;
+            self.manual_update_check = false;
+            self.update_check_in_flight = true;
+            if !matches!(self.update_state, UpdateState::Available { .. })
+                && self.update_available.is_none()
+            {
+                self.update_state = UpdateState::Checking;
+            }
         }
         events::spawn_startup_probes(workspace, profile_root, check_updates, tx);
     }
 
     pub(crate) fn trigger_live_update_check(&mut self) {
+        self.trigger_live_update_check_with(Instant::now(), events::spawn_update_check);
+    }
+
+    pub(crate) fn trigger_live_update_check_with(
+        &mut self,
+        now: Instant,
+        spawn: impl FnOnce(mpsc::Sender<AppEvent>),
+    ) {
+        if matches!(self.update_state, UpdateState::Downloading { .. }) {
+            return;
+        }
         self.manual_update_check = true;
+        self.last_update_check = Some(now);
         self.update_state = UpdateState::Checking;
         self.notice = "Checking GitHub releases…".into();
-        if let Some(tx) = &self.bg_tx {
-            events::spawn_update_check(tx.clone());
+        if self.update_check_in_flight && self.bg_tx.is_some() {
+            return;
+        }
+        self.update_check_in_flight = true;
+        let tx = if let Some(tx) = &self.bg_tx {
+            tx.clone()
         } else {
             let (tx, rx) = mpsc::channel();
             self.bg_tx = Some(tx.clone());
             self.bg_rx = Some(rx);
-            events::spawn_update_check(tx);
-        }
+            tx
+        };
+        spawn(tx);
     }
 
     pub fn poll_background_events(&mut self) {
@@ -470,6 +543,8 @@ impl App {
         for wake in wakes {
             self.apply_background_event(AppEvent::WorkerWake(wake));
         }
+
+        self.maybe_poll_periodic_update(Instant::now());
     }
 
     pub(crate) fn apply_background_event(&mut self, event: AppEvent) {
@@ -528,12 +603,24 @@ impl App {
                 self.github_status = status;
             }
             AppEvent::UpdateChecked(state) => {
+                self.update_check_in_flight = false;
+                let was_manual = std::mem::take(&mut self.manual_update_check);
+                if matches!(self.update_state, UpdateState::Downloading { .. }) {
+                    return;
+                }
+                if !was_manual
+                    && matches!(state, UpdateState::Failed(_))
+                    && (matches!(self.update_state, UpdateState::Available { .. })
+                        || self.update_available.is_some())
+                {
+                    return;
+                }
                 if let Some(ver) = state.available_version() {
                     self.update_available = Some(ver.to_owned());
                 } else {
                     self.update_available = None;
                 }
-                if std::mem::take(&mut self.manual_update_check) {
+                if was_manual {
                     self.notice = match &state {
                         UpdateState::UpToDate { current } => format!("Up to date (v{current})"),
                         UpdateState::Available { tag, .. } => {
@@ -1966,5 +2053,386 @@ impl App {
                 let _ = (allowance.five, allowance.week, usage::now());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn app_with_background_channel(last_check: Option<Instant>) -> App {
+        let (tx, rx) = mpsc::channel();
+        App {
+            bg_tx: Some(tx),
+            bg_rx: Some(rx),
+            last_update_check: last_check,
+            ..App::default()
+        }
+    }
+
+    #[test]
+    fn periodic_update_poll_due_only_after_interval_with_background_channel() {
+        assert_eq!(UPDATE_POLL_INTERVAL, Duration::from_secs(10 * 60));
+
+        let t0 = Instant::now();
+        let before_due = t0 + UPDATE_POLL_INTERVAL - Duration::from_secs(1);
+        let at_due = t0 + UPDATE_POLL_INTERVAL;
+
+        let mut without_bg = App {
+            last_update_check: Some(t0),
+            ..App::default()
+        };
+        assert!(!without_bg.periodic_update_check_due_at(at_due));
+        assert!(!without_bg
+            .begin_periodic_update_check(at_due, |_| { panic!("must not spawn without bg_tx") }));
+
+        let mut uninitialized_timer = app_with_background_channel(None);
+        assert!(!uninitialized_timer.periodic_update_check_due_at(at_due));
+        assert!(
+            !uninitialized_timer.begin_periodic_update_check(at_due, |_| {
+                panic!("must not spawn without last_update_check")
+            })
+        );
+
+        let mut app = app_with_background_channel(Some(t0));
+        app.notice = "Commander replied.".into();
+        assert!(!app.periodic_update_check_due_at(t0));
+        assert!(!app.periodic_update_check_due_at(before_due));
+        assert!(!app.begin_periodic_update_check(before_due, |_| {
+            panic!("must not spawn before interval elapses")
+        }));
+
+        assert!(app.periodic_update_check_due_at(at_due));
+        let mut spawned = 0usize;
+        let started = app.begin_periodic_update_check(at_due, |tx| {
+            spawned += 1;
+            tx.send(AppEvent::UpdateChecked(UpdateState::UpToDate {
+                current: crate::update::CURRENT.to_owned(),
+            }))
+            .unwrap();
+        });
+        assert!(started);
+        assert_eq!(spawned, 1);
+        assert!(app.update_check_in_flight);
+        assert!(!app.manual_update_check);
+        assert_eq!(app.last_update_check, Some(at_due));
+        assert_eq!(app.update_state, UpdateState::Checking);
+        assert_eq!(app.notice, "Commander replied.");
+        assert!(!app.periodic_update_check_due_at(at_due + UPDATE_POLL_INTERVAL));
+
+        app.poll_background_events();
+        assert!(!app.update_check_in_flight);
+        assert_eq!(
+            app.update_state,
+            UpdateState::UpToDate {
+                current: crate::update::CURRENT.to_owned()
+            }
+        );
+        assert_eq!(app.notice, "Commander replied.");
+        assert!(!app
+            .periodic_update_check_due_at(at_due + UPDATE_POLL_INTERVAL - Duration::from_secs(1)));
+        assert!(app.periodic_update_check_due_at(at_due + UPDATE_POLL_INTERVAL));
+    }
+
+    #[test]
+    fn periodic_update_poll_respects_settings_env_and_debug_opt_outs() {
+        let t0 = Instant::now();
+        let at_due = t0 + UPDATE_POLL_INTERVAL;
+
+        let mut app = app_with_background_channel(Some(t0));
+        assert!(app.launch_update_check());
+        assert_eq!(
+            app.automatic_update_check_enabled(),
+            !cfg!(debug_assertions)
+        );
+        if cfg!(debug_assertions) {
+            assert!(!app.maybe_poll_periodic_update(at_due));
+            assert!(!app.update_check_in_flight);
+        }
+
+        app.settings.check_for_updates = false;
+        assert!(!app.launch_update_check());
+        assert!(!app.automatic_update_check_enabled());
+        assert!(!app.periodic_update_check_due_at(at_due));
+        assert!(!app.begin_periodic_update_check(at_due, |_| {
+            panic!("must not spawn when check_for_updates is false")
+        }));
+
+        app.settings.check_for_updates = true;
+        app.launch.no_update_check = Some(OsString::from("1"));
+        assert!(!app.launch_update_check());
+        assert!(!app.automatic_update_check_enabled());
+        assert!(!app.periodic_update_check_due_at(at_due));
+        assert!(!app.begin_periodic_update_check(at_due, |_| {
+            panic!("must not spawn when AGENT_COMMAND_NO_UPDATE_CHECK=1")
+        }));
+    }
+
+    #[test]
+    fn periodic_update_poll_guards_in_flight_checking_downloading_and_legacy_receiver() {
+        let t0 = Instant::now();
+        let at_due = t0 + UPDATE_POLL_INTERVAL;
+
+        let mut in_flight = app_with_background_channel(Some(t0));
+        in_flight.update_check_in_flight = true;
+        assert!(!in_flight.periodic_update_check_due_at(at_due));
+        assert!(!in_flight
+            .begin_periodic_update_check(at_due, |_| { panic!("must not spawn while in flight") }));
+
+        let mut checking = app_with_background_channel(Some(t0));
+        checking.update_state = UpdateState::Checking;
+        assert!(!checking.periodic_update_check_due_at(at_due));
+        assert!(!checking
+            .begin_periodic_update_check(at_due, |_| { panic!("must not spawn while Checking") }));
+
+        let mut downloading = app_with_background_channel(Some(t0));
+        downloading.update_state = UpdateState::Downloading { pct: 40 };
+        assert!(!downloading.periodic_update_check_due_at(at_due));
+        assert!(!downloading.begin_periodic_update_check(at_due, |_| {
+            panic!("must not spawn while Downloading")
+        }));
+
+        let mut legacy = app_with_background_channel(Some(t0));
+        let (_sender, receiver) = mpsc::channel();
+        legacy.watch_updates(Some(receiver));
+        legacy.update_state = UpdateState::Idle;
+        assert!(!legacy.periodic_update_check_due_at(at_due));
+        assert!(!legacy.begin_periodic_update_check(at_due, |_| {
+            panic!("must not spawn while legacy update_receiver is active")
+        }));
+    }
+
+    #[test]
+    fn manual_update_check_resets_periodic_timer_and_prevents_overlap() {
+        let t0 = Instant::now();
+        let manual_at = t0 + Duration::from_secs(9 * 60);
+        let retry_at = manual_at + Duration::from_secs(1);
+
+        let mut app = app_with_background_channel(Some(t0));
+        let mut spawns = 0usize;
+        app.trigger_live_update_check_with(manual_at, |tx| {
+            spawns += 1;
+            tx.send(AppEvent::UpdateChecked(UpdateState::UpToDate {
+                current: crate::update::CURRENT.to_owned(),
+            }))
+            .unwrap();
+        });
+        assert_eq!(spawns, 1);
+        assert!(app.manual_update_check);
+        assert!(app.update_check_in_flight);
+        assert_eq!(app.last_update_check, Some(manual_at));
+        assert_eq!(app.update_state, UpdateState::Checking);
+        assert_eq!(app.notice, "Checking GitHub releases…");
+
+        app.trigger_live_update_check_with(retry_at, |_| {
+            spawns += 1;
+        });
+        assert_eq!(spawns, 1);
+        assert_eq!(app.last_update_check, Some(retry_at));
+
+        app.poll_background_events();
+        assert!(!app.update_check_in_flight);
+        assert!(!app.manual_update_check);
+        assert_eq!(
+            app.notice,
+            format!("Up to date (v{})", crate::update::CURRENT)
+        );
+        assert!(!app.periodic_update_check_due_at(t0 + UPDATE_POLL_INTERVAL));
+        assert!(!app.periodic_update_check_due_at(
+            retry_at + UPDATE_POLL_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(app.periodic_update_check_due_at(retry_at + UPDATE_POLL_INTERVAL));
+
+        app.update_state = UpdateState::Downloading { pct: 25 };
+        app.notice = "Downloading update…".into();
+        app.trigger_live_update_check_with(retry_at + UPDATE_POLL_INTERVAL, |_| {
+            spawns += 1;
+        });
+        assert_eq!(spawns, 1);
+        assert_eq!(app.update_state, UpdateState::Downloading { pct: 25 });
+        assert_eq!(app.notice, "Downloading update…");
+    }
+
+    #[test]
+    fn silent_periodic_available_updates_button_without_flicker_or_notice_clobber() {
+        let t0 = Instant::now();
+        let t1 = t0 + UPDATE_POLL_INTERVAL;
+        let t2 = t1 + UPDATE_POLL_INTERVAL;
+
+        let mut app = app_with_background_channel(Some(t0));
+        app.update_state = UpdateState::UpToDate {
+            current: crate::update::CURRENT.to_owned(),
+        };
+        app.notice = "Commander replied.".into();
+
+        assert!(!app.update_button_visible());
+        assert_eq!(app.update_button_label(120), None);
+
+        let started = app.begin_periodic_update_check(t1, |tx| {
+            tx.send(AppEvent::UpdateChecked(UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: crate::update::CURRENT.to_owned(),
+            }))
+            .unwrap();
+        });
+        assert!(started);
+        assert_eq!(app.notice, "Commander replied.");
+
+        app.poll_background_events();
+        assert!(!app.update_check_in_flight);
+        assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(80).as_deref(),
+            Some("⬆ Update v0.9.0")
+        );
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v0.9.0 (F6)")
+        );
+        assert_eq!(app.notice, "Commander replied.");
+
+        let recheck_started = app.begin_periodic_update_check(t2, |tx| {
+            tx.send(AppEvent::UpdateChecked(UpdateState::Available {
+                tag: "v0.10.0".into(),
+                current: crate::update::CURRENT.to_owned(),
+            }))
+            .unwrap();
+        });
+        assert!(recheck_started);
+        assert!(app.update_check_in_flight);
+        assert_eq!(
+            app.update_state,
+            UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: crate::update::CURRENT.to_owned(),
+            }
+        );
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v0.9.0 (F6)")
+        );
+        assert_eq!(app.notice, "Commander replied.");
+
+        app.poll_background_events();
+        assert!(!app.update_check_in_flight);
+        assert_eq!(app.update_available.as_deref(), Some("0.10.0"));
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v0.10.0 (F6)")
+        );
+        assert_eq!(app.notice, "Commander replied.");
+    }
+
+    #[test]
+    fn silent_failed_check_preserves_existing_available_and_notice() {
+        let mut app = App {
+            update_available: Some("0.9.0".into()),
+            update_state: UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: crate::update::CURRENT.to_owned(),
+            },
+            update_check_in_flight: true,
+            manual_update_check: false,
+            notice: "Keep existing notice".into(),
+            ..App::default()
+        };
+
+        app.apply_background_event(AppEvent::UpdateChecked(UpdateState::Failed(
+            "temporarily offline".into(),
+        )));
+
+        assert!(!app.update_check_in_flight);
+        assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            app.update_state,
+            UpdateState::Available {
+                tag: "v0.9.0".into(),
+                current: crate::update::CURRENT.to_owned(),
+            }
+        );
+        assert!(app.update_button_visible());
+        assert_eq!(
+            app.update_button_label(120).as_deref(),
+            Some("⬆ Update v0.9.0 (F6)")
+        );
+        assert_eq!(app.notice, "Keep existing notice");
+
+        let mut no_prior = App {
+            update_state: UpdateState::Checking,
+            update_check_in_flight: true,
+            manual_update_check: false,
+            notice: "Keep existing notice".into(),
+            ..App::default()
+        };
+        no_prior.apply_background_event(AppEvent::UpdateChecked(UpdateState::Failed(
+            "offline".into(),
+        )));
+        assert!(!no_prior.update_check_in_flight);
+        assert!(no_prior.update_available.is_none());
+        assert_eq!(no_prior.update_state, UpdateState::Failed("offline".into()));
+        assert!(!no_prior.update_button_visible());
+        assert_eq!(no_prior.notice, "Keep existing notice");
+    }
+
+    #[test]
+    fn late_update_checked_and_legacy_poll_never_clobber_downloading() {
+        for late_state in [
+            UpdateState::UpToDate {
+                current: crate::update::CURRENT.to_owned(),
+            },
+            UpdateState::Available {
+                tag: "v0.9.1".into(),
+                current: crate::update::CURRENT.to_owned(),
+            },
+            UpdateState::Failed("network reset".into()),
+        ] {
+            let mut app = App {
+                update_available: Some("0.9.0".into()),
+                update_state: UpdateState::Downloading { pct: 60 },
+                update_check_in_flight: true,
+                manual_update_check: true,
+                notice: "Updating…".into(),
+                ..App::default()
+            };
+            app.apply_background_event(AppEvent::UpdateChecked(late_state));
+            assert!(!app.update_check_in_flight);
+            assert!(!app.manual_update_check);
+            assert_eq!(app.update_state, UpdateState::Downloading { pct: 60 });
+            assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+            assert_eq!(
+                app.update_button_label(120).as_deref(),
+                Some("⬇ Updating 60%")
+            );
+            assert_eq!(app.notice, "Updating…");
+        }
+
+        let mut app = App {
+            update_available: Some("0.9.0".into()),
+            update_state: UpdateState::Downloading { pct: 60 },
+            ..App::default()
+        };
+        let (sender, receiver) = mpsc::channel();
+        app.watch_updates(Some(receiver));
+        sender.send("9.9.9".into()).unwrap();
+        app.poll_update();
+        assert_eq!(app.update_state, UpdateState::Downloading { pct: 60 });
+        assert_eq!(app.update_available.as_deref(), Some("0.9.0"));
+        assert!(app.update_receiver.is_none());
+
+        let mut in_flight_app = App {
+            update_state: UpdateState::Checking,
+            update_check_in_flight: true,
+            ..App::default()
+        };
+        let (sender, receiver) = mpsc::channel::<String>();
+        in_flight_app.watch_updates(Some(receiver));
+        drop(sender);
+        in_flight_app.poll_update();
+        assert_eq!(in_flight_app.update_state, UpdateState::Checking);
+        assert!(in_flight_app.update_receiver.is_none());
     }
 }

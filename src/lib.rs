@@ -603,10 +603,12 @@ pub struct App {
     pub show_settled: bool,
     touch_clock: u64,
     pub deck_palette: token_burn::TokenBurnPalette,
-    update_receiver: Option<Receiver<String>>,
+    pub(crate) update_receiver: Option<Receiver<String>>,
     pub update_available: Option<String>,
     pub update_state: update::UpdateState,
     pub(crate) manual_update_check: bool,
+    pub(crate) last_update_check: Option<Instant>,
+    pub(crate) update_check_in_flight: bool,
     pub update_area: Rect,
     exit_message: Option<String>,
     pub(crate) relaunch_executable: Option<PathBuf>,
@@ -696,6 +698,8 @@ impl Default for App {
             update_available: None,
             update_state: update::UpdateState::Idle,
             manual_update_check: false,
+            last_update_check: None,
+            update_check_in_flight: false,
             update_area: Rect::default(),
             exit_message: None,
             relaunch_executable: None,
@@ -1737,20 +1741,29 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(latest) => {
-                self.update_state = update::UpdateState::Available {
-                    tag: format!("v{latest}"),
-                    current: update::CURRENT.to_owned(),
-                };
-                self.update_available = Some(latest);
+                if !matches!(self.update_state, update::UpdateState::Downloading { .. }) {
+                    self.update_state = update::UpdateState::Available {
+                        tag: format!("v{latest}"),
+                        current: update::CURRENT.to_owned(),
+                    };
+                    self.update_available = Some(latest);
+                }
+                if self.last_update_check.is_some() {
+                    self.last_update_check = Some(Instant::now());
+                }
                 self.update_receiver = None;
             }
             Err(TryRecvError::Disconnected) => {
                 if self.update_available.is_none()
+                    && !self.update_check_in_flight
                     && self.update_state == update::UpdateState::Checking
                 {
                     self.update_state = update::UpdateState::UpToDate {
                         current: update::CURRENT.to_owned(),
                     };
+                }
+                if !self.update_check_in_flight && self.last_update_check.is_some() {
+                    self.last_update_check = Some(Instant::now());
                 }
                 self.update_receiver = None;
             }
