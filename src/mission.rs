@@ -724,6 +724,120 @@ pub fn build_provider_arguments(
     }
 }
 
+const BENIGN_STDERR_WARNINGS: [&str; 11] = [
+    "warning: 256-color support not detected",
+    "warning: true color (24-bit) support not detected",
+    "warning: basic terminal detected",
+    "warning: limited color support detected",
+    "warning: windows 10 detected",
+    "warning: gnu screen detected",
+    "warning: jetbrains terminal detected",
+    "ripgrep is not available",
+    "experimentalwarning:",
+    "deprecationwarning:",
+    "(use `node --trace-",
+];
+
+fn is_benign_stderr_warning(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    BENIGN_STDERR_WARNINGS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+fn is_critical_stderr_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    const CRITICAL_SIGNALS: [&str; 20] = [
+        "an unexpected critical error occurred",
+        "critical error",
+        "fatal:",
+        "error:",
+        "authentication failed",
+        "failed to authenticate",
+        "authentication required",
+        "not logged in",
+        "unauthorized",
+        "invalid api key",
+        "invalid_grant",
+        "sign in first",
+        "no longer supported",
+        "migrate to",
+        "no conversation found",
+        "session not found",
+        "no such session",
+        "thread not found",
+        "no such thread",
+        "panicked at",
+    ];
+    CRITICAL_SIGNALS.iter().any(|signal| lower.contains(signal))
+}
+
+fn non_benign_stderr_lines(stderr_lines: &[String]) -> Vec<&str> {
+    stderr_lines
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_benign_stderr_warning(line))
+        .collect()
+}
+
+fn push_stderr_tail(lines: &mut Vec<String>, line: String) {
+    if lines.len() < STDERR_TAIL_LIMIT {
+        lines.push(line);
+        return;
+    }
+    if is_benign_stderr_warning(&line) {
+        if let Some(pos) = lines
+            .iter()
+            .position(|entry| is_benign_stderr_warning(entry))
+        {
+            lines.remove(pos);
+            lines.push(line);
+        }
+        return;
+    }
+    if let Some(pos) = lines
+        .iter()
+        .position(|entry| is_benign_stderr_warning(entry))
+    {
+        lines.remove(pos);
+    } else {
+        lines.remove(0);
+    }
+    lines.push(line);
+}
+
+fn summarize_stderr_for_error(captured: &[String]) -> String {
+    let relevant = non_benign_stderr_lines(captured);
+    if !relevant.is_empty() {
+        let critical: Vec<&str> = relevant
+            .iter()
+            .copied()
+            .filter(|line| is_critical_stderr_line(line))
+            .collect();
+        if !critical.is_empty() {
+            return critical.join(" | ");
+        }
+        return relevant.join(" | ");
+    }
+    captured
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn format_exit_detail(status_label: &str, captured: &[String]) -> String {
+    let summary = summarize_stderr_for_error(captured);
+    if summary.is_empty() {
+        format!("Provider exited with {status_label}")
+    } else {
+        format!("Provider exited with {status_label}: {summary}")
+    }
+}
+
 pub fn classify_health(stderr_lines: &[String], io_error: Option<&io::Error>) -> HealthCode {
     if let Some(err) = io_error {
         match err.kind() {
@@ -732,17 +846,22 @@ pub fn classify_health(stderr_lines: &[String], io_error: Option<&io::Error>) ->
             _ => {}
         }
     }
-    let joined = stderr_lines.join("\n").to_ascii_lowercase();
-    const AUTH_SIGNALS: [&str; 9] = [
+    let joined = non_benign_stderr_lines(stderr_lines)
+        .join("\n")
+        .to_ascii_lowercase();
+    const AUTH_SIGNALS: [&str; 12] = [
         "not logged in",
         "authentication failed",
         "failed to authenticate",
+        "authentication required",
         "unauthorized",
         "invalid api key",
         "invalid_grant",
         "oauth",
         "credentials",
         "sign in first",
+        "no longer supported",
+        "migrate to",
     ];
     if AUTH_SIGNALS.iter().any(|signal| joined.contains(signal)) {
         return HealthCode::AgentAuth;
@@ -2489,10 +2608,7 @@ fn run(
             let mut guard = stderr_collect
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if guard.len() >= STDERR_TAIL_LIMIT {
-                guard.remove(0);
-            }
-            guard.push(trimmed.to_owned());
+            push_stderr_tail(&mut guard, trimmed.to_owned());
         }
     });
 
@@ -2634,11 +2750,7 @@ fn run(
             });
         }
         let code = classify_health(&captured, None);
-        let detail = if captured.is_empty() {
-            format!("Provider exited with {status}")
-        } else {
-            format!("Provider exited with {status}: {}", captured.join(" | "))
-        };
+        let detail = format_exit_detail(&status.to_string(), &captured);
         let _ = norm_sender.send(NormalizedEvent::TurnFinished {
             interrupted: false,
             is_error: true,
@@ -3242,9 +3354,112 @@ mod engine_tests {
             HealthCode::AgentAuth
         );
         assert_eq!(
+            classify_health(
+                &[
+                    "Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.".into(),
+                    "Ripgrep is not available. Falling back to GrepTool.".into(),
+                    "An unexpected critical error occurred: This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google".into(),
+                ],
+                None
+            ),
+            HealthCode::AgentAuth
+        );
+        assert_eq!(
+            classify_health(
+                &["Please migrate to the Antigravity suite of products".into()],
+                None
+            ),
+            HealthCode::AgentAuth
+        );
+        assert_eq!(
+            classify_health(&["This client is no longer supported".into()], None),
+            HealthCode::AgentAuth
+        );
+        assert_eq!(
+            classify_health(
+                &[
+                    "(node:1234) DeprecationWarning: punycode is deprecated; please migrate to userland".into(),
+                    "fatal: disk full".into(),
+                ],
+                None
+            ),
+            HealthCode::AgentFailed
+        );
+        assert_eq!(
             classify_health(&["fatal: disk full".into()], None),
             HealthCode::AgentFailed
         );
+    }
+
+    #[test]
+    fn stderr_error_summary_filters_benign_warnings_prioritizes_critical_lines_and_falls_back() {
+        let gemini_live = vec![
+            "Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.".to_owned(),
+            "Ripgrep is not available. Falling back to GrepTool.".to_owned(),
+            "An unexpected critical error occurred: This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google".to_owned(),
+        ];
+        assert_eq!(
+            format_exit_detail("exit code: 1", &gemini_live),
+            "Provider exited with exit code: 1: An unexpected critical error occurred: This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google"
+        );
+
+        let mixed_chatter = vec![
+            "Warning: 256-color support not detected.".to_owned(),
+            "Initializing MCP servers...".to_owned(),
+            "Error: request rejected by upstream".to_owned(),
+            "    at main (cli.js:12:4)".to_owned(),
+        ];
+        assert_eq!(
+            format_exit_detail("exit code: 1", &mixed_chatter),
+            "Provider exited with exit code: 1: Error: request rejected by upstream"
+        );
+
+        let non_critical_only = vec![
+            "Ripgrep is not available. Falling back to GrepTool.".to_owned(),
+            "Connection reset by peer".to_owned(),
+        ];
+        assert_eq!(
+            format_exit_detail("exit code: 2", &non_critical_only),
+            "Provider exited with exit code: 2: Connection reset by peer"
+        );
+
+        let all_benign = vec![
+            "Warning: 256-color support not detected.".to_owned(),
+            "Ripgrep is not available. Falling back to GrepTool.".to_owned(),
+        ];
+        assert_eq!(
+            format_exit_detail("exit code: 1", &all_benign),
+            "Provider exited with exit code: 1: Warning: 256-color support not detected. | Ripgrep is not available. Falling back to GrepTool."
+        );
+
+        assert_eq!(
+            format_exit_detail("exit code: 1", &[]),
+            "Provider exited with exit code: 1"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_preserves_fatal_lines_over_trailing_benign_warnings() {
+        let mut tail = Vec::new();
+        push_stderr_tail(&mut tail, "Error: fatal failure".to_owned());
+        for i in 0..(STDERR_TAIL_LIMIT + 5) {
+            push_stderr_tail(
+                &mut tail,
+                format!("Warning: 256-color support not detected. ({i})"),
+            );
+        }
+        assert_eq!(tail.len(), STDERR_TAIL_LIMIT);
+        assert!(tail.iter().any(|line| line == "Error: fatal failure"));
+        assert_eq!(summarize_stderr_for_error(&tail), "Error: fatal failure");
+
+        let mut all_benign = Vec::new();
+        for i in 0..(STDERR_TAIL_LIMIT + 3) {
+            push_stderr_tail(&mut all_benign, format!("Ripgrep is not available. ({i})"));
+        }
+        assert_eq!(all_benign.len(), STDERR_TAIL_LIMIT);
+        assert!(all_benign
+            .last()
+            .is_some_and(|line| line.ends_with(&format!("({})", STDERR_TAIL_LIMIT + 2))));
     }
 
     #[test]

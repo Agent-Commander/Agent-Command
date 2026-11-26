@@ -106,6 +106,62 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.bottom()
 }
 
+fn current_turn_start(entries: &[TranscriptEntry]) -> usize {
+    entries
+        .iter()
+        .rposition(|entry| matches!(entry, TranscriptEntry::UserMessage { .. }))
+        .map_or(0, |idx| idx + 1)
+}
+
+fn provider_stderr_prefix(name: &str) -> String {
+    format!("stderr-{name}-turn-")
+}
+
+fn is_open_provider_stderr_id(id: &str, prefix: &str) -> bool {
+    id.starts_with(prefix) && !id.ends_with("-done")
+}
+
+fn parse_stderr_turn_number(id: &str, prefix: &str) -> Option<usize> {
+    let rest = id.strip_prefix(prefix)?;
+    let number = rest.strip_suffix("-done").unwrap_or(rest);
+    number.parse().ok()
+}
+
+fn next_provider_stderr_call_id(entries: &[TranscriptEntry], name: &str) -> String {
+    let prefix = provider_stderr_prefix(name);
+    let max_existing = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::ToolCallCard { call_id, .. } => {
+                parse_stderr_turn_number(call_id, &prefix)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let user_turns = entries
+        .iter()
+        .filter(|entry| matches!(entry, TranscriptEntry::UserMessage { .. }))
+        .count();
+    let next_turn = (max_existing + 1).max(user_turns.max(1));
+    format!("{prefix}{next_turn}")
+}
+
+fn pop_trailing_turn_error_notice(entries: &mut Vec<TranscriptEntry>) {
+    let turn_start = current_turn_start(entries);
+    if entries.len() > turn_start
+        && matches!(
+            entries.last(),
+            Some(TranscriptEntry::SystemNotice {
+                level: NoticeLevel::Error,
+                ..
+            })
+        )
+    {
+        entries.pop();
+    }
+}
+
 fn summarize_permission_command(input: &serde_json::Value) -> String {
     if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
         return cmd.to_owned();
@@ -933,6 +989,7 @@ impl App {
             } => {
                 self.transcript_for_mut(name).finish_assistant_stream();
                 if interrupted {
+                    self.finish_turn_provider_stderr(name, false);
                     self.transcript_for_mut(name)
                         .push(TranscriptEntry::SystemNotice {
                             level: NoticeLevel::Warning,
@@ -946,7 +1003,7 @@ impl App {
                             }
                         }
                     }
-                    self.mark_provider_stderr_failed(name);
+                    self.finish_turn_provider_stderr(name, true);
                     if error_code == Some(HealthCode::AgentAuth) {
                         self.transcript_for_mut(name)
                             .push(TranscriptEntry::InlineConnectCard {
@@ -961,12 +1018,29 @@ impl App {
                                 resolved: false,
                             });
                     } else if !final_text.is_empty() {
-                        self.transcript_for_mut(name)
-                            .push(TranscriptEntry::SystemNotice {
+                        let transcript = self.transcript_for_mut(name);
+                        let turn_start = current_turn_start(&transcript.entries);
+                        let already_shown =
+                            transcript.entries[turn_start..]
+                                .last()
+                                .is_some_and(|entry| {
+                                    matches!(
+                                        entry,
+                                        TranscriptEntry::SystemNotice {
+                                            level: NoticeLevel::Error,
+                                            text,
+                                        } if text == &final_text
+                                    )
+                                });
+                        if !already_shown {
+                            transcript.push(TranscriptEntry::SystemNotice {
                                 level: NoticeLevel::Error,
                                 text: final_text,
                             });
+                        }
                     }
+                } else {
+                    self.finish_turn_provider_stderr(name, false);
                 }
                 if is_commander {
                     self.persist_commander_transcript();
@@ -1236,11 +1310,11 @@ impl App {
     }
 
     pub fn interrupt_all_runs(&mut self) {
-        let mut had_runs = false;
+        let mut cancelled_names = Vec::new();
         if let Some(live) = &mut self.live {
             let cancelled = std::mem::take(&mut live.runs);
-            had_runs = !cancelled.is_empty();
             for run in cancelled {
+                cancelled_names.push(run.name.clone());
                 run.mission.interrupt();
                 drop(run);
             }
@@ -1248,6 +1322,10 @@ impl App {
             live.pending_prod_gates.clear();
             live.queue.clear();
         }
+        for name in &cancelled_names {
+            self.finish_turn_provider_stderr(name, false);
+        }
+        let had_runs = !cancelled_names.is_empty();
         self.composer.clear_queued();
         self.composer.set_running(false);
         for member in &mut self.crew {
@@ -1270,16 +1348,22 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
-        let call_id = format!("stderr-{name}");
+        let prefix = provider_stderr_prefix(name);
         let transcript = self.transcript_for_mut(name);
+        let turn_start = current_turn_start(&transcript.entries);
         if let Some(TranscriptEntry::ToolCallCard {
             summary, output, ..
-        }) = transcript.entries.iter_mut().rev().find(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::ToolCallCard { call_id: id, .. } if id == &call_id
-            )
-        }) {
+        }) = transcript.entries[turn_start..]
+            .iter_mut()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::ToolCallCard { call_id, .. }
+                        if is_open_provider_stderr_id(call_id, &prefix)
+                )
+            })
+        {
             if !output.is_empty() {
                 output.push('\n');
             }
@@ -1289,6 +1373,7 @@ impl App {
             *summary = format!("{count} {noun} · Ctrl+E to expand");
             return;
         }
+        let call_id = next_provider_stderr_call_id(&transcript.entries, name);
         transcript.push(TranscriptEntry::ToolCallCard {
             call_id,
             kind: ToolKind::Other,
@@ -1302,20 +1387,37 @@ impl App {
         });
     }
 
-    pub(crate) fn mark_provider_stderr_failed(&mut self, name: &str) {
-        let call_id = format!("stderr-{name}");
+    fn finish_turn_provider_stderr(&mut self, name: &str, failed: bool) {
+        let prefix = provider_stderr_prefix(name);
         let transcript = self.transcript_for_mut(name);
-        if let Some(TranscriptEntry::ToolCallCard { ok, collapsed, .. }) =
-            transcript.entries.iter_mut().rev().find(|entry| {
+        let turn_start = current_turn_start(&transcript.entries);
+        if let Some(TranscriptEntry::ToolCallCard {
+            call_id,
+            ok,
+            collapsed,
+            ..
+        }) = transcript.entries[turn_start..]
+            .iter_mut()
+            .rev()
+            .find(|entry| {
                 matches!(
                     entry,
-                    TranscriptEntry::ToolCallCard { call_id: id, .. } if id == &call_id
+                    TranscriptEntry::ToolCallCard { call_id, .. }
+                        if is_open_provider_stderr_id(call_id, &prefix)
                 )
             })
         {
-            *ok = Some(false);
-            *collapsed = false;
+            if failed {
+                *ok = Some(false);
+                *collapsed = false;
+            }
+            call_id.push_str("-done");
         }
+    }
+
+    pub(crate) fn mark_provider_stderr_failed(&mut self, name: &str) {
+        self.finish_turn_provider_stderr(name, true);
+        pop_trailing_turn_error_notice(&mut self.transcript_for_mut(name).entries);
     }
 
     pub fn run_shell_command(&mut self, command: String) {
@@ -2434,5 +2536,312 @@ mod tests {
         in_flight_app.poll_update();
         assert_eq!(in_flight_app.update_state, UpdateState::Checking);
         assert!(in_flight_app.update_receiver.is_none());
+    }
+
+    #[test]
+    fn provider_stderr_cards_are_scoped_per_turn_and_never_glue_across_turns() {
+        let mut app = App::default();
+        app.transcript.push(TranscriptEntry::ToolCallCard {
+            call_id: "stderr-Commander".into(),
+            kind: ToolKind::Other,
+            name: "Provider stderr".into(),
+            summary: "1 line · Ctrl+E to expand".into(),
+            output: "legacy prior session stderr".into(),
+            ok: Some(true),
+            exit_code: None,
+            duration_ms: None,
+            collapsed: true,
+        });
+
+        app.transcript.push_user("first turn", None);
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::StderrLine("18:06 claude warning".into()),
+        );
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: false,
+                error_code: None,
+                final_text: String::new(),
+            },
+        );
+
+        app.transcript.push_user("second turn", None);
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::StderrLine("19:15 gemini warning".into()),
+        );
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::StderrLine("19:15 gemini fatal".into()),
+        );
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentFailed),
+                final_text: "gemini failed".into(),
+            },
+        );
+
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::StderrLine("third turn without user prompt".into()),
+        );
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: false,
+                error_code: None,
+                final_text: String::new(),
+            },
+        );
+
+        app.transcript.push_user("fourth turn with no stderr", None);
+        app.handle_normalized_event(
+            specialists::COMMANDER,
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentFailed),
+                final_text: "spawn failed".into(),
+            },
+        );
+
+        let cards: Vec<(&str, &str, Option<bool>, bool)> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::ToolCallCard {
+                    call_id,
+                    name,
+                    output,
+                    ok,
+                    collapsed,
+                    ..
+                } if name == "Provider stderr" => {
+                    Some((call_id.as_str(), output.as_str(), *ok, *collapsed))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(cards.len(), 4);
+        assert_eq!(
+            cards[0],
+            (
+                "stderr-Commander",
+                "legacy prior session stderr",
+                Some(true),
+                true
+            )
+        );
+        assert_eq!(
+            cards[1],
+            (
+                "stderr-Commander-turn-1-done",
+                "18:06 claude warning",
+                Some(true),
+                true
+            )
+        );
+        assert_eq!(
+            cards[2],
+            (
+                "stderr-Commander-turn-2-done",
+                "19:15 gemini warning\n19:15 gemini fatal",
+                Some(false),
+                false
+            )
+        );
+        assert_eq!(
+            cards[3],
+            (
+                "stderr-Commander-turn-3-done",
+                "third turn without user prompt",
+                Some(true),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn failed_commander_turn_emits_single_error_notice_across_turn_finished_and_event_finished() {
+        let workspace = std::env::temp_dir().join(format!(
+            "agent-command-stderr-dedup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (mut mission, event_tx) = crate::mission::Mission::held();
+        let (norm_tx, norm_rx) = mpsc::channel();
+        mission.normalized = norm_rx;
+        let mut live = crate::Live::new(workspace.clone(), Vec::new(), None);
+        live.runs
+            .push(crate::Run::new(specialists::COMMANDER, mission, false));
+
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+        app.transcript.push_user("run task", None);
+
+        let detail = "Provider exited with exit code: 1: client unsupported";
+        norm_tx
+            .send(NormalizedEvent::StderrLine("client unsupported".into()))
+            .unwrap();
+        norm_tx
+            .send(NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentFailed),
+                final_text: detail.into(),
+            })
+            .unwrap();
+        event_tx
+            .send(crate::mission::Event::Finished(Err(std::io::Error::other(
+                detail,
+            ))))
+            .unwrap();
+
+        app.poll_mission();
+
+        let error_notices: Vec<&str> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::SystemNotice {
+                    level: NoticeLevel::Error,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(error_notices, vec![format!("Commander: {detail}")]);
+
+        let stderr_cards: Vec<(&str, Option<bool>, bool)> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::ToolCallCard {
+                    call_id,
+                    name,
+                    ok,
+                    collapsed,
+                    ..
+                } if name == "Provider stderr" => Some((call_id.as_str(), *ok, *collapsed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stderr_cards,
+            vec![("stderr-Commander-turn-1-done", Some(false), false)]
+        );
+
+        let (mut ok_mission, ok_event_tx) = crate::mission::Mission::held();
+        let (ok_norm_tx, ok_norm_rx) = mpsc::channel();
+        ok_mission.normalized = ok_norm_rx;
+        app.live.as_mut().unwrap().runs.push(crate::Run::new(
+            specialists::COMMANDER,
+            ok_mission,
+            false,
+        ));
+        app.transcript.push_user("exit zero error", None);
+        ok_norm_tx
+            .send(NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentFailed),
+                final_text: "API error on exit 0".into(),
+            })
+            .unwrap();
+        ok_event_tx
+            .send(crate::mission::Event::Finished(Ok(())))
+            .unwrap();
+        app.poll_mission();
+
+        let error_notices_after_ok: Vec<&str> = app
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::SystemNotice {
+                    level: NoticeLevel::Error,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            error_notices_after_ok,
+            vec![
+                format!("Commander: {detail}"),
+                "API error on exit 0".to_owned()
+            ]
+        );
+
+        let (mut auth_mission, auth_event_tx) = crate::mission::Mission::held();
+        let (auth_norm_tx, auth_norm_rx) = mpsc::channel();
+        auth_mission.normalized = auth_norm_rx;
+        app.live.as_mut().unwrap().runs.push(crate::Run::new(
+            specialists::COMMANDER,
+            auth_mission,
+            false,
+        ));
+        app.transcript.push_user("auth failure turn", None);
+        auth_norm_tx
+            .send(NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentAuth),
+                final_text: "reauth required".into(),
+            })
+            .unwrap();
+        auth_event_tx
+            .send(crate::mission::Event::Finished(Err(std::io::Error::other(
+                "reauth required",
+            ))))
+            .unwrap();
+        app.poll_mission();
+
+        let connect_cards = app
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::InlineConnectCard { .. }))
+            .count();
+        assert_eq!(connect_cards, 1);
+
+        app.handle_normalized_event(
+            "builder",
+            NormalizedEvent::TurnFinished {
+                interrupted: false,
+                is_error: true,
+                error_code: Some(HealthCode::AgentFailed),
+                final_text: "specialist error".into(),
+            },
+        );
+        let specialist_errors: Vec<&str> = app
+            .transcript_for_mut("builder")
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::SystemNotice {
+                    level: NoticeLevel::Error,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(specialist_errors, vec!["specialist error"]);
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }
