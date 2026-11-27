@@ -32,6 +32,7 @@ mod review;
 pub mod routing;
 pub mod settings;
 mod side;
+pub mod sim;
 pub mod soul;
 mod specialists;
 mod targeting;
@@ -234,6 +235,7 @@ pub(crate) struct Live {
     pub vault_store: Option<vault::VaultStore>,
     pub memory_store: Option<memory::MemoryStore>,
     pub evolution_store: Option<evolution::EvolutionStore>,
+    pub sim_store: Option<sim::SimStore>,
 }
 
 const MAX_PARALLEL_SPECIALISTS: usize = 4;
@@ -314,6 +316,9 @@ impl Live {
         let evolution_store = profile_root
             .clone()
             .map(|root| evolution::EvolutionStore::for_workspace(root, &workspace));
+        let sim_store = profile_root
+            .clone()
+            .map(|root| sim::SimStore::for_workspace(root, &workspace));
         Self {
             workspace,
             profiles,
@@ -349,6 +354,7 @@ impl Live {
             vault_store,
             memory_store,
             evolution_store,
+            sim_store,
         }
     }
 
@@ -1781,8 +1787,9 @@ impl App {
             let now = chrono::Utc::now().timestamp();
             let evolution = live.evolution_store.as_ref();
             let memory = live.memory_store.as_ref();
+            let sim = live.sim_store.as_ref();
             let request = framed(routing::parse(&delegation.task)?, |unit| {
-                specialists::specialist_prompt_for_stores(member, unit, evolution, memory, now)
+                specialists::specialist_prompt_for_stores(member, unit, evolution, memory, sim, now)
             });
             (request, member.permission)
         };
@@ -2068,6 +2075,9 @@ impl App {
             }
             specialists::Command::Memory { subcommand, rest } => {
                 self.handle_memory_command(&subcommand, rest.as_deref());
+            }
+            specialists::Command::Sim { subcommand, rest } => {
+                self.handle_sim_command(&subcommand, rest.as_deref());
             }
             specialists::Command::Help => {
                 self.show_help_in_transcript();
@@ -2534,6 +2544,73 @@ impl App {
                 self.notice = "Usage: /bot {scorecard|forge|evolve|decommission} [ARGS]".into();
             }
         }
+    }
+
+    fn handle_sim_command(&mut self, subcommand: &str, rest: Option<&str>) {
+        let Some(store) = self.live.as_ref().and_then(|live| live.sim_store.clone()) else {
+            self.notice = PREVIEW_NOTICE.into();
+            return;
+        };
+        let raw = rest.unwrap_or_default().trim();
+        match subcommand {
+            "search" => match store.search(
+                raw,
+                &sim::SimFilter::default(),
+                sim::CARD_PROBLEMS,
+                sim::DEFAULT_TOKEN_BUDGET,
+            ) {
+                Ok(result) => {
+                    let problems: Vec<sim::SimProblem> =
+                        result.hits.into_iter().map(|hit| hit.problem).collect();
+                    self.push_sim_card(format!("SIM Search: {raw}"), &problems);
+                }
+                Err(error) => self.notice = format!("SIM search failed: {error}"),
+            },
+            "recent" => match store.recent(&sim::SimFilter::default(), sim::CARD_PROBLEMS) {
+                Ok(problems) => self.push_sim_card("SIM Recent".to_owned(), &problems),
+                Err(error) => self.notice = format!("SIM recent failed: {error}"),
+            },
+            "log" => {
+                let Some(input) = sim::operator_log_input(raw) else {
+                    self.notice = "Usage: /sim log PROBLEM | ATTEMPT".into();
+                    return;
+                };
+                match store.log_attempt(input, chrono::Utc::now().timestamp()) {
+                    Ok(outcome) => {
+                        let msg = format!(
+                            "Logged SIM {} attempt {} on {} ({} attempt(s)).",
+                            outcome.attempt.outcome.label(),
+                            outcome.attempt.attempt_id,
+                            outcome.problem_id,
+                            outcome.attempt_count
+                        );
+                        self.notice = msg.clone();
+                        self.transcript
+                            .push(markdown::TranscriptEntry::SystemNotice {
+                                level: markdown::NoticeLevel::Success,
+                                text: msg,
+                            });
+                    }
+                    Err(error) => self.notice = format!("SIM log refused: {error}"),
+                }
+            }
+            _ => self.notice = "Usage: /sim {search QUERY | recent | log PROBLEM | ATTEMPT}".into(),
+        }
+    }
+
+    fn push_sim_card(&mut self, title: String, problems: &[sim::SimProblem]) {
+        if problems.is_empty() {
+            self.notice = format!("{title}: no SIM problems matched.");
+            return;
+        }
+        self.transcript.push(markdown::TranscriptEntry::InfoCard {
+            title,
+            level: "info".into(),
+            badge: Some(format!("{} problem(s)", problems.len())),
+            fields: sim::card_fields(problems),
+            body_markdown: String::new(),
+        });
+        self.notice = format!("Found {} SIM problem(s).", problems.len());
     }
 
     fn handle_memory_command(&mut self, subcommand: &str, rest: Option<&str>) {
@@ -5788,6 +5865,41 @@ esac
         app.submit_text("/bot decommission sentinel --confirm Retired".into());
         assert!(app.decommissioned_bots.contains("sentinel"));
         assert!(!app.bot_badges.contains_key("sentinel"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sim_slash_commands_log_search_and_list_isolated_attempts() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-command-sim-tui-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let root = base.join("profiles");
+        let workspace = base.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut app = App::from_live(Live::new(workspace, Vec::new(), Some(root)));
+
+        app.submit_text("/sim recent".into());
+        assert!(app.notice.contains("no SIM problems matched"));
+        app.submit_text("/sim log Torn checkpoint | Wrote the fence in place".into());
+        assert!(app.notice.contains("Logged SIM failed attempt"));
+        app.submit_text("/sim log Torn checkpoint | worked: Synced the parent directory".into());
+        assert!(app.notice.contains("(2 attempt(s))"));
+        app.submit_text("/sim search checkpoint".into());
+        assert!(app.notice.contains("Found 1 SIM problem"));
+        assert!(app.transcript.entries.iter().any(|entry| matches!(
+            entry,
+            markdown::TranscriptEntry::InfoCard { title, fields, .. }
+                if title == "SIM Search: checkpoint"
+                    && fields.iter().any(|(_, body)| body.contains("Avoid: Do not repeat: Wrote the fence in place"))
+        )));
+        app.submit_text("/sim recent".into());
+        assert!(app.notice.contains("Found 1 SIM problem"));
+        app.submit_text("/memory search checkpoint".into());
+        assert!(app.notice.contains("No shared memory matched"));
+        app.submit_text("/sim log missing separator".into());
+        assert!(app.notice.contains("Usage: /sim"));
 
         let _ = fs::remove_dir_all(&base);
     }

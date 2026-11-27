@@ -4,7 +4,7 @@ use crate::{
         self, DistilledLesson, MemoryKind, MemoryOrigin, MemoryScope, MemoryStore, WriteMemoryInput,
     },
     permissions::PermissionMode,
-    soul, specialists,
+    sim, soul, specialists,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1779,6 +1779,151 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+pub const SIM_EVOLUTION_DOMAIN: &str = "bot-evolution";
+
+pub fn sim_attempt_for_mutation(
+    record: &BotRecord,
+    request: &MutateBotRequest,
+    revision: &CharterRevision,
+) -> sim::LogAttemptInput {
+    let bot_id = record.blueprint.bot_id.clone();
+    let failure_mode = request.failure_mode.label();
+    let avoid_guidance = request
+        .memory_correction
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "Do not repeat the approach that charter v{} replaced: {}. Keep the charter anti-jobs and verification bar; they exist to block {failure_mode}.",
+                revision.version,
+                request.root_cause.trim()
+            )
+        });
+    sim::LogAttemptInput {
+        title: clip_chars(request.root_cause.trim(), sim::MAX_TITLE_CHARS),
+        component: Some(record.blueprint.work_class.label().to_owned()),
+        domain: Some(SIM_EVOLUTION_DOMAIN.to_owned()),
+        problem_tags: vec!["bot-evolve".to_owned(), failure_mode.to_owned()],
+        outcome: Some(sim::SimOutcome::Failed),
+        attempt_summary: clip_chars(
+            &format!(
+                "{bot_id} failed ({failure_mode}): {}",
+                request.task_summary.trim()
+            ),
+            sim::MAX_TEXT_CHARS,
+        ),
+        rationale: clip_chars(
+            &format!(
+                "Proposed charter v{}: {}",
+                revision.version,
+                revision.diff_summary.join("; ")
+            ),
+            sim::MAX_TEXT_CHARS,
+        ),
+        predicted_outcome: format!(
+            "Charter v{} passes {} probation run(s).",
+            revision.version, revision.probation_required
+        ),
+        observed_outcome: clip_chars(request.root_cause.trim(), sim::MAX_TEXT_CHARS),
+        avoid_guidance: clip_chars(&avoid_guidance, sim::MAX_TEXT_CHARS),
+        bot_id: Some(bot_id),
+        model: sim_model_label(record),
+        charter_revision: Some(revision.version),
+        tags: vec!["charter-mutation".to_owned(), failure_mode.to_owned()],
+        ..sim::LogAttemptInput::default()
+    }
+}
+
+pub fn sim_attempt_for_feedback(
+    record: &BotRecord,
+    report: &FeedbackReport,
+    task_id: Option<&str>,
+    note: Option<&str>,
+) -> Option<sim::LogAttemptInput> {
+    let bot_id = record.blueprint.bot_id.clone();
+    let observed = note
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| clip_chars(text, sim::MAX_TEXT_CHARS))
+        .unwrap_or_default();
+    let (outcome, revision, summary, avoid_guidance, tag) = match &report.action {
+        HealthAction::PromoteProbation { revision } => (
+            sim::SimOutcome::Worked,
+            Some(*revision),
+            format!("Charter v{revision} of {bot_id} passed probation and was promoted."),
+            String::new(),
+            "probation-promoted",
+        ),
+        HealthAction::RollbackProbation {
+            from_rev,
+            to_rev,
+            reason,
+        } => (
+            sim::SimOutcome::Reverted,
+            Some(*from_rev),
+            format!("Charter v{from_rev} of {bot_id} was rolled back to v{to_rev}: {reason}"),
+            format!(
+                "Do not reapply charter v{from_rev} unchanged ({reason}). Keep the last known good v{to_rev} safeguards that the rollback restored."
+            ),
+            "probation-rollback",
+        ),
+        HealthAction::RecommendDecommission { reason, .. }
+            if record.blueprint.mutation_rounds_failed > 0 =>
+        {
+            (
+                sim::SimOutcome::Regressed,
+                None,
+                format!(
+                    "{bot_id} recommended for decommission after {} failed mutation round(s): {reason}",
+                    record.blueprint.mutation_rounds_failed
+                ),
+                format!(
+                    "Stop mutating {bot_id} along the same line ({reason}). Address the recorded root causes before forging a replacement charter."
+                ),
+                "decommission-recommended",
+            )
+        }
+        _ => return None,
+    };
+    let fallback_revision = revision.unwrap_or(report.active_revision);
+    Some(sim::LogAttemptInput {
+        title: format!("{bot_id} charter v{fallback_revision} probation"),
+        component: Some(record.blueprint.work_class.label().to_owned()),
+        domain: Some(SIM_EVOLUTION_DOMAIN.to_owned()),
+        problem_tags: vec!["bot-evolve".to_owned()],
+        outcome: Some(outcome),
+        attempt_summary: clip_chars(&summary, sim::MAX_TEXT_CHARS),
+        observed_outcome: observed,
+        avoid_guidance: clip_chars(&avoid_guidance, sim::MAX_TEXT_CHARS),
+        bot_id: Some(bot_id),
+        model: sim_model_label(record),
+        charter_revision: revision,
+        task_id: task_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        tags: vec![tag.to_owned()],
+        ..sim::LogAttemptInput::default()
+    })
+}
+
+fn sim_model_label(record: &BotRecord) -> Option<String> {
+    record.blueprint.preferred_model.clone().filter(|model| {
+        model
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '@'))
+    })
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1837,6 +1982,75 @@ mod tests {
             initial_memory_seeds: vec!["Check for unwrap() on external input.".to_owned()],
             probation_runs: Some(3),
             rationale: "Recurring Rust review gap.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn sim_feedback_mapping_covers_promotion_rollback_and_decommission() {
+        let scratch = Scratch::new("sim-mapping");
+        let (memory, evolution) = scratch.stores();
+        let now = 1_700_000_000;
+        evolution
+            .forge_bot(&memory, forge_request("mapper", false), now)
+            .unwrap();
+        let mut record = evolution.get_bot("mapper").unwrap().unwrap();
+        let report = |action: HealthAction| FeedbackReport {
+            bot_id: "mapper".to_owned(),
+            lifecycle: LifecycleState::UnderReview,
+            active_revision: 1,
+            rolling_metrics: record_metrics(),
+            lifetime_metrics: record_metrics(),
+            action,
+        };
+        let promoted = sim_attempt_for_feedback(
+            &record,
+            &report(HealthAction::PromoteProbation { revision: 2 }),
+            Some("T-1"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(promoted.outcome, Some(sim::SimOutcome::Worked));
+        assert_eq!(promoted.charter_revision, Some(2));
+        assert_eq!(promoted.task_id.as_deref(), Some("T-1"));
+        let rolled_back = sim_attempt_for_feedback(
+            &record,
+            &report(HealthAction::RollbackProbation {
+                from_rev: 3,
+                to_rev: 2,
+                reason: "Two failures.".to_owned(),
+            }),
+            None,
+            Some("Broke Windows paths"),
+        )
+        .unwrap();
+        assert_eq!(rolled_back.outcome, Some(sim::SimOutcome::Reverted));
+        assert!(rolled_back.avoid_guidance.contains("last known good v2"));
+        assert_eq!(rolled_back.observed_outcome, "Broke Windows paths");
+        let decommission = HealthAction::RecommendDecommission {
+            reason: "Exhausted rounds.".to_owned(),
+            requires_user_confirm: false,
+        };
+        assert!(
+            sim_attempt_for_feedback(&record, &report(decommission.clone()), None, None).is_none()
+        );
+        record.blueprint.mutation_rounds_failed = 2;
+        let regressed =
+            sim_attempt_for_feedback(&record, &report(decommission), None, None).unwrap();
+        assert_eq!(regressed.outcome, Some(sim::SimOutcome::Regressed));
+        assert_eq!(regressed.charter_revision, None);
+        assert!(!regressed.avoid_guidance.is_empty());
+        assert!(
+            sim_attempt_for_feedback(&record, &report(HealthAction::Healthy), None, None).is_none()
+        );
+    }
+
+    fn record_metrics() -> QualityMetrics {
+        QualityMetrics {
+            wilson_lower_bound: 0.0,
+            bayesian_mean: 0.5,
+            positive_weight: 0.0,
+            negative_weight: 0.0,
+            sample_count: 0,
         }
     }
 

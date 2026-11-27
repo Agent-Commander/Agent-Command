@@ -326,6 +326,32 @@ pub fn retry_prompt_suffix(context: &FailedAttemptContext) -> String {
     format!("{}\n\n{instruction}", lines.join("\n"))
 }
 
+pub const RETRY_SIM_BUDGET_TOKENS: usize = 400;
+
+pub fn retry_prompt_suffix_with_sim(
+    context: &FailedAttemptContext,
+    task: &str,
+    sim: Option<&crate::sim::SimStore>,
+) -> String {
+    let suffix = retry_prompt_suffix(context);
+    let query = [task, context.reason.as_str()]
+        .into_iter()
+        .chain(context.failed_checks.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let block = sim
+        .and_then(|store| {
+            store
+                .render_failure_block(&query, RETRY_SIM_BUDGET_TOKENS)
+                .ok()
+        })
+        .filter(|block| !block.trim().is_empty());
+    match block {
+        Some(block) => format!("{suffix}\n\n{block}"),
+        None => suffix,
+    }
+}
+
 pub fn recovery_key(workspace: &str, task_id: &str, revision: &str) -> String {
     format!("{workspace}:{task_id}:{revision}")
 }
@@ -734,6 +760,56 @@ mod tests {
         assert!(suffix.contains("unit tests (failure)"));
         assert!(suffix.contains("Reuse that branch"));
         assert!(suffix.contains("Do not start over"));
+    }
+
+    #[test]
+    fn retry_prompt_suffix_with_sim_appends_matching_failure_history_only() {
+        let dir = scratch_dir("sim-retry");
+        let workspace = dir.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = crate::sim::SimStore::for_workspace(dir.join("state"), &workspace);
+        let ctx = FailedAttemptContext {
+            branch: Some("ac/forge-task".into()),
+            reason: "cargo test failed in inbox parser".into(),
+            failed_checks: vec!["unit tests (failure)".into()],
+            ..FailedAttemptContext::default()
+        };
+        let plain = retry_prompt_suffix(&ctx);
+        assert_eq!(retry_prompt_suffix_with_sim(&ctx, "Fix inbox", None), plain);
+        assert_eq!(
+            retry_prompt_suffix_with_sim(&ctx, "Fix inbox", Some(&store)),
+            plain
+        );
+        store
+            .log_attempt(
+                crate::sim::LogAttemptInput {
+                    title: "Inbox parser panics on CRLF".into(),
+                    outcome: Some(crate::sim::SimOutcome::Failed),
+                    attempt_summary: "Split lines on \\n only".into(),
+                    avoid_guidance: "Keep the CRLF normalisation guard; Windows inboxes need it."
+                        .into(),
+                    ..crate::sim::LogAttemptInput::default()
+                },
+                10,
+            )
+            .unwrap();
+        store
+            .log_attempt(
+                crate::sim::LogAttemptInput {
+                    title: "Inbox parser panics on CRLF".into(),
+                    outcome: Some(crate::sim::SimOutcome::Worked),
+                    attempt_summary: "Normalise line endings first".into(),
+                    ..crate::sim::LogAttemptInput::default()
+                },
+                20,
+            )
+            .unwrap();
+        let enriched = retry_prompt_suffix_with_sim(&ctx, "Fix inbox", Some(&store));
+        assert!(enriched.starts_with(&plain));
+        assert!(enriched.contains("<sim-memory"));
+        assert!(enriched.contains("Keep the CRLF normalisation guard"));
+        assert!(!enriched.contains("VERIFIED FIX"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
