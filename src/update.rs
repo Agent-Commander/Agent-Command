@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -346,29 +346,117 @@ fn curl_download(url: &str, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn self_update_windows(tag: &str, mut progress: impl FnMut(u8)) -> io::Result<PathBuf> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStep {
+    Downloading,
+    Verifying,
+    Extracting,
+    Swapping,
+    Relaunching,
+}
+
+impl UpdateStep {
+    pub const ALL: [Self; 5] = [
+        Self::Downloading,
+        Self::Verifying,
+        Self::Extracting,
+        Self::Swapping,
+        Self::Relaunching,
+    ];
+
+    pub fn number(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|step| *step == self)
+            .map_or(0, |index| index + 1)
+    }
+
+    pub fn description(self, tag: &str) -> String {
+        match self {
+            Self::Downloading => format!("Downloading Agent Command {tag} and its checksum"),
+            Self::Verifying => "Verifying the SHA-256 checksum".to_owned(),
+            Self::Extracting => "Extracting the new executable".to_owned(),
+            Self::Swapping => "Swapping the running executable in place".to_owned(),
+            Self::Relaunching => format!("Relaunching Agent Command {tag}"),
+        }
+    }
+}
+
+pub struct ConsoleProgress<W: Write> {
+    out: W,
+    tag: String,
+}
+
+impl<W: Write> ConsoleProgress<W> {
+    pub fn new(out: W, tag: &str) -> Self {
+        Self {
+            out,
+            tag: tag.to_owned(),
+        }
+    }
+
+    pub fn begin(&mut self) {
+        let _ = writeln!(
+            self.out,
+            "\nUpdating Agent Command {CURRENT} to {}. Keep this window open.\n",
+            self.tag
+        );
+        let _ = self.out.flush();
+    }
+
+    pub fn step(&mut self, step: UpdateStep) {
+        let _ = writeln!(
+            self.out,
+            "  [{}/{}] {}...",
+            step.number(),
+            UpdateStep::ALL.len(),
+            step.description(&self.tag)
+        );
+        let _ = self.out.flush();
+    }
+}
+
+pub const RETURN_PROMPT: &str = "Press Enter to return to Agent Command.";
+
+pub fn show_failure(
+    out: &mut impl Write,
+    input: Option<&mut dyn BufRead>,
+    error: &io::Error,
+) -> io::Result<()> {
+    writeln!(out, "\nThe update did not finish: {error}")?;
+    writeln!(
+        out,
+        "Agent Command was not changed. Click Update or press F6 to retry."
+    )?;
+    if let Some(input) = input {
+        write!(out, "\n{RETURN_PROMPT} ")?;
+        out.flush()?;
+        let mut line = String::new();
+        input.read_line(&mut line)?;
+    }
+    out.flush()
+}
+
+pub fn self_update_windows(tag: &str, mut progress: impl FnMut(UpdateStep)) -> io::Result<PathBuf> {
     let current_exe = env::current_exe()?;
     let asset = windows_asset_name()?;
     let temp = env::temp_dir().join(format!("ac-update-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp)?;
 
     let result = (|| {
-        progress(10);
+        progress(UpdateStep::Downloading);
         let zip_path = temp.join(asset);
         let sha_path = temp.join(format!("{asset}.sha256"));
         curl_download(&release_asset_url(tag, asset), &zip_path)?;
-        progress(55);
         curl_download(
             &release_asset_url(tag, &format!("{asset}.sha256")),
             &sha_path,
         )?;
-        progress(70);
-
+        progress(UpdateStep::Verifying);
         let zip_bytes = fs::read(&zip_path)?;
         let sha_text = fs::read_to_string(&sha_path)?;
         verify_sha256_bytes(&zip_bytes, &sha_text)?;
-        progress(80);
-
+        progress(UpdateStep::Extracting);
         let unpacked = temp.join("unpacked");
         fs::create_dir_all(&unpacked)?;
         let tar_output = Command::new("tar.exe")
@@ -396,9 +484,8 @@ pub fn self_update_windows(tag: &str, mut progress: impl FnMut(u8)) -> io::Resul
                 "Extracted update is not a valid Windows executable.",
             ));
         }
-        progress(90);
+        progress(UpdateStep::Swapping);
         swap_executable_in_place(&current_exe, &staged)?;
-        progress(100);
         Ok(current_exe)
     })();
 
@@ -433,7 +520,9 @@ fn apply(latest: Option<&str>) -> io::Result<()> {
         return Ok(());
     };
     if cfg!(windows) {
-        self_update_windows(&latest, |_| {})?;
+        let mut progress = ConsoleProgress::new(io::stdout(), &latest);
+        progress.begin();
+        self_update_windows(&latest, |step| progress.step(step))?;
         println!(
             "Agent Command updated to {latest}. Restart agent-command to run the new version."
         );
@@ -467,12 +556,15 @@ pub(crate) fn finished_message(latest: &str, applied: Applied) -> String {
     }
 }
 
-pub(crate) fn apply_in_app(latest: &str) -> io::Result<Applied> {
+pub(crate) fn apply_in_app(latest: &str, out: impl Write) -> io::Result<Applied> {
     if cfg!(debug_assertions) {
         return Err(io::Error::other(DEVELOPMENT_REFUSAL));
     }
     if cfg!(windows) {
-        let executable = self_update_windows(latest, |_| {})?;
+        let mut progress = ConsoleProgress::new(out, latest);
+        let executable = replace_in_place(&mut progress, |progress| {
+            self_update_windows(latest, |step| progress.step(step))
+        })?;
         return Ok(Applied::ReplacedInPlace { executable });
     }
     if install(latest) {
@@ -480,6 +572,16 @@ pub(crate) fn apply_in_app(latest: &str) -> io::Result<Applied> {
     } else {
         Err(io::Error::other("the installer did not finish"))
     }
+}
+
+pub fn replace_in_place<W: Write>(
+    progress: &mut ConsoleProgress<W>,
+    replace: impl FnOnce(&mut ConsoleProgress<W>) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    progress.begin();
+    let executable = replace(progress)?;
+    progress.step(UpdateStep::Relaunching);
+    Ok(executable)
 }
 
 pub fn one_line_notice(latest: &str) -> String {
@@ -801,11 +903,107 @@ mod tests {
         assert!(finished_message("9.9.9", Applied::HandedOff).contains("PowerShell window"));
     }
 
+    #[test]
+    fn update_steps_are_numbered_in_order_and_name_each_phase() {
+        let numbers: Vec<usize> = UpdateStep::ALL.iter().map(|step| step.number()).collect();
+        assert_eq!(numbers, [1, 2, 3, 4, 5]);
+        let tag = "9.9.9";
+        assert!(UpdateStep::Downloading
+            .description(tag)
+            .contains("Downloading"));
+        assert!(UpdateStep::Downloading.description(tag).contains(tag));
+        assert!(UpdateStep::Verifying.description(tag).contains("SHA-256"));
+        assert!(UpdateStep::Extracting
+            .description(tag)
+            .contains("Extracting"));
+        assert!(UpdateStep::Swapping.description(tag).contains("Swapping"));
+        assert!(UpdateStep::Relaunching
+            .description(tag)
+            .contains("Relaunching"));
+    }
+
+    #[test]
+    fn in_place_replacement_prints_every_step_then_relaunching() {
+        let mut out = Vec::new();
+        let mut progress = ConsoleProgress::new(&mut out, "9.9.9");
+        let executable = replace_in_place(&mut progress, |progress| {
+            for step in [
+                UpdateStep::Downloading,
+                UpdateStep::Verifying,
+                UpdateStep::Extracting,
+                UpdateStep::Swapping,
+            ] {
+                progress.step(step);
+            }
+            Ok(PathBuf::from("agent-command.exe"))
+        })
+        .unwrap();
+        assert_eq!(executable, PathBuf::from("agent-command.exe"));
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            lines,
+            [
+                format!("Updating Agent Command {CURRENT} to 9.9.9. Keep this window open."),
+                "  [1/5] Downloading Agent Command 9.9.9 and its checksum...".to_owned(),
+                "  [2/5] Verifying the SHA-256 checksum...".to_owned(),
+                "  [3/5] Extracting the new executable...".to_owned(),
+                "  [4/5] Swapping the running executable in place...".to_owned(),
+                "  [5/5] Relaunching Agent Command 9.9.9...".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_replacement_stops_before_relaunching() {
+        let mut out = Vec::new();
+        let mut progress = ConsoleProgress::new(&mut out, "9.9.9");
+        let error = replace_in_place(&mut progress, |progress| {
+            progress.step(UpdateStep::Downloading);
+            progress.step(UpdateStep::Verifying);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SHA-256 mismatch",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SHA-256 mismatch");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("[2/5] Verifying"), "{text}");
+        assert!(!text.contains("Extracting"), "{text}");
+        assert!(!text.contains("Relaunching"), "{text}");
+    }
+
+    #[test]
+    fn failure_stays_visible_until_enter_on_an_interactive_console() {
+        let error = io::Error::other("Download failed (exit code: 22)");
+        let mut out = Vec::new();
+        let mut input = io::Cursor::new(b"\nleft over".to_vec());
+        show_failure(&mut out, Some(&mut input), &error).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("The update did not finish: Download failed (exit code: 22)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Click Update or press F6 to retry."),
+            "{text}"
+        );
+        assert!(text.trim_end().ends_with(RETURN_PROMPT), "{text}");
+        assert_eq!(input.position(), 1);
+
+        let mut out = Vec::new();
+        show_failure(&mut out, None, &error).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("The update did not finish"), "{text}");
+        assert!(!text.contains(RETURN_PROMPT), "{text}");
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn in_app_update_refuses_in_development_builds() {
         assert_eq!(
-            apply_in_app("9.9.9").unwrap_err().to_string(),
+            apply_in_app("9.9.9", Vec::new()).unwrap_err().to_string(),
             DEVELOPMENT_REFUSAL
         );
     }

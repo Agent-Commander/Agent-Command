@@ -21,7 +21,8 @@ use ratatui::{
     Frame,
 };
 use std::{
-    env, io,
+    env,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -144,7 +145,12 @@ impl Host for TerminalHost {
     }
 
     fn update(&mut self, latest: &str) -> io::Result<update::Applied> {
-        update::apply_in_app(latest)
+        update::apply_in_app(latest, io::stderr()).inspect_err(|error| {
+            let mut stdin = io::stdin().lock();
+            let interactive = io::stdin().is_terminal();
+            let input = interactive.then_some(&mut stdin as &mut dyn io::BufRead);
+            let _ = update::show_failure(&mut io::stderr(), input, error);
+        })
     }
 }
 
