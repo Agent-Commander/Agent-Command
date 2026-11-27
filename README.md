@@ -416,6 +416,48 @@ a daemon's authenticated `/mcp` endpoint.
 | `delegate_task` | create if needed and run a seven-field brief: `role`, `goal`, `context`, `requirements`, `done_when`, `do_not`, `return` |
 | `wait_thread` | block until idle or `timeout_ms` (max 600000) |
 | `interrupt_thread` | stop the mission and drop queued messages |
+| `sim_search`, `sim_get`, `sim_recent` | read the Self-Improvement Memory (allowed in read-only scope) |
+| `sim_log_attempt`, `sim_merge` | append an attempt or merge duplicate root causes (supervised or commander scope) |
+
+### Self-Improvement Memory (SIM)
+
+SIM is a separate bucket for what was tried and how it went. It is not part of
+shared or bot memory: `memory_search` never returns SIM entries, and
+`sim_search` never returns memory entries.
+
+- Each problem (`sim-<12 hex>`) groups attempts that share a root cause. Its
+  attempts are append-only and in time order. Each attempt records an outcome
+  (`failed`, `regressed`, `reverted`, `partial`, `worked`), what was tried and
+  why, the expected and actual result, `avoid_guidance` (required for
+  failures, and it should name the safeguard to keep), and provenance: bot,
+  provider, model, charter revision, task, evidence.
+- `sim_search` and `sim_recent` filter by `failures_only`, `domain`,
+  `component`, `bot_id`, `provider`, `model`, `outcome` and `status`.
+  `sim_merge` folds a duplicate into another problem and leaves an alias, so
+  `sim_get` and `sim_log_attempt` still work with the old id.
+- `bot_evolve` logs each proposed charter mutation as a failed attempt.
+  `bot_record_feedback` logs a probation promotion as `worked`, a probation
+  rollback as `reverted`, and a decommission recommendation after failed
+  mutation rounds as `regressed`.
+- Specialist prompts get a short `<sim-memory>` block when earlier attempts
+  match the task. Retry prompts get the matching failures and their avoid
+  guidance.
+- State lives in `agent-command-sim-v1/<workspace hash>/sim.json`, with a
+  readable `sim.md` beside it. Writes are atomic, secret-like text is refused,
+  output is redacted, and a corrupt file blocks reads and writes.
+
+In the terminal:
+
+```text
+/sim search QUERY
+/sim recent
+/sim log PROBLEM | ATTEMPT
+/sim log PROBLEM | worked: ATTEMPT
+/sim log PROBLEM | ATTEMPT | AVOID GUIDANCE
+```
+
+Logged attempts count as `failed` unless `ATTEMPT` starts with an outcome and a
+colon.
 
 Connect OpenBot (or Nagatha, or any MCP client) with a stdio server entry:
 

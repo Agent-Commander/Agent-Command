@@ -6,6 +6,7 @@ use crate::{
     http::{self, HttpError, Request},
     mcp,
     memory::MemoryStore,
+    sim::SimStore,
     soul::SoulStore,
     specialists,
     vault::{self, VaultStore},
@@ -1236,6 +1237,7 @@ pub struct LoopbackBridge {
     vault: Option<VaultStore>,
     memory: Option<MemoryStore>,
     evolution: Option<EvolutionStore>,
+    sim: Option<SimStore>,
     profile_root: Option<PathBuf>,
     temp_files: Mutex<Vec<PathBuf>>,
     managed_agy_configs: Mutex<Vec<ManagedAgyConfig>>,
@@ -1272,6 +1274,7 @@ impl LoopbackBridge {
         let profile_root = config.profile_root.clone();
         let memory = MemoryStore::for_workspace(profile_root.clone(), &config.workspace_root);
         let evolution = EvolutionStore::for_workspace(profile_root.clone(), &config.workspace_root);
+        let sim = SimStore::for_workspace(profile_root.clone(), &config.workspace_root);
         let control = Control::open_with(
             specialists::Store::new(config.profile_root.clone()),
             &config.workspace_root,
@@ -1284,7 +1287,8 @@ impl LoopbackBridge {
             .with_ask_user(config.ask_user)
             .with_ui(ui_bridge.clone())
             .with_memory(memory.clone())
-            .with_evolution(evolution.clone());
+            .with_evolution(evolution.clone())
+            .with_sim(sim.clone());
         if let Some(soul) = config.soul {
             server = server.with_soul(soul);
         }
@@ -1297,6 +1301,7 @@ impl LoopbackBridge {
         bridge.vault = vault;
         bridge.memory = Some(memory);
         bridge.evolution = Some(evolution);
+        bridge.sim = Some(sim);
         bridge.profile_root = Some(profile_root);
         Ok(bridge)
     }
@@ -1334,6 +1339,7 @@ impl LoopbackBridge {
             vault: None,
             memory: None,
             evolution: None,
+            sim: None,
             profile_root: None,
             temp_files: Mutex::new(Vec::new()),
             managed_agy_configs: Mutex::new(Vec::new()),
@@ -1359,6 +1365,10 @@ impl LoopbackBridge {
 
     pub fn evolution(&self) -> Option<&EvolutionStore> {
         self.evolution.as_ref()
+    }
+
+    pub fn sim(&self) -> Option<&SimStore> {
+        self.sim.as_ref()
     }
 
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {

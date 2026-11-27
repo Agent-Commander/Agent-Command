@@ -830,6 +830,9 @@ impl App {
                 if live.evolution_store.is_none() {
                     live.evolution_store = started.evolution().cloned();
                 }
+                if live.sim_store.is_none() {
+                    live.sim_store = started.sim().cloned();
+                }
                 live.bridge = Some(Arc::new(started));
             }
         }
@@ -3012,6 +3015,9 @@ impl App {
                 "bot_evolve",
                 "bot_decommission",
             ]);
+        }
+        if live.sim_store.is_some() || live.bridge.as_deref().is_some_and(|b| b.sim().is_some()) {
+            active_tools.extend(crate::mcp::SIM_TOOLS);
         }
         if self.github_status.authenticated {
             active_tools.extend(["github_pr_*", "github_issue_*"]);

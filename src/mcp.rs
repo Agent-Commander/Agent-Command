@@ -17,6 +17,7 @@ use crate::{
         MAX_BOT_ID_CHARS, MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS,
     },
     permissions::PermissionMode,
+    sim::{self, SimStore},
     soul::{self, SoulStore},
     vault::{self, VaultStore},
 };
@@ -32,6 +33,13 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const SIM_TOOLS: [&str; 5] = [
+    "sim_search",
+    "sim_get",
+    "sim_recent",
+    "sim_log_attempt",
+    "sim_merge",
+];
 pub(crate) const LATEST_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: [&str; 3] = [LATEST_PROTOCOL, "2025-03-26", "2024-11-05"];
 pub(crate) const MAX_MESSAGE_BYTES: usize = 1 << 20;
@@ -55,7 +63,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-const READ_TOOLS: [&str; 22] = [
+const READ_TOOLS: [&str; 25] = [
     "list_threads",
     "search_threads",
     "read_thread",
@@ -78,6 +86,9 @@ const READ_TOOLS: [&str; 22] = [
     "vault_check",
     "memory_search",
     "bot_scorecard",
+    "sim_search",
+    "sim_get",
+    "sim_recent",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -597,6 +608,94 @@ struct BotDecommissionArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SimSearchArguments {
+    query: String,
+    limit: Option<usize>,
+    token_budget: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimRecentArguments {
+    limit: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimFilterArguments {
+    failures_only: Option<bool>,
+    domain: Option<String>,
+    component: Option<String>,
+    bot_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    outcome: Option<String>,
+    status: Option<String>,
+}
+
+impl SimFilterArguments {
+    fn into_filter(self) -> Result<sim::SimFilter, ToolError> {
+        Ok(sim::SimFilter {
+            failures_only: self.failures_only.unwrap_or(false),
+            domain: self.domain,
+            component: self.component,
+            bot_id: self.bot_id,
+            provider: self.provider,
+            model: self.model,
+            outcome: self
+                .outcome
+                .as_deref()
+                .map(sim::SimOutcome::parse)
+                .transpose()
+                .map_err(ToolError::invalid)?,
+            status: self
+                .status
+                .as_deref()
+                .map(sim::ProblemStatus::parse)
+                .transpose()
+                .map_err(ToolError::invalid)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimGetArguments {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimLogAttemptArguments {
+    problem_id: Option<String>,
+    title: Option<String>,
+    component: Option<String>,
+    domain: Option<String>,
+    status: Option<String>,
+    outcome: String,
+    attempt_summary: String,
+    rationale: Option<String>,
+    predicted_outcome: Option<String>,
+    observed_outcome: Option<String>,
+    avoid_guidance: Option<String>,
+    bot_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    charter_revision: Option<u32>,
+    task_id: Option<String>,
+    evidence: Option<Vec<String>>,
+    tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimMergeArguments {
+    source_id: String,
+    target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallParams {
     name: String,
     #[serde(default)]
@@ -615,6 +714,7 @@ pub(crate) struct Server {
     vault: Option<VaultStore>,
     memory: Option<MemoryStore>,
     evolution: Option<EvolutionStore>,
+    sim: Option<SimStore>,
     gh: Arc<dyn GhExecutor>,
 }
 
@@ -627,6 +727,9 @@ impl Server {
         let evolution = profile_root
             .as_ref()
             .map(|root| EvolutionStore::for_workspace(root.clone(), control.root()));
+        let sim = profile_root
+            .as_ref()
+            .map(|root| SimStore::for_workspace(root.clone(), control.root()));
         Self {
             control,
             scope,
@@ -637,6 +740,7 @@ impl Server {
             vault: VaultStore::from_env().ok(),
             memory,
             evolution,
+            sim,
             gh: Arc::new(CliGhExecutor),
         }
     }
@@ -673,6 +777,11 @@ impl Server {
 
     pub(crate) fn with_evolution(mut self, evolution: EvolutionStore) -> Self {
         self.evolution = Some(evolution);
+        self
+    }
+
+    pub(crate) fn with_sim(mut self, sim: SimStore) -> Self {
+        self.sim = Some(sim);
         self
     }
 
@@ -954,6 +1063,11 @@ impl Server {
             "bot_record_feedback" => self.run_bot_record_feedback(parse(arguments)?),
             "bot_evolve" => self.run_bot_evolve(parse(arguments)?),
             "bot_decommission" => self.run_bot_decommission(parse(arguments)?),
+            "sim_search" => self.run_sim_search(arguments),
+            "sim_get" => self.run_sim_get(parse(arguments)?),
+            "sim_recent" => self.run_sim_recent(arguments),
+            "sim_log_attempt" => self.run_sim_log_attempt(parse(arguments)?),
+            "sim_merge" => self.run_sim_merge(parse(arguments)?),
             other => Err(ToolError::Rpc(RpcError::params(format!(
                 "Unknown tool: {other}"
             )))),
@@ -2464,9 +2578,16 @@ impl Server {
                 now,
             )
             .map_err(map_store_io_error)?;
+        let sim_logged = self.record_sim_feedback(
+            evolution,
+            &report,
+            args.task_id.as_deref(),
+            args.note.as_deref(),
+        );
         let mut payload = json!({
             "recorded": true,
             "report": report,
+            "sim": sim_logged,
         });
         vault::redact_json(&mut payload);
         Ok(payload)
@@ -2504,11 +2625,13 @@ impl Server {
             probation_runs: args.probation_runs,
         };
         let revision = evolution
-            .propose_mutation(memory, request, now)
+            .propose_mutation(memory, request.clone(), now)
             .map_err(map_store_io_error)?;
+        let sim_logged = self.record_sim_mutation(evolution, &request, &revision);
         let mut payload = json!({
             "evolved": true,
             "revision": revision,
+            "sim": sim_logged,
         });
         vault::redact_json(&mut payload);
         Ok(payload)
@@ -2536,6 +2659,206 @@ impl Server {
         vault::redact_json(&mut payload);
         Ok(payload)
     }
+
+    fn require_sim(&self) -> Result<&SimStore, ToolError> {
+        self.sim.as_ref().ok_or_else(|| {
+            ToolError::Failed(
+                "Self-Improvement Memory store is not configured for this session.".into(),
+            )
+        })
+    }
+
+    fn run_sim_search(&self, arguments: Value) -> Result<Value, ToolError> {
+        let (own, filter) = split_sim_filter(arguments, &["query", "limit", "token_budget"])?;
+        let args: SimSearchArguments = parse(own)?;
+        let filter = parse::<SimFilterArguments>(filter)?.into_filter()?;
+        if args.query.contains('\0') || args.query.chars().count() > sim::MAX_QUERY_CHARS {
+            return Err(ToolError::invalid("Invalid SIM search query."));
+        }
+        let limit = sim_limit(args.limit)?;
+        let token_budget = match args.token_budget {
+            None => sim::DEFAULT_TOKEN_BUDGET,
+            Some(value) if (sim::MIN_TOKEN_BUDGET..=sim::MAX_TOKEN_BUDGET).contains(&value) => {
+                value
+            }
+            Some(_) => {
+                return Err(ToolError::invalid(format!(
+                    "token_budget must be between {} and {}.",
+                    sim::MIN_TOKEN_BUDGET,
+                    sim::MAX_TOKEN_BUDGET
+                )));
+            }
+        };
+        let result = self
+            .require_sim()?
+            .search(&args.query, &filter, limit, token_budget)
+            .map_err(map_store_io_error)?;
+        let count = result.hits.len();
+        let mut payload = json!({
+            "query": result.query,
+            "hits": result.hits,
+            "count": count,
+            "truncated_by_budget": result.truncated_by_budget,
+            "approx_tokens": result.approx_tokens,
+        });
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_sim_recent(&self, arguments: Value) -> Result<Value, ToolError> {
+        let (own, filter) = split_sim_filter(arguments, &["limit"])?;
+        let args: SimRecentArguments = parse(own)?;
+        let filter = parse::<SimFilterArguments>(filter)?.into_filter()?;
+        let limit = sim_limit(args.limit)?;
+        let problems = self
+            .require_sim()?
+            .recent(&filter, limit)
+            .map_err(map_store_io_error)?;
+        let count = problems.len();
+        let mut payload = json!({"problems": problems, "count": count});
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_sim_get(&self, args: SimGetArguments) -> Result<Value, ToolError> {
+        let lookup = self
+            .require_sim()?
+            .get(&args.id)
+            .map_err(map_store_io_error)?
+            .ok_or_else(|| ToolError::Failed(format!("No SIM problem {}.", args.id.trim())))?;
+        let mut payload = json!(lookup);
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_sim_log_attempt(&self, args: SimLogAttemptArguments) -> Result<Value, ToolError> {
+        let input = sim::LogAttemptInput {
+            problem_id: args.problem_id,
+            title: args.title.unwrap_or_default(),
+            component: args.component,
+            domain: args.domain,
+            status: args
+                .status
+                .as_deref()
+                .map(sim::ProblemStatus::parse)
+                .transpose()
+                .map_err(ToolError::invalid)?,
+            problem_tags: Vec::new(),
+            outcome: Some(sim::SimOutcome::parse(&args.outcome).map_err(ToolError::invalid)?),
+            attempt_summary: args.attempt_summary,
+            rationale: args.rationale.unwrap_or_default(),
+            predicted_outcome: args.predicted_outcome.unwrap_or_default(),
+            observed_outcome: args.observed_outcome.unwrap_or_default(),
+            avoid_guidance: args.avoid_guidance.unwrap_or_default(),
+            bot_id: args.bot_id,
+            provider: args.provider,
+            model: args.model,
+            charter_revision: args.charter_revision,
+            task_id: args.task_id,
+            evidence: args.evidence.unwrap_or_default(),
+            tags: args.tags.unwrap_or_default(),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let outcome = self
+            .require_sim()?
+            .log_attempt(input, now)
+            .map_err(map_store_io_error)?;
+        let mut payload = json!(outcome);
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn run_sim_merge(&self, args: SimMergeArguments) -> Result<Value, ToolError> {
+        let now = chrono::Utc::now().timestamp();
+        let outcome = self
+            .require_sim()?
+            .merge(&args.source_id, &args.target_id, now)
+            .map_err(map_store_io_error)?;
+        let mut payload = json!(outcome);
+        vault::redact_json(&mut payload);
+        Ok(payload)
+    }
+
+    fn record_sim_mutation(
+        &self,
+        evolution: &EvolutionStore,
+        request: &MutateBotRequest,
+        revision: &crate::evolution::CharterRevision,
+    ) -> Option<Value> {
+        let sim = self.sim.as_ref()?;
+        let record = evolution.get_bot(&request.bot_id).ok().flatten()?;
+        let input = crate::evolution::sim_attempt_for_mutation(&record, request, revision);
+        let now = chrono::Utc::now().timestamp();
+        Some(sim_log_summary(sim.log_attempt(input, now)))
+    }
+
+    fn record_sim_feedback(
+        &self,
+        evolution: &EvolutionStore,
+        report: &crate::evolution::FeedbackReport,
+        task_id: Option<&str>,
+        note: Option<&str>,
+    ) -> Option<Value> {
+        let sim = self.sim.as_ref()?;
+        let record = evolution.get_bot(&report.bot_id).ok().flatten()?;
+        let mut input = crate::evolution::sim_attempt_for_feedback(&record, report, task_id, note)?;
+        let existing = sim
+            .latest_problem_for_bot(&report.bot_id, input.charter_revision)
+            .ok()
+            .flatten();
+        if let Some(problem) = &existing {
+            if repeats_last_attempt(problem, &input) {
+                return None;
+            }
+            input.problem_id = Some(problem.id.clone());
+        }
+        let now = chrono::Utc::now().timestamp();
+        Some(sim_log_summary(sim.log_attempt(input, now)))
+    }
+}
+
+fn repeats_last_attempt(problem: &sim::SimProblem, input: &sim::LogAttemptInput) -> bool {
+    problem.attempts.last().is_some_and(|last| {
+        Some(last.outcome) == input.outcome
+            && last.bot_id == input.bot_id
+            && last.attempt_summary == input.attempt_summary
+    })
+}
+
+fn sim_log_summary(result: io::Result<sim::LogOutcome>) -> Value {
+    match result {
+        Ok(outcome) => json!({
+            "logged": true,
+            "problem_id": outcome.problem_id,
+            "attempt_id": outcome.attempt.attempt_id,
+            "outcome": outcome.attempt.outcome,
+        }),
+        Err(error) => json!({"logged": false, "error": error.to_string()}),
+    }
+}
+
+fn sim_limit(limit: Option<usize>) -> Result<usize, ToolError> {
+    match limit {
+        None => Ok(sim::DEFAULT_SEARCH_LIMIT),
+        Some(value) if (1..=sim::MAX_SEARCH_LIMIT).contains(&value) => Ok(value),
+        Some(_) => Err(ToolError::invalid(format!(
+            "limit must be between 1 and {}.",
+            sim::MAX_SEARCH_LIMIT
+        ))),
+    }
+}
+
+fn split_sim_filter(arguments: Value, own_keys: &[&str]) -> Result<(Value, Value), ToolError> {
+    let Value::Object(mut filter) = arguments else {
+        return Err(ToolError::invalid("arguments must be an object"));
+    };
+    let mut own = serde_json::Map::new();
+    for key in own_keys {
+        if let Some(value) = filter.remove(*key) {
+            own.insert((*key).to_owned(), value);
+        }
+    }
+    Ok((Value::Object(own), Value::Object(filter)))
 }
 
 fn map_store_io_error(error: io::Error) -> ToolError {
@@ -3810,7 +4133,104 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             ),
             false,
         ),
+        tool(
+            "sim_search",
+            "Search the isolated Self-Improvement Memory (SIM) bucket of failed, reverted, regressed, partial and working attempts grouped by root cause, within a token budget. Separate from memory_search.",
+            sim_query_schema(json!({
+                "query": {"type": "string", "maxLength": sim::MAX_QUERY_CHARS},
+                "limit": {"type": "integer", "minimum": 1, "maximum": sim::MAX_SEARCH_LIMIT},
+                "token_budget": {"type": "integer", "minimum": sim::MIN_TOKEN_BUDGET, "maximum": sim::MAX_TOKEN_BUDGET},
+            }), &["query"]),
+            true,
+        ),
+        tool(
+            "sim_get",
+            "Read the full chronological attempt timeline of one SIM problem, following merged aliases.",
+            object_schema(json!({"id": text_schema(32)}), &["id"]),
+            true,
+        ),
+        tool(
+            "sim_recent",
+            "List the most recently updated SIM problems, optionally only failures or one bot, provider, model, domain, component, outcome or status.",
+            sim_query_schema(json!({
+                "limit": {"type": "integer", "minimum": 1, "maximum": sim::MAX_SEARCH_LIMIT},
+            }), &[]),
+            true,
+        ),
+        tool(
+            "sim_log_attempt",
+            "Append an attempt to a SIM problem (creating it by title when new). Record what was tried, why, predicted vs observed outcome, and avoid_guidance (required for failures) naming the safeguard to keep. Secrets are refused.",
+            object_schema(
+                json!({
+                    "problem_id": text_schema(32),
+                    "title": text_schema(sim::MAX_TITLE_CHARS),
+                    "component": text_schema(sim::MAX_LABEL_CHARS),
+                    "domain": text_schema(sim::MAX_LABEL_CHARS),
+                    "status": sim_status_schema(),
+                    "outcome": sim_outcome_schema(),
+                    "attempt_summary": text_schema(sim::MAX_TEXT_CHARS),
+                    "rationale": text_schema(sim::MAX_TEXT_CHARS),
+                    "predicted_outcome": text_schema(sim::MAX_TEXT_CHARS),
+                    "observed_outcome": text_schema(sim::MAX_TEXT_CHARS),
+                    "avoid_guidance": text_schema(sim::MAX_TEXT_CHARS),
+                    "bot_id": text_schema(MAX_BOT_ID_CHARS),
+                    "provider": text_schema(sim::MAX_LABEL_CHARS),
+                    "model": text_schema(sim::MAX_LABEL_CHARS),
+                    "charter_revision": {"type": "integer", "minimum": 1},
+                    "task_id": text_schema(sim::MAX_LABEL_CHARS),
+                    "evidence": {
+                        "type": "array",
+                        "maxItems": sim::MAX_EVIDENCE,
+                        "items": text_schema(sim::MAX_EVIDENCE_CHARS),
+                    },
+                    "tags": {
+                        "type": "array",
+                        "maxItems": sim::MAX_TAGS,
+                        "items": text_schema(sim::MAX_TAG_CHARS),
+                    },
+                }),
+                &["outcome", "attempt_summary"],
+            ),
+            false,
+        ),
+        tool(
+            "sim_merge",
+            "Merge a duplicate SIM problem into another with the same root cause, keeping every attempt in chronological order and leaving an alias redirect.",
+            object_schema(
+                json!({
+                    "source_id": text_schema(32),
+                    "target_id": text_schema(32),
+                }),
+                &["source_id", "target_id"],
+            ),
+            false,
+        ),
     ]
+}
+
+fn sim_outcome_schema() -> Value {
+    json!({"type": "string", "enum": ["failed", "regressed", "reverted", "partial", "worked"]})
+}
+
+fn sim_status_schema() -> Value {
+    json!({"type": "string", "enum": ["open", "mitigated", "resolved", "wontfix"]})
+}
+
+fn sim_query_schema(own: Value, required: &[&str]) -> Value {
+    let mut properties = json!({
+        "failures_only": {"type": "boolean"},
+        "domain": text_schema(sim::MAX_LABEL_CHARS),
+        "component": text_schema(sim::MAX_LABEL_CHARS),
+        "bot_id": text_schema(MAX_BOT_ID_CHARS),
+        "provider": text_schema(sim::MAX_LABEL_CHARS),
+        "model": text_schema(sim::MAX_LABEL_CHARS),
+        "outcome": sim_outcome_schema(),
+        "status": sim_status_schema(),
+    });
+    if let (Some(target), Value::Object(extra)) = (properties.as_object_mut(), own) {
+        target.extend(extra);
+    }
+    object_schema(properties, required)
 }
 
 pub(crate) fn serve_stdio(
@@ -4069,6 +4489,7 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let vault = VaultStore::open(profile_root.clone());
     let memory = MemoryStore::for_workspace(profile_root.clone(), &options.root);
     let evolution = EvolutionStore::for_workspace(profile_root.clone(), &options.root);
+    let sim = SimStore::for_workspace(profile_root.clone(), &options.root);
     let control = Control::open(
         crate::specialists::Store::new(profile_root.clone()),
         &options.root,
@@ -4079,7 +4500,8 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
             .with_ui(ui)
             .with_vault(vault)
             .with_memory(memory)
-            .with_evolution(evolution),
+            .with_evolution(evolution)
+            .with_sim(sim),
     );
     serve_stdio(server, io::stdin().lock(), io::stdout())
 }
@@ -4105,12 +4527,14 @@ mod tests {
         let state_root = scratch.0.join("vault-profiles");
         let memory = MemoryStore::for_workspace(state_root.clone(), &scratch.0);
         let evolution = EvolutionStore::for_workspace(state_root.clone(), &scratch.0);
+        let sim = SimStore::for_workspace(state_root.clone(), &scratch.0);
         Server::new(control(scratch, false), scope)
             .with_soul(SoulStore::new(scratch.0.join("SOUL.md")))
             .with_ui(ui)
             .with_vault(VaultStore::open(state_root))
             .with_memory(memory)
             .with_evolution(evolution)
+            .with_sim(sim)
     }
 
     fn request(id: u64, method: &str, params: Value) -> Value {
@@ -4229,6 +4653,11 @@ mod tests {
             "bot_record_feedback",
             "bot_evolve",
             "bot_decommission",
+            "sim_search",
+            "sim_get",
+            "sim_recent",
+            "sim_log_attempt",
+            "sim_merge",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -5398,5 +5827,314 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+    fn sim_charter() -> Value {
+        json!({
+            "job": "Audit Rust pull requests for durable state safety.",
+            "anti_jobs": ["Never push commits directly to main."],
+            "voice_and_style": "Terse findings.",
+            "verification_bar": "Run clippy and cite exact line numbers.",
+            "allowed_tools": ["read_thread"],
+            "instructions": "Verify atomic writes before approving.",
+        })
+    }
+
+    fn sim_evolve(server: &Server, root_cause: &str) -> Value {
+        call(
+            server,
+            "bot_evolve",
+            json!({
+                "bot_id": "warden",
+                "failure_mode": "verification_missed",
+                "task_summary": "Approved a diff that wrote state in place.",
+                "root_cause": root_cause,
+                "patched_charter": sim_charter(),
+                "diff_summary": ["Require tmp plus sync_all plus rename evidence."],
+                "probation_runs": 2,
+            }),
+        )
+    }
+
+    fn sim_feedback(server: &Server, signal: &str) -> Value {
+        call(
+            server,
+            "bot_record_feedback",
+            json!({"bot_id": "warden", "signal": signal, "note": "Operator review"}),
+        )
+    }
+
+    #[test]
+    fn sim_tools_stay_isolated_from_memory_and_follow_merges() {
+        let scratch = Scratch::new("mcp-sim");
+        let server = server(&scratch, Scope::Supervised);
+        let advertised = server.advertised_tool_names();
+        for name in SIM_TOOLS {
+            assert!(advertised.iter().any(|tool| tool == name), "{name}");
+        }
+        let failed = call(
+            &server,
+            "sim_log_attempt",
+            json!({
+                "title": "Quokka lockfile starvation",
+                "component": "src/memory.rs",
+                "domain": "durable-state",
+                "outcome": "failed",
+                "attempt_summary": "Spin without sleeping",
+                "avoid_guidance": "Keep the stale-lock timeout; it prevents deadlock after a crash.",
+                "provider": "claude",
+                "model": "claude-opus-5-5",
+            }),
+        );
+        let problem_id = structured(&failed)["problem_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(structured(&failed)["status"], "created");
+        call(
+            &server,
+            "memory_write",
+            json!({"scope": "shared", "kind": "fact", "title": "Wombat cadence", "body": "Weekly releases"}),
+        );
+        let memory_hits = call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "quokka"}),
+        );
+        assert_eq!(structured(&memory_hits)["count"], 0);
+        let sim_hits = call(&server, "sim_search", json!({"query": "wombat"}));
+        assert_eq!(structured(&sim_hits)["count"], 0);
+        let sim_hits = call(&server, "sim_search", json!({"query": "quokka"}));
+        assert_eq!(structured(&sim_hits)["count"], 1);
+
+        let duplicate = call(
+            &server,
+            "sim_log_attempt",
+            json!({
+                "title": "Lockfile starvation under load",
+                "component": "src/memory.rs",
+                "outcome": "reverted",
+                "attempt_summary": "Removed the stale-lock timeout",
+                "avoid_guidance": "Do not remove the stale-lock timeout.",
+                "provider": "codex",
+            }),
+        );
+        let duplicate_id = structured(&duplicate)["problem_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let merged = call(
+            &server,
+            "sim_merge",
+            json!({"source_id": duplicate_id, "target_id": problem_id}),
+        );
+        assert_eq!(structured(&merged)["moved_attempts"], 1);
+        let worked = call(
+            &server,
+            "sim_log_attempt",
+            json!({
+                "problem_id": duplicate_id,
+                "outcome": "worked",
+                "attempt_summary": "Sleep with backoff and keep the timeout",
+                "provider": "gemini",
+            }),
+        );
+        assert_eq!(structured(&worked)["problem_id"], problem_id.as_str());
+        let timeline = call(&server, "sim_get", json!({"id": duplicate_id}));
+        assert_eq!(structured(&timeline)["redirected"], true);
+        let outcomes: Vec<&str> = structured(&timeline)["problem"]["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attempt| attempt["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, vec!["failed", "reverted", "worked"]);
+
+        let failures = call(
+            &server,
+            "sim_recent",
+            json!({"failures_only": true, "provider": "codex"}),
+        );
+        assert_eq!(structured(&failures)["count"], 1);
+        assert_eq!(
+            structured(&failures)["problems"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let none = call(&server, "sim_recent", json!({"bot_id": "nobody"}));
+        assert_eq!(structured(&none)["count"], 0);
+        assert_eq!(
+            call(&server, "sim_recent", json!({"outcome": "maybe"}))["error"]["code"],
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            call(&server, "sim_recent", json!({"unknown": true}))["error"]["code"],
+            INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn sim_tools_refuse_secrets_redact_output_and_fail_closed() {
+        let scratch = Scratch::new("mcp-sim-safety");
+        let server = server(&scratch, Scope::Supervised);
+        let secret = call(
+            &server,
+            "sim_log_attempt",
+            json!({
+                "title": "Leaky retry",
+                "outcome": "failed",
+                "attempt_summary": "Passed api_key=sk-abcdefghijklmnopqrstuvwxyz123456 on argv",
+                "avoid_guidance": "Never pass keys as arguments.",
+            }),
+        );
+        assert_eq!(secret["result"]["isError"], true);
+        let logged = call(
+            &server,
+            "sim_log_attempt",
+            json!({"title": "Leaky retry", "outcome": "worked", "attempt_summary": "Used env"}),
+        );
+        let problem_id = structured(&logged)["problem_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let store = server.sim.as_ref().unwrap();
+        let path = store.json_path().unwrap();
+        let tampered = fs::read_to_string(&path)
+            .unwrap()
+            .replace("Used env", "Used sk-abcdefghijklmnopqrstuvwxyz123456");
+        fs::write(&path, tampered).unwrap();
+        let read_back = call(&server, "sim_get", json!({"id": problem_id}));
+        assert!(!read_back
+            .to_string()
+            .contains("abcdefghijklmnopqrstuvwxyz123456"));
+        fs::write(&path, b"{corrupt").unwrap();
+        let corrupt = call(&server, "sim_search", json!({"query": "leaky"}));
+        assert_eq!(corrupt["result"]["isError"], true);
+        let corrupt_log = call(
+            &server,
+            "sim_log_attempt",
+            json!({"title": "Leaky retry", "outcome": "worked", "attempt_summary": "Again"}),
+        );
+        assert_eq!(corrupt_log["result"]["isError"], true);
+    }
+
+    #[test]
+    fn sim_read_tools_work_in_read_only_scope_and_writes_are_refused() {
+        let scratch = Scratch::new("mcp-sim-read-only");
+        let server = server(&scratch, Scope::ReadOnly);
+        let advertised = server.advertised_tool_names();
+        for name in ["sim_search", "sim_get", "sim_recent"] {
+            assert!(advertised.iter().any(|tool| tool == name), "{name}");
+        }
+        for name in ["sim_log_attempt", "sim_merge"] {
+            assert!(!advertised.iter().any(|tool| tool == name), "{name}");
+        }
+        assert_eq!(
+            structured(&call(&server, "sim_search", json!({"query": "x"})))["count"],
+            0
+        );
+        assert_eq!(
+            structured(&call(&server, "sim_recent", json!({})))["count"],
+            0
+        );
+        let missing = call(&server, "sim_get", json!({"id": "sim-000000000000"}));
+        assert_eq!(missing["result"]["isError"], true);
+        assert!(!missing.to_string().contains("read-only"));
+        for (tool, args) in [
+            (
+                "sim_log_attempt",
+                json!({"title": "T", "outcome": "worked", "attempt_summary": "S"}),
+            ),
+            (
+                "sim_merge",
+                json!({"source_id": "sim-000000000000", "target_id": "sim-111111111111"}),
+            ),
+        ] {
+            let refused = call(&server, tool, args);
+            assert_eq!(refused["result"]["isError"], true, "{tool}");
+            assert!(refused.to_string().contains("read-only"), "{tool}");
+        }
+    }
+
+    #[test]
+    fn bot_evolution_auto_logs_attempts_into_sim() {
+        let scratch = Scratch::new("mcp-sim-evolve");
+        let server = server(&scratch, Scope::Supervised);
+        let forged = call(
+            &server,
+            "bot_forge",
+            json!({
+                "bot_id": "warden",
+                "role": "reviewer",
+                "work_class": "review",
+                "charter": sim_charter(),
+                "preferred_model": "claude-opus-5-5",
+                "probation_runs": 2,
+                "rationale": "Durable state reviewer.",
+            }),
+        );
+        assert_eq!(structured(&forged)["forged"], true);
+        let root_cause = "Reviewer accepted non-atomic state writes";
+        let evolved = sim_evolve(&server, root_cause);
+        assert_eq!(structured(&evolved)["sim"]["logged"], true);
+        let problem_id = structured(&evolved)["sim"]["problem_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            structured(&sim_feedback(&server, "first_try_pass"))["sim"],
+            Value::Null
+        );
+        let promoted = sim_feedback(&server, "first_try_pass");
+        assert_eq!(
+            structured(&promoted)["report"]["action"]["action"],
+            "promote_probation"
+        );
+        assert_eq!(structured(&promoted)["sim"]["outcome"], "worked");
+        sim_evolve(&server, root_cause);
+        let rolled_back = sim_feedback(&server, "user_disapproved");
+        assert_eq!(
+            structured(&rolled_back)["report"]["action"]["action"],
+            "rollback_probation"
+        );
+        assert_eq!(structured(&rolled_back)["sim"]["outcome"], "reverted");
+        assert_eq!(
+            structured(&rolled_back)["sim"]["problem_id"],
+            problem_id.as_str()
+        );
+
+        let timeline = call(&server, "sim_get", json!({"id": problem_id}));
+        let problem = &structured(&timeline)["problem"];
+        assert_eq!(problem["domain"], "bot-evolution");
+        let attempts = problem["attempts"].as_array().unwrap();
+        let outcomes: Vec<&str> = attempts
+            .iter()
+            .map(|attempt| attempt["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, vec!["failed", "worked", "failed", "reverted"]);
+        assert_eq!(attempts[0]["bot_id"], "warden");
+        assert_eq!(attempts[0]["charter_revision"], 2);
+        assert_eq!(attempts[0]["model"], "claude-opus-5-5");
+        assert!(attempts[0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("verification_missed")));
+        assert!(attempts[3]["avoid_guidance"]
+            .as_str()
+            .unwrap()
+            .contains("Do not reapply charter v3"));
+        let by_bot = call(
+            &server,
+            "sim_search",
+            json!({"query": "atomic", "bot_id": "warden", "failures_only": true}),
+        );
+        assert_eq!(structured(&by_bot)["count"], 1);
+        let memory_hits = call(
+            &server,
+            "memory_search",
+            json!({"scope": "shared", "query": "non-atomic"}),
+        );
+        assert_eq!(structured(&memory_hits)["count"], 0);
     }
 }

@@ -928,6 +928,10 @@ pub(crate) enum Command {
         subcommand: String,
         rest: Option<String>,
     },
+    Sim {
+        subcommand: String,
+        rest: Option<String>,
+    },
     Help,
     Unknown {
         command: String,
@@ -942,7 +946,7 @@ pub struct CommandHelp {
     pub summary: &'static str,
 }
 
-const HELP_ENTRIES: [CommandHelp; 26] = [
+const HELP_ENTRIES: [CommandHelp; 27] = [
     CommandHelp {
         usage: "/help",
         summary: "Show all slash commands and routing prefixes.",
@@ -1024,6 +1028,10 @@ const HELP_ENTRIES: [CommandHelp; 26] = [
         summary: "Search or write shared two-tier durable memory.",
     },
     CommandHelp {
+        usage: "/sim search QUERY | recent | log PROBLEM | ATTEMPT",
+        summary: "Search, list or log the isolated Self-Improvement Memory of failed and working attempts.",
+    },
+    CommandHelp {
         usage: "/settings",
         summary: "Open Settings panel.",
     },
@@ -1049,7 +1057,7 @@ const HELP_ENTRIES: [CommandHelp; 26] = [
     },
 ];
 
-const KNOWN_SLASH_COMMANDS: [&str; 32] = [
+const KNOWN_SLASH_COMMANDS: [&str; 33] = [
     "/help",
     "/spawn",
     "/ask",
@@ -1071,6 +1079,7 @@ const KNOWN_SLASH_COMMANDS: [&str; 32] = [
     "/disapprove",
     "/bot",
     "/memory",
+    "/sim",
     "/settings",
     "/connect",
     "/disconnect",
@@ -1377,6 +1386,7 @@ const APPROVE_USAGE: &str = "Usage: /approve BOT [NOTE]";
 const DISAPPROVE_USAGE: &str = "Usage: /disapprove BOT REASON";
 const BOT_USAGE: &str = "Usage: /bot {scorecard|forge|evolve|decommission} [ARGS]";
 const MEMORY_USAGE: &str = "Usage: /memory {search QUERY | write TITLE | BODY}";
+const SIM_USAGE: &str = "Usage: /sim {search QUERY | recent | log PROBLEM | ATTEMPT}";
 pub(crate) const UPDATE_USAGE: &str = "Usage: /update";
 pub(crate) const DISCONNECT_USAGE: &str = "Usage: /disconnect [claude|codex|PROVIDER/PROFILE]";
 pub(crate) const RECONNECT_USAGE: &str = "Usage: /reconnect [claude|codex|PROVIDER/PROFILE]";
@@ -1428,6 +1438,28 @@ fn next_word(text: &str) -> Option<(&str, &str)> {
 
 fn optional(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn parse_sim_command(rest: &str) -> Result<Command, String> {
+    let Some((subcommand, tail)) = next_word(rest) else {
+        return Err(SIM_USAGE.into());
+    };
+    let subcommand = subcommand.to_ascii_lowercase();
+    let accepted = match subcommand.as_str() {
+        "recent" => true,
+        "search" => !tail.is_empty(),
+        "log" => tail.split_once('|').is_some_and(|(problem, attempt)| {
+            !problem.trim().is_empty() && !attempt.trim().is_empty()
+        }),
+        _ => false,
+    };
+    if !accepted {
+        return Err(SIM_USAGE.into());
+    }
+    Ok(Command::Sim {
+        subcommand,
+        rest: optional(tail),
+    })
 }
 
 fn mode_option(text: &str) -> Result<(Option<PermissionMode>, &str), String> {
@@ -1572,6 +1604,7 @@ pub(crate) fn parse_command(input: &str) -> Result<Command, String> {
             }
             _ => Err(MEMORY_USAGE.into()),
         },
+        "/sim" => parse_sim_command(rest),
         "/help" | "/?" if rest.is_empty() => Ok(Command::Help),
         "/help" | "/?" => Err(HELP_USAGE.into()),
         other if ROUTING_DIRECTIVES.contains(&other) => Ok(Command::Message(input.into())),
@@ -1738,6 +1771,7 @@ pub(crate) fn specialist_prompt_for_stores(
     task: &str,
     evolution: Option<&crate::evolution::EvolutionStore>,
     memory: Option<&crate::memory::MemoryStore>,
+    sim: Option<&crate::sim::SimStore>,
     now: i64,
 ) -> String {
     let charter = evolution
@@ -1750,7 +1784,19 @@ pub(crate) fn specialist_prompt_for_stores(
                 .ok()
         })
         .filter(|block| !block.trim().is_empty());
-    specialist_prompt_with_context(member, task, charter.as_deref(), memory_block.as_deref())
+    let sim_block = sim
+        .and_then(|store| {
+            store
+                .render_prompt_block(task, crate::sim::DEFAULT_PROMPT_BUDGET_TOKENS)
+                .ok()
+        })
+        .filter(|block| !block.trim().is_empty());
+    let context_block = [memory_block, sim_block]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    specialist_prompt_with_context(member, task, charter.as_deref(), Some(&context_block))
 }
 
 pub(crate) fn summary(text: &str) -> String {
@@ -3009,6 +3055,35 @@ mod cross_platform_tests {
             })
         );
         assert!(parse_command("/memory search").is_err());
+        assert_eq!(
+            parse_command("/sim search torn writes"),
+            Ok(Command::Sim {
+                subcommand: "search".into(),
+                rest: Some("torn writes".into()),
+            })
+        );
+        assert_eq!(
+            parse_command("/sim RECENT"),
+            Ok(Command::Sim {
+                subcommand: "recent".into(),
+                rest: None,
+            })
+        );
+        assert_eq!(
+            parse_command("/sim log Torn writes | Skipped fsync"),
+            Ok(Command::Sim {
+                subcommand: "log".into(),
+                rest: Some("Torn writes | Skipped fsync".into()),
+            })
+        );
+        assert!(parse_command("/sim").is_err());
+        assert!(parse_command("/sim search").is_err());
+        assert!(parse_command("/sim log only problem").is_err());
+        assert!(parse_command("/sim log | attempt").is_err());
+        assert!(parse_command("/sim forget all").is_err());
+        assert!(help_entries()
+            .iter()
+            .any(|entry| entry.usage.starts_with("/sim search")));
 
         let base = std::env::temp_dir().join(format!(
             "agent-command-spec-prompt-{}",
@@ -3050,11 +3125,57 @@ mod cross_platform_tests {
             "Audit atomic writes",
             Some(&evo),
             Some(&mem),
+            None,
             now,
         );
         assert!(prompt.contains("Bot Charter: sentinel"));
         assert!(prompt.contains("Always verify atomic renames."));
         assert!(prompt.contains("Task: Audit atomic writes"));
+        assert!(!prompt.contains("<sim-memory"));
+
+        let sim = crate::sim::SimStore::for_workspace(base.join("state"), &ws);
+        sim.log_attempt(
+            crate::sim::LogAttemptInput {
+                title: "Atomic writes skipped fsync".into(),
+                outcome: Some(crate::sim::SimOutcome::Reverted),
+                attempt_summary: "Renamed without sync_all".into(),
+                avoid_guidance: "Keep sync_all before rename; it prevents torn state.".into(),
+                bot_id: Some("forge".into()),
+                ..crate::sim::LogAttemptInput::default()
+            },
+            now,
+        )
+        .unwrap();
+        let with_sim = specialist_prompt_for_stores(
+            &member,
+            "Audit atomic writes",
+            Some(&evo),
+            Some(&mem),
+            Some(&sim),
+            now,
+        );
+        assert!(with_sim.contains("Always verify atomic renames."));
+        assert!(with_sim.contains("<sim-memory"));
+        assert!(with_sim.contains("Keep sync_all before rename"));
+        let unrelated = specialist_prompt_for_stores(
+            &member,
+            "Translate the README",
+            None,
+            None,
+            Some(&sim),
+            now,
+        );
+        assert!(!unrelated.contains("<sim-memory"));
+        let shared = mem
+            .search(
+                &[crate::memory::MemoryScope::Shared],
+                "fsync",
+                10,
+                1_000,
+                now,
+            )
+            .unwrap();
+        assert!(shared.hits.is_empty());
         let _ = fs::remove_dir_all(&base);
     }
 }
