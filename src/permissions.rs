@@ -279,6 +279,7 @@ const AGY_STREAM_ARGUMENTS: [&str; 5] = [
 ];
 pub(crate) const AGY_READ_ONLY_SETTINGS: &str = r#"{"agentMode":"","toolPermission":"request-review","permissions":{"deny":["write_file(*)","command(*)"]}}"#;
 const AGY_SUPERVISED_SETTINGS: &str = r#"{"agentMode":"","toolPermission":"request-review"}"#;
+const CODEX_WORKSPACE_NETWORK_CONFIG: &str = "sandbox_workspace_write.network_access=true";
 const END_OF_OPTIONS: &str = "--";
 
 impl PermissionMode {
@@ -376,13 +377,21 @@ impl PermissionMode {
         }
     }
 
-    fn codex_sandbox(self) -> &'static str {
+    pub(crate) fn codex_sandbox(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised | Self::AutoAcceptEdits | Self::WorktreeAuto | Self::WorkspaceAuto => {
                 "workspace-write"
             }
         }
+    }
+
+    pub(crate) fn codex_leading_arguments(self) -> Vec<&'static str> {
+        let mut arguments = vec!["-a", "never"];
+        if matches!(self, Self::WorktreeAuto | Self::WorkspaceAuto) {
+            arguments.extend(["-c", CODEX_WORKSPACE_NETWORK_CONFIG]);
+        }
+        arguments
     }
 
     fn gemini_arguments(self) -> Vec<&'static str> {
@@ -403,16 +412,18 @@ pub(crate) fn dispatch_arguments(provider: Provider, mode: PermissionMode) -> Ve
             arguments.push(END_OF_OPTIONS);
             arguments
         }
-        Provider::Codex => vec![
-            "-a",
-            "never",
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox",
-            mode.codex_sandbox(),
-            "-",
-        ],
+        Provider::Codex => {
+            let mut arguments = mode.codex_leading_arguments();
+            arguments.extend([
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--sandbox",
+                mode.codex_sandbox(),
+                "-",
+            ]);
+            arguments
+        }
         Provider::Gemini => {
             let mut arguments = AGY_STREAM_ARGUMENTS.to_vec();
             arguments.extend(mode.gemini_arguments());
@@ -473,20 +484,21 @@ mod tests {
 
     #[test]
     fn codex_argv_for_every_mode_is_exact() {
-        let expected = |sandbox: &str| {
+        let sandboxed = |sandbox: &str| {
             format!("-a never exec --json --skip-git-repo-check --sandbox {sandbox} -")
         };
         assert_eq!(
             joined(Provider::Codex, PermissionMode::ReadOnly),
-            expected("read-only")
+            sandboxed("read-only")
         );
-        for mode in [
-            PermissionMode::Supervised,
-            PermissionMode::AutoAcceptEdits,
-            PermissionMode::WorktreeAuto,
-            PermissionMode::WorkspaceAuto,
-        ] {
-            assert_eq!(joined(Provider::Codex, mode), expected("workspace-write"));
+        for mode in [PermissionMode::Supervised, PermissionMode::AutoAcceptEdits] {
+            assert_eq!(joined(Provider::Codex, mode), sandboxed("workspace-write"));
+        }
+        let network_enabled = format!(
+            "-a never -c {CODEX_WORKSPACE_NETWORK_CONFIG} exec --json --skip-git-repo-check --sandbox workspace-write -"
+        );
+        for mode in [PermissionMode::WorktreeAuto, PermissionMode::WorkspaceAuto] {
+            assert_eq!(joined(Provider::Codex, mode), network_enabled);
         }
     }
 
@@ -535,6 +547,7 @@ mod tests {
             .unwrap();
         assert_eq!(sandbox, "read-only");
         assert!(!codex.contains(&"workspace-write"));
+        assert!(!codex.contains(&CODEX_WORKSPACE_NETWORK_CONFIG));
         let gemini = dispatch_arguments(Provider::Gemini, PermissionMode::ReadOnly);
         let settings_raw = gemini
             .iter()
@@ -706,6 +719,15 @@ mod tests {
         );
         assert!(!joined.contains("--permission-mode default"));
         assert!(refuse_bypass(claude.iter().map(OsStr::new)).is_ok());
+        let codex = dispatch_arguments(Provider::Codex, commander);
+        assert!(codex.windows(2).any(|pair| pair == ["-a", "never"]));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["-c", CODEX_WORKSPACE_NETWORK_CONFIG]));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+        assert!(refuse_bypass(codex.iter().map(OsStr::new)).is_ok());
         let mut smuggled = claude.clone();
         for flag in FORBIDDEN_FLAGS {
             smuggled.push(flag);

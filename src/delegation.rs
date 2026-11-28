@@ -35,7 +35,6 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 pub const HEARTBEAT_DEAD_SECS: i64 = 30;
 pub const COMPLETION_WINDOW_SECS: i64 = 900;
 pub const MAX_INLINE_PATCH_BYTES: usize = 48 * 1024;
-pub const AGY_FALLBACK_COOLDOWN_SECS: i64 = 1_800;
 
 const RESERVATIONS_FILE: &str = "reservations.json";
 const RESERVATIONS_SCHEMA: &str = "agent-command-reservations-v1";

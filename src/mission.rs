@@ -839,9 +839,16 @@ pub fn build_provider_arguments(
         Provider::Codex => {
             let (leading_config, other_extra) = split_codex_config_args(&options.extra_args);
             if let Some(thread_id) = &options.resume_session {
-                let mut args = leading_config;
+                let mut args: Vec<String> = mode
+                    .codex_leading_arguments()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                args.extend(leading_config);
                 args.extend([
                     "exec".to_owned(),
+                    "--sandbox".to_owned(),
+                    mode.codex_sandbox().to_owned(),
                     "resume".to_owned(),
                     "--json".to_owned(),
                     "--skip-git-repo-check".to_owned(),
@@ -2047,15 +2054,8 @@ impl EventParser {
             Some("turn.completed") => {
                 self.codex_item_text.clear();
                 self.codex_started_tools.clear();
-                let usage_val = &event["usage"];
-                if usage_val.is_object() {
-                    out.push(NormalizedEvent::UsageDelta {
-                        input: usage_val["input_tokens"].as_u64().unwrap_or(0),
-                        cached_read: usage_val["cached_input_tokens"].as_u64().unwrap_or(0),
-                        output: usage_val["output_tokens"].as_u64().unwrap_or(0),
-                        cost_usd: None,
-                        context_used: None,
-                    });
+                if let Some(usage_event) = parse_codex_usage(&event["usage"]) {
+                    out.push(usage_event);
                 }
                 out.push(NormalizedEvent::TurnFinished {
                     interrupted,
@@ -2304,6 +2304,23 @@ impl EventParser {
         }
         out
     }
+}
+
+fn parse_codex_usage(usage_val: &Value) -> Option<NormalizedEvent> {
+    if !usage_val.is_object() {
+        return None;
+    }
+    let input = usage_val["input_tokens"].as_u64().unwrap_or(0);
+    let cached_read = usage_val["cached_input_tokens"].as_u64().unwrap_or(0);
+    let output = usage_val["output_tokens"].as_u64().unwrap_or(0);
+    let context_used = input.max(cached_read);
+    (context_used > 0 || output > 0).then_some(NormalizedEvent::UsageDelta {
+        input,
+        cached_read,
+        output,
+        cost_usd: None,
+        context_used: (context_used > 0).then_some(context_used),
+    })
 }
 
 fn parse_agy_usage(usage_val: &Value) -> Option<NormalizedEvent> {
@@ -3767,10 +3784,23 @@ mod engine_tests {
 
         let codex =
             build_provider_arguments(Provider::Codex, PermissionMode::WorkspaceAuto, &options);
-        assert_eq!(codex[0], "exec");
-        assert_eq!(codex[1], "resume");
-        assert!(codex.contains(&"sess-123".to_owned()));
-        assert_eq!(codex.last().map(String::as_str), Some("-"));
+        assert_eq!(
+            codex,
+            vec![
+                "-a",
+                "never",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "sess-123",
+                "-",
+            ]
+        );
 
         let gemini =
             build_provider_arguments(Provider::Gemini, PermissionMode::WorktreeAuto, &options);
@@ -3928,6 +3958,155 @@ mod engine_tests {
             .any(|pair| pair == ["--add-dir", &dir.to_string_lossy()]));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_resume_preserves_approval_sandbox_and_network_flags_for_every_mode() {
+        let extra = vec![
+            "-c".to_owned(),
+            "mcp_servers.agent_command.url='http://127.0.0.1:9/mcp'".to_owned(),
+        ];
+        for (mode, expected_sandbox, expect_network) in [
+            (PermissionMode::ReadOnly, "read-only", false),
+            (PermissionMode::Supervised, "workspace-write", false),
+            (PermissionMode::AutoAcceptEdits, "workspace-write", false),
+            (PermissionMode::WorktreeAuto, "workspace-write", true),
+            (PermissionMode::WorkspaceAuto, "workspace-write", true),
+        ] {
+            let options = LaunchOptions {
+                resume_session: Some("thread-42".into()),
+                extra_args: extra.clone(),
+                ..LaunchOptions::default()
+            };
+            let args = build_provider_arguments(Provider::Codex, mode, &options);
+            assert!(
+                permissions::refuse_bypass(args.iter().map(std::ffi::OsStr::new)).is_ok(),
+                "{mode:?}: {args:?}"
+            );
+            let exec_pos = args.iter().position(|arg| arg == "exec").unwrap();
+            let resume_pos = args.iter().position(|arg| arg == "resume").unwrap();
+            assert!(exec_pos < resume_pos, "{mode:?}: {args:?}");
+            assert!(
+                args[..exec_pos]
+                    .windows(2)
+                    .any(|pair| pair == ["-a", "never"]),
+                "{mode:?}: {args:?}"
+            );
+            assert!(
+                args[..exec_pos]
+                    .windows(2)
+                    .any(|pair| pair == ["-c", &extra[1]]),
+                "{mode:?}: {args:?}"
+            );
+            assert_eq!(
+                args[..exec_pos]
+                    .windows(2)
+                    .any(|pair| pair == ["-c", "sandbox_workspace_write.network_access=true"]),
+                expect_network,
+                "{mode:?}: {args:?}"
+            );
+            assert!(
+                args[exec_pos..resume_pos]
+                    .windows(2)
+                    .any(|pair| pair == ["--sandbox", expected_sandbox]),
+                "{mode:?}: {args:?}"
+            );
+            assert!(args[resume_pos..].contains(&"--json".to_owned()));
+            assert!(args[resume_pos..].contains(&"--skip-git-repo-check".to_owned()));
+            assert_eq!(
+                &args[args.len() - 2..],
+                &["thread-42".to_owned(), "-".to_owned()]
+            );
+        }
+    }
+
+    #[test]
+    fn parse_codex_computes_context_used_without_double_counting_cached_tokens() {
+        let mut parser = EventParser::new(Provider::Codex);
+        let cached_turn = parser.parse_value(
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 68385,
+                    "cached_input_tokens": 13824,
+                    "output_tokens": 112
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            cached_turn[0],
+            NormalizedEvent::UsageDelta {
+                input: 68385,
+                cached_read: 13824,
+                output: 112,
+                cost_usd: None,
+                context_used: Some(68385),
+            }
+        );
+
+        let cached_only = parser.parse_value(
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 5
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            cached_only[0],
+            NormalizedEvent::UsageDelta {
+                input: 0,
+                cached_read: 40,
+                output: 5,
+                cost_usd: None,
+                context_used: Some(40),
+            }
+        );
+
+        let output_only = parser.parse_value(
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 7
+                }
+            }),
+            false,
+            None,
+        );
+        assert_eq!(
+            output_only[0],
+            NormalizedEvent::UsageDelta {
+                input: 0,
+                cached_read: 0,
+                output: 7,
+                cost_usd: None,
+                context_used: None,
+            }
+        );
+
+        let empty = parser.parse_value(
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                }
+            }),
+            false,
+            None,
+        );
+        assert!(!empty
+            .iter()
+            .any(|event| matches!(event, NormalizedEvent::UsageDelta { .. })));
     }
 
     #[test]
@@ -4430,6 +4609,13 @@ mod engine_tests {
         assert!(codex_events.iter().any(
             |e| matches!(e, NormalizedEvent::ToolEnd { call_id, ok: true, .. } if call_id == "f1")
         ));
+        assert!(codex_events.contains(&NormalizedEvent::UsageDelta {
+            input: 10,
+            cached_read: 0,
+            output: 5,
+            cost_usd: None,
+            context_used: Some(10),
+        }));
 
         let mut gemini = EventParser::new(Provider::Gemini);
         let gemini_stream = [

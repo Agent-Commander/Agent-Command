@@ -39,11 +39,11 @@ fs::rename(&temporary, &path)?;
 
 Corrupt or unreadable state fails closed: the profile is not selected, polled or continued.
 
-## 4. No synthetic Claude probes
+## 4. Non-billable usage probes and five-minute floor
 
-Claude usage comes only from the native CLI's structured stream during a real mission. Never send a prompt, ping or empty mission to Claude to read usage. An unreported window stays unavailable.
+Claude usage comes from the native CLI's structured `rate_limit_event` stream during missions and from the non-billable `/usage` probe (`claude -p --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --tools "" -- /usage`). Never send a billable prompt, ping or empty mission to Claude to read usage. An unreported window stays unavailable.
 
-Codex readbacks keep the five-minute monotonic floor per profile, across failures, wall-clock jumps and app restarts.
+Claude, Codex and Antigravity (`agy`) readbacks keep the five-minute monotonic floor per profile, across failures, wall-clock jumps and app restarts.
 
 ## 5. Latches
 

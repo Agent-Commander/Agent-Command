@@ -237,8 +237,8 @@ provider CLI's argv, never by prompt text alone, and no mode ever passes
 | `read-only` | Playtester, Reviewer, QA, Audit | `--permission-mode default --disallowedTools Edit,Write,NotebookEdit` | `--sandbox read-only` |
 | `supervised` | Lead, Builder, everything else | `--permission-mode default` | `--sandbox workspace-write` |
 | `auto-edits` | Copywriter, Docs, Writer, Editor | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
-| `worktree-auto` | none (explicit only) | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `--sandbox workspace-write` |
-| `workspace-auto` | Commander | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `--sandbox workspace-write` |
+| `worktree-auto` | none (explicit only) | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `-c sandbox_workspace_write.network_access=true --sandbox workspace-write` |
+| `workspace-auto` | Commander | `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,NotebookEdit` | `-c sandbox_workspace_write.network_access=true --sandbox workspace-write` |
 
 `worktree-auto` is refused unless the specialist's workspace is an isolated
 `git worktree`, both at spawn and again at every launch. `workspace-auto` runs
