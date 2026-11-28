@@ -782,7 +782,7 @@ impl App {
         }
     }
 
-    pub(crate) fn ensure_loopback_bridge(&mut self) -> Option<PathBuf> {
+    pub(crate) fn ensure_loopback_bridge(&mut self) -> Option<Arc<bridge::LoopbackBridge>> {
         let env_snapshot = self.build_env_snapshot();
         let ledger_path_opt = self.ledger_path.clone();
         let soul_path = self.settings.effective_soul_path();
@@ -836,11 +836,7 @@ impl App {
                 live.bridge = Some(Arc::new(started));
             }
         }
-        let bridge = live.bridge.as_deref()?;
-        bridge
-            .injection_for(bridge::BridgeProvider::Claude)
-            .ok()
-            .and_then(|inj| inj.config_file)
+        live.bridge.clone()
     }
 
     pub(crate) fn build_env_snapshot(&self) -> Option<bridge::EnvSnapshot> {
@@ -4111,6 +4107,58 @@ mod tests {
             "uncovered slot repaints"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_loopback_bridge_skips_eager_claude_temp_config_creation() {
+        fn has_claude_mcp_temp_file(dir: &std::path::Path) -> bool {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if has_claude_mcp_temp_file(&path) {
+                        return true;
+                    }
+                } else if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("agent-command-mcp-claude-")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "ac-bridge-no-eager-mcp-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let workspace = root.join("work");
+        let profile_root = root.join("profiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let profile = crate::auth::Profile::system_default(profile_root.clone(), Provider::Codex);
+        let mut live = crate::Live::new(workspace, vec![profile], None);
+        live.profile_root = Some(profile_root.clone());
+        let mut app = App {
+            live: Some(live),
+            ..App::default()
+        };
+
+        let first = app
+            .ensure_loopback_bridge()
+            .expect("loopback bridge starts");
+        let second = app
+            .ensure_loopback_bridge()
+            .expect("loopback bridge reuses existing instance");
+        assert_eq!(first.url(), second.url());
+        assert!(!has_claude_mcp_temp_file(&profile_root));
+
+        first.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

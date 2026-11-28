@@ -739,24 +739,24 @@ fn page_url(endpoint: Endpoint, page: u64) -> String {
 struct Harness {
     provider: Provider,
     creator: &'static str,
-    agent: &'static str,
+    agents: &'static [&'static str],
 }
 
 const HARNESSES: [Harness; 3] = [
     Harness {
         provider: Provider::Codex,
         creator: "OpenAI",
-        agent: "Codex",
+        agents: &["Codex"],
     },
     Harness {
         provider: Provider::Claude,
         creator: "Anthropic",
-        agent: "Claude Code",
+        agents: &["Claude Code"],
     },
     Harness {
         provider: Provider::Gemini,
         creator: "Google",
-        agent: "Gemini CLI",
+        agents: &["Antigravity", "Antigravity CLI"],
     },
 ];
 
@@ -812,7 +812,7 @@ fn identify_agent(raw: &Value) -> Option<Identity> {
     let agent = raw["agent"]["name"].as_str()?;
     let provider = raw["provider"].as_str()?;
     let harness = HARNESSES.iter().find(|harness| {
-        harness.agent == agent
+        harness.agents.contains(&agent)
             && harness.creator == provider
             && agent_creator_matches(raw, harness.creator)
     })?;
@@ -1744,6 +1744,44 @@ mod tests {
             identify_model(&json!({"model_creator": {"name": "OpenAI"}})),
             None
         );
+    }
+
+    #[test]
+    fn antigravity_harness_identifies_google_agents_and_rejects_legacy_gemini_cli() {
+        for agent_name in ["Antigravity", "Antigravity CLI"] {
+            let row = json!({
+                "agent": { "name": agent_name },
+                "agent_creator": { "name": "Google" },
+                "model": { "slug": "gemini-4-neon", "effort": "medium" },
+                "provider": "Google",
+                "is_router": false
+            });
+            assert_eq!(
+                identify_agent(&row),
+                Some(Identity {
+                    provider: Provider::Gemini,
+                    slug: "gemini-4-neon".into(),
+                    effort: Some("medium".into()),
+                }),
+                "{agent_name}"
+            );
+        }
+        let stale_legacy = json!({
+            "agent": { "name": "Gemini CLI" },
+            "agent_creator": { "name": "Google" },
+            "model": { "slug": "gemini-4-neon", "effort": "medium" },
+            "provider": "Google",
+            "is_router": false
+        });
+        assert_eq!(identify_agent(&stale_legacy), None);
+        let crossed = json!({
+            "agent": { "name": "Antigravity" },
+            "agent_creator": { "name": "OpenAI" },
+            "model": { "slug": "gemini-4-neon", "effort": "medium" },
+            "provider": "Google",
+            "is_router": false
+        });
+        assert_eq!(identify_agent(&crossed), None);
     }
 
     #[test]

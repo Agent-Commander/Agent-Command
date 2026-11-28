@@ -2983,8 +2983,7 @@ impl App {
             }
         };
         let request = framed(parsed, |unit| self.build_commander_prompt_text(unit));
-        let mcp_config = self.ensure_loopback_bridge();
-        let bridge = self.live.as_ref().and_then(|live| live.bridge.clone());
+        let bridge = self.ensure_loopback_bridge();
         let (resume_session, resume_session_profile, portable_handoff) =
             if let Some(live) = &self.live {
                 let handoff = (!live.handoff_turns.is_empty()).then(|| {
@@ -3006,7 +3005,7 @@ impl App {
             resume_session,
             resume_session_profile,
             portable_handoff,
-            mcp_config: if bridge.is_some() { None } else { mcp_config },
+            mcp_config: None,
             extra_args: Vec::new(),
             policy,
             persistent_stdio: true,
